@@ -202,7 +202,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 current_pod = "Unbekannt"
                 
                 for page in pdf.pages:
-                    # NEU: Flexible Tabellenerkennung (auch für "unsichtbare" Tabellen ohne Linien)
+                    # Flexible Tabellenerkennung (auch für "unsichtbare" Tabellen ohne Linien)
                     tables = page.extract_tables()
                     if not tables:
                         tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
@@ -364,6 +364,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         
         return df_return, "Excel/CSV"
 
+# --- TABS FÜR UI ---
+tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
 # === TAB 1: SUCHEN ===
 with tab_suche:
@@ -434,7 +436,6 @@ with tab_upload:
                             alle_daten.append(df_teil)
                     except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
             
-                # NEU: Verbesserte Fehlermeldung, wenn Dateien zwar gelesen wurden, aber keine Daten extrahiert werden konnten
                 if not alle_daten:
                     st.warning("⚠️ Die Dateien wurden gelesen, aber das Skript konnte keine gültigen 40'HC Preise darin finden. Bitte überprüfe die PDFs.")
                 else:
