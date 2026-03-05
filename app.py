@@ -172,12 +172,20 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            # --- NEU: Textbasierte POL/POD Erkennung (Ignoriert Spalten-Chaos) ---
-            pol_match = re.search(r'([A-Z][a-zäöüß]+(?:[\s-][A-Z][a-zäöüß]+)*)\s+Valid as from', text, re.IGNORECASE)
+            # --- NEU: Ultra-strikte POL/POD Erkennung (Ignoriert lange Sätze komplett) ---
+            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-
-            pod_match = re.search(r'Remarks\W+([A-Z][a-zäöüß]+(?:[\s-][A-Z][a-zäöüß]+)*)', text, re.IGNORECASE)
+            
+            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
+            if not pod_match:
+                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
             pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
+            
+            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
+            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
+            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
+            if len(pol_str) > 25: pol_str = "Unbekannt"
+            if len(pod_str) > 25: pod_str = "Unbekannt"
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
