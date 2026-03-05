@@ -32,13 +32,9 @@ def init_db():
     client = pymongo.MongoClient(MONGO_URI)
     db = client["SpeditionsDB"]
     collection = db["Raten"]
-    
-    # Erstellt einen TTL-Index. Löscht Dokumente automatisch nach 180 Tagen (15.552.000 Sekunden)
     collection.create_index("createdAt", expireAfterSeconds=15552000)
-    
     return collection
 
-# Datenbankverbindung herstellen
 collection = init_db()
 
 # --- LIVE WECHSELKURS ---
@@ -55,6 +51,13 @@ aktueller_kurs = hole_live_wechselkurs()
 st.sidebar.header("💱 Einstellungen")
 st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
+
+# --- NEU: DOKUMENTEN-FILTER ---
+def ist_doc_gebuehr(name):
+    n = str(name).lower()
+    if 'b/l' in n: return True
+    if re.search(r'\b(bl|doc|docs|documentation|bill of lading)\b', n): return True
+    return False
 
 # --- HILFSFUNKTIONEN ---
 def berechne_gebuehren(zuschlaege_str):
@@ -74,9 +77,11 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     summe_gebuehren_eur = 0
     
     for g in berechne_gebuehren(str(row.get(prep_surcharge_col, ''))):
+        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
         summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
 
     for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
+        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
         if st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
             summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
             
@@ -89,16 +94,22 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
     
     prep_gebuehren = berechne_gebuehren(str(row.get(prep_surcharge_col, '')))
     coll_gebuehren = berechne_gebuehren(str(row.get(coll_surcharge_col, '')))
-    summe_gebuehren_eur, fremd_gebuehren = 0, [] 
+    summe_gebuehren_eur, fremd_gebuehren, doc_gebuehren = 0, [], [] 
     
-    col_basis, col_prep, col_coll, col_total = st.columns([1, 1.2, 1.2, 1.2])
+    # NEU: Fünf Spalten für die UI (Die vierte ist für Docs)
+    col_basis, col_prep, col_coll, col_doc, col_total = st.columns([1, 1.1, 1.1, 1.1, 1.2])
     
-    with col_basis: st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
+    with col_basis: 
+        st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
         
     with col_prep:
         st.write("**Zusammensetzung (Prepaid):**")
-        if not prep_gebuehren: st.write("<small>Keine extra Prepaid Gebühren</small>", unsafe_allow_html=True)
+        has_prep = False
         for g in prep_gebuehren:
+            if ist_doc_gebuehr(g['name']): 
+                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
+                continue
+            has_prep = True
             if g['waehrung'] == 'USD':
                 umgerechnet = g['betrag'] * usd_to_eur
                 summe_gebuehren_eur += umgerechnet
@@ -109,16 +120,30 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
             else:
                 fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']})")
                 st.markdown(f"➕ <span class='fremd-waehrung'>{g['name']}: {g['betrag']:.2f} {g['waehrung']}</span>", unsafe_allow_html=True)
+        if not has_prep: st.write("<small>Keine extra Prepaid Gebühren</small>", unsafe_allow_html=True)
                 
     with col_coll:
-        st.write("**🏢 Collect (Zahlbar Zielort):**")
-        if not coll_gebuehren: st.write("<small>Keine Collect Gebühren</small>", unsafe_allow_html=True)
+        st.write("**🏢 Collect (Zielort):**")
+        has_coll = False
+        for i, g in enumerate(coll_gebuehren):
+            if ist_doc_gebuehr(g['name']): 
+                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
+                continue
+            has_coll = True
+            if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
+                if g['waehrung'] == 'USD': summe_gebuehren_eur += (g['betrag'] * usd_to_eur)
+                elif g['waehrung'] == 'EUR': summe_gebuehren_eur += g['betrag']
+                else: fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']} - Collect)")
+        if not has_coll: st.write("<small>Keine Collect Gebühren</small>", unsafe_allow_html=True)
+
+    with col_doc:
+        st.write("**📄 BL & Docs:**")
+        if not doc_gebuehren: 
+            st.write("<small>-</small>", unsafe_allow_html=True)
         else:
-            for i, g in enumerate(coll_gebuehren):
-                if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
-                    if g['waehrung'] == 'USD': summe_gebuehren_eur += (g['betrag'] * usd_to_eur)
-                    elif g['waehrung'] == 'EUR': summe_gebuehren_eur += g['betrag']
-                    else: fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']} - Collect)")
+            st.write("<small><i>(Nicht im All-In)</i></small>", unsafe_allow_html=True)
+            for g in doc_gebuehren:
+                st.markdown(f"🔹 {g['name']}: {g['betrag']:.2f} {g['waehrung']}")
 
     with col_total:
         total_eur = basis_eur + summe_gebuehren_eur
@@ -304,7 +329,7 @@ with tab_upload:
                         st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                         st.balloons()
     
-    # --- NEU: GEFAHRENZONE (DATENBANK LEEREN) ---
+    # --- GEFAHRENZONE (DATENBANK LEEREN) ---
     st.markdown("---")
     st.write("### 🚨 Gefahrenzone")
     st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
