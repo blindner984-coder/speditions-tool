@@ -206,11 +206,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                     # Schneidet 120 Zeichen nach dem gefundenen Wort (z.B. "ETS") aus
                     block = text_data[m.end():m.end()+120]
                     
-                    # BLOCKER: Wenn der Zuschlag "not subject to" oder "incl." ist, brechen wir hier sofort ab!
-                    if re.search(r'^\s*(?:not subject to|incl\.?|included|n/a)', block, re.IGNORECASE):
+                    # BLOCKER: Wir schauen uns die ersten 50 Zeichen an. Wenn dort steht, dass die Gebühr inkludiert ist, brechen wir ab!
+                    if re.search(r'\b(?:not subject to|incl\.?|included|n/a|ind\.?)\b', block[:50], re.IGNORECASE):
                         continue
                     
-                    # Sucht zwingend nach einer Zahl gefolgt von Währung! Das ignoriert "Q1/2026"
+                    # Sucht zwingend nach einer Zahl gefolgt von Währung!
                     price_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)\s*(EUR|USD|LISD|SEUR)', block, re.IGNORECASE)
                     
                     if price_match:
@@ -261,13 +261,20 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             # Exakte Zuweisung der Verdopplungs-Regeln
             s_erc = find_surcharge("ERC", ["Logistic Fee", "Equipment Repositioning"], text, prevent_teu=True)
             if s_erc: prepaid_list.append(s_erc)
+            
             s_ets = find_surcharge("ETS", ["ETS", "Emissions Trading System"], text, force_teu=True)
             if s_ets: prepaid_list.append(s_ets)
+            
             s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text, force_teu=True)
             if s_feu: prepaid_list.append(s_feu)
+            
             s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text, prevent_teu=True)
             if s_pss: prepaid_list.append(s_pss)
-            s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF"], text, force_teu=True)
+            
+            s_eca = find_surcharge("ECA", ["ECA", "Emission Control Area"], text, force_teu=True)
+            if s_eca: prepaid_list.append(s_eca)
+            
+            s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF", "BAC"], text, force_teu=True)
             if s_brc: prepaid_list.append(s_brc)
             
             prepaid_str = ", ".join(prepaid_list)
