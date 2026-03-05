@@ -4,3 +4,4 @@ openpyxl
 PyPDF2
 pymongo
 requests
+pdfplumber
