@@ -13,10 +13,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # 2. Konfiguration & Design
 st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
-
 st.markdown("""
     <style>
-    /* Info-Boxen Styling */
     .all-in-box { background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }
     .basis-box { background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }
     .collect-box { background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
@@ -24,13 +22,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- LOGO IN DER SIDEBAR ---
-try:
-    st.sidebar.image("logo_farbig.png", use_container_width=True) 
-except FileNotFoundError:
-    pass 
-
-# --- HAUPT-ÜBERSCHRIFT ---
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
@@ -61,14 +52,14 @@ st.sidebar.header("💱 Einstellungen")
 st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
 
-# --- DOKUMENTEN-FILTER ---
+# --- NEU: DOKUMENTEN-FILTER ---
 def ist_doc_gebuehr(name):
     n = str(name).lower()
     if 'b/l' in n: return True
     if re.search(r'\b(bl|doc|docs|documentation|bill of lading)\b', n): return True
     return False
 
-# --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
+# --- HILFSFUNKTIONEN ---
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
     treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
@@ -86,11 +77,11 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     summe_gebuehren_eur = 0
     
     for g in berechne_gebuehren(str(row.get(prep_surcharge_col, ''))):
-        if ist_doc_gebuehr(g['name']): continue 
+        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
         summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
 
     for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
-        if ist_doc_gebuehr(g['name']): continue 
+        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
         if st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
             summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
             
@@ -105,6 +96,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
     coll_gebuehren = berechne_gebuehren(str(row.get(coll_surcharge_col, '')))
     summe_gebuehren_eur, fremd_gebuehren, doc_gebuehren = 0, [], [] 
     
+    # NEU: Fünf Spalten für die UI (Die vierte ist für Docs)
     col_basis, col_prep, col_coll, col_doc, col_total = st.columns([1, 1.1, 1.1, 1.1, 1.2])
     
     with col_basis: 
@@ -115,7 +107,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         has_prep = False
         for g in prep_gebuehren:
             if ist_doc_gebuehr(g['name']): 
-                doc_gebuehren.append(g)
+                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
                 continue
             has_prep = True
             if g['waehrung'] == 'USD':
@@ -135,7 +127,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         has_coll = False
         for i, g in enumerate(coll_gebuehren):
             if ist_doc_gebuehr(g['name']): 
-                doc_gebuehren.append(g)
+                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
                 continue
             has_coll = True
             if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
@@ -215,38 +207,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
-        # --- 🚨 FIX FÜR DIE PRÄZISE CONTRACT NUMBER (Ignoriert Quote Number) ---
         global_contract = "Unbekannt"
-        
-        # 1. Zuerst gezielt nach dem Wort "Contract" in den Excel-Kopfzeilen suchen
-        for i in range(min(20, len(df_raw))):
-            row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
-            for j, val in enumerate(row_vals):
-                v_low = val.lower()
-                # Wir suchen explizit nach "Contract", um nicht die darüber stehende Quote zu nehmen
-                if 'contract' in v_low:
-                    # Suche nach einer Nummer direkt in dieser Zelle (z.B. "Contract Number 299424203")
-                    nums = re.findall(r'\b\d{6,10}\b', val)
-                    if nums:
-                        global_contract = nums[0]
-                        break
-                    # Falls nicht in derselben Zelle, schaue in die nächsten 3 Zellen rechts daneben
-                    for k in range(1, 4):
-                        if j + k < len(row_vals):
-                            next_val = row_vals[j+k].upper()
-                            next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
-                            if next_tokens:
-                                global_contract = next_tokens[0]
-                                break
-                if global_contract != "Unbekannt":
-                    break
-            if global_contract != "Unbekannt":
-                break
-
-        # 2. Nur wenn oben nichts gefunden wurde, Fallback auf den Dateinamen
-        if global_contract == "Unbekannt":
-            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
-                global_contract = fn_match.group(1)
+        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): global_contract = fn_match.group(1)
 
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
@@ -269,11 +231,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                 if len(val_raw) < 2: continue
                 
-                # Wir priorisieren die gefundene globale Contract Number
-                row_contract = global_contract
-                
                 standard_rows.append({
-                    'Carrier': 'Maersk', 'Contract Number': row_contract, 
+                    'Carrier': 'Maersk', 'Contract Number': str(bas_row[contract_col].values[0]) if contract_col else global_contract, 
                     'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
                     '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
                     'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
@@ -281,7 +240,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 })
             df_return = pd.DataFrame(standard_rows)
         else:
-            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
+            df_raw['Contract Number'] = df_raw[contract_col].astype(str).fillna(global_contract) if contract_col else global_contract
             df_return = df_raw
             
         if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
@@ -293,7 +252,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
 # --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
-# === TAB 1: SUCHEN ===
+# === TAB 1: SUCHEN (LÄDT AUS DER DATENBANK) ===
 with tab_suche:
     cursor = collection.find({})
     daten_liste = list(cursor)
@@ -306,7 +265,7 @@ with tab_suche:
         if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
         
-        st.write(f"### Suche in der Datenbank ({len(df)} Raten aktiv)")
+        st.write(f"### 🔍 Suche in der Datenbank ({len(df)} Raten aktiv)")
         c1, c2, c3, c4 = st.columns(4)
         with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
         with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
@@ -343,7 +302,8 @@ with tab_suche:
                         if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
             else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
-# === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
+
+# === TAB 2: ADMIN UPLOAD ===
 with tab_upload:
     st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
     uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
