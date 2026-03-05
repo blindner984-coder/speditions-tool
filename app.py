@@ -5,6 +5,8 @@ import PyPDF2
 import warnings
 import io
 import requests
+import pymongo
+from datetime import datetime, timezone
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -20,7 +22,25 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🚢 Speditions-Raten-Finder (Multi & PDF-Upload)")
+st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
+
+# --- MONGODB ANBINDUNG ---
+# Hier ist dein persönlicher Connection-Link inklusive Passwort sicher hinterlegt:
+MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+@st.cache_resource
+def init_db():
+    client = pymongo.MongoClient(MONGO_URI)
+    db = client["SpeditionsDB"]
+    collection = db["Raten"]
+    
+    # ⚠️ MAGIE: Erstellt einen TTL-Index. Löscht Dokumente automatisch nach 180 Tagen (15.552.000 Sekunden)
+    collection.create_index("createdAt", expireAfterSeconds=15552000)
+    
+    return collection
+
+# Datenbankverbindung herstellen
+collection = init_db()
 
 # --- LIVE WECHSELKURS ---
 @st.cache_data(ttl=3600)
@@ -37,17 +57,13 @@ st.sidebar.header("💱 Einstellungen")
 st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
 
-uploaded_files = st.file_uploader("Raten-Dateien hochladen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
-
 # --- HILFSFUNKTIONEN ---
 def berechne_gebuehren(zuschlaege_str):
-    if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']:
-        return []
+    if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
     treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
     liste = []
     for t in treffer:
-        try:
-            liste.append({"name": t[0].strip().lstrip(','), "betrag": float(t[1].replace('.', '').replace(',', '.')), "waehrung": t[2].upper()})
+        try: liste.append({"name": t[0].strip().lstrip(','), "betrag": float(t[1].replace('.', '').replace(',', '.')), "waehrung": t[2].upper()})
         except (ValueError, IndexError): pass
     return liste
 
@@ -74,14 +90,11 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
     
     prep_gebuehren = berechne_gebuehren(str(row.get(prep_surcharge_col, '')))
     coll_gebuehren = berechne_gebuehren(str(row.get(coll_surcharge_col, '')))
-    
-    summe_gebuehren_eur = 0
-    fremd_gebuehren = [] 
+    summe_gebuehren_eur, fremd_gebuehren = 0, [] 
     
     col_basis, col_prep, col_coll, col_total = st.columns([1, 1.2, 1.2, 1.2])
     
-    with col_basis:
-        st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
+    with col_basis: st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
         
     with col_prep:
         st.write("**Zusammensetzung (Prepaid):**")
@@ -113,8 +126,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
-# --- OPTIMIERTER DATEI-READER ---
-@st.cache_data(show_spinner=False)
+# --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
@@ -151,24 +163,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 'Remark': 'Automatisch aus PDF importiert'
             }])
             return df_pdf, "PDF"
-        except Exception as e:
-            return pd.DataFrame(), f"Fehler: {e}"
+        except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
     else:
-        # PERORMANCE-BOOST: Lese nur die ersten 20 Zeilen von allen Tabs, um das richtige zu finden!
         if datei.name.endswith('.xlsx'):
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
             ziel_sheet, header_idx = None, 0
-            
             for sheet_name, df_preview in excel_preview.items():
                 for i in range(len(df_preview)):
-                    row_str = " ".join(df_preview.iloc[i].dropna().astype(str))
-                    if '40HDRY' in row_str or 'Port of Destination' in row_str or '40HC All In' in row_str:
+                    if any(x in " ".join(df_preview.iloc[i].dropna().astype(str)) for x in ['40HDRY', 'Port of Destination', '40HC All In']):
                         ziel_sheet, header_idx = sheet_name, i
                         break
                 if ziel_sheet: break
-            
-            # Jetzt laden wir NUR das EINE richtige Sheet komplett in den Arbeitsspeicher
             df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
         else:
             df_raw = pd.read_csv(datei, header=None, low_memory=False)
@@ -178,8 +184,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                     header_idx = i; break
 
         global_contract = "Unbekannt"
-        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): 
-            global_contract = fn_match.group(1)
+        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): global_contract = fn_match.group(1)
 
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
@@ -191,9 +196,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
         contract_col = next((c for c in df_raw.columns if any(x in c.lower() for x in ['contract', 'quote', 'reference'])), None)
         
-        # Datums-Konvertierung direkt im Cache erledigen (spart Rechenleistung bei der Suche)
-        if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce')
-        if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce')
+        if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
+        if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
         if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
             standard_rows = []
@@ -215,31 +219,31 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             df_raw['Contract Number'] = df_raw[contract_col].astype(str).fillna(global_contract) if contract_col else global_contract
             df_return = df_raw
             
-        # Datum auch bei Maersk/Standard sofort cachen
-        if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce')
-        if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce')
+        if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
+        if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
         
         return df_return, "Excel/CSV"
 
-# --- HAUPTPROGRAMM ---
-if not uploaded_files:
-    st.info("💡 Bitte lade oben eine Excel- oder PDF-Datei hoch, um die Suche zu starten.")
-else: 
-    alle_daten = []
-    with st.spinner("Lese Dateien ein (Optimierter Modus)..."):
-        for datei in uploaded_files:
-            try:
-                df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
-                if not df_teil.empty:
-                    alle_daten.append(df_teil)
-                    st.success(f"✅ {datei.name} erfolgreich geladen!")
-            except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
-    
-    if alle_daten:
-        df = pd.concat(alle_daten, ignore_index=True)
-        st.markdown("---")
+
+# --- TABS FÜR UI ---
+tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
+
+# === TAB 1: SUCHEN (LÄDT AUS DER DATENBANK) ===
+with tab_suche:
+    # Lade alle Daten aus MongoDB in den Zwischenspeicher
+    cursor = collection.find({})
+    daten_liste = list(cursor)
+
+    if not daten_liste:
+        st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
+    else:
+        df = pd.DataFrame(daten_liste)
         
-        st.write("### 🔍 Suche in ALLEN hochgeladenen Dokumenten")
+        # Datums-Spalten für die Suche in Pandas-Format zurückwandeln
+        if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
+        if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
+        
+        st.write(f"### 🔍 Suche in der Datenbank ({len(df)} Raten aktiv)")
         c1, c2, c3, c4 = st.columns(4)
         with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
         with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
@@ -265,7 +269,6 @@ else:
                 treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
                 treffer = treffer.sort_values(by='Total_EUR_Sort')
                 
-                # UI SCHUTZ: Wir zeigen nur die Top 50 an, damit der Browser nicht überlastet.
                 st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
                 
                 for _, row in treffer.head(50).iterrows():
@@ -276,3 +279,34 @@ else:
                         anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
                         if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
             else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
+
+
+# === TAB 2: ADMIN UPLOAD ===
+with tab_upload:
+    st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
+    uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
+            alle_daten = []
+            with st.spinner("Lese Dateien und speichere in Datenbank..."):
+                for datei in uploaded_files:
+                    try:
+                        df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
+                        if not df_teil.empty:
+                            alle_daten.append(df_teil)
+                    except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
+            
+                if alle_daten:
+                    df_upload = pd.concat(alle_daten, ignore_index=True)
+                    
+                    # WICHTIG: Erstellungsdatum für den MongoDB TTL-Index hinzufügen (Auto-Delete nach 6 Monaten)
+                    df_upload['createdAt'] = datetime.now(timezone.utc)
+                    
+                    # Pandas Dataframe in eine Liste von Dictionarys verwandeln
+                    records = df_upload.to_dict('records')
+                    
+                    if records:
+                        collection.insert_many(records) # Ab in die Datenbank damit!
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                        st.balloons()
