@@ -195,55 +195,67 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
-            # --- ZUSCHLÄGE EXTRAHIEREN (MIT NEUER PSS/TEU LOGIK) ---
+            # --- ZUSCHLÄGE EXTRAHIEREN (MIT VERBESSERTEM SCHMUTZ-FILTER) ---
             prepaid_list = []
             
             def find_surcharge(name, patterns, text_data, force_teu=False, prevent_teu=False):
-                # Regex akzeptiert auch Zahlen ohne Währung (wie das defekte 250,000 im PDF)
-                regex = r'(?:' + '|'.join(patterns) + r')[\s\S]{1,150}?(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)(?:\s*(EUR|USD|LISD|SEUR))?'
-                matches = list(re.finditer(regex, text_data, re.IGNORECASE))
+                regex_name = r'(?:' + '|'.join(patterns) + r')'
+                valid_amounts = []
                 
-                if matches:
-                    valid_amounts = []
-                    for m in matches:
-                        num_str = m.group(1).replace(',', '.')
+                for m in re.finditer(regex_name, text_data, re.IGNORECASE):
+                    # Schneidet 120 Zeichen nach dem gefundenen Wort (z.B. "ETS") aus
+                    block = text_data[m.end():m.end()+120]
+                    
+                    # BLOCKER: Wenn der Zuschlag "not subject to" oder "incl." ist, brechen wir hier sofort ab!
+                    if re.search(r'^\s*(?:not subject to|incl\.?|included|n/a)', block, re.IGNORECASE):
+                        continue
+                    
+                    # Sucht zwingend nach einer Zahl gefolgt von Währung! Das ignoriert "Q1/2026"
+                    price_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)\s*(EUR|USD|LISD|SEUR)', block, re.IGNORECASE)
+                    
+                    if price_match:
+                        num_str = price_match.group(1).replace(',', '.')
                         if num_str.count('.') > 1:
                             num_str = num_str.rsplit('.', 1)[0].replace('.', '') + '.' + num_str.rsplit('.', 1)[1]
                         try:
                             parsed_val = float(num_str)
-                            if parsed_val < 5000: # Ignoriert absurde Lesefehler
-                                valid_amounts.append((parsed_val, m))
+                            if parsed_val < 5000: # Ignoriert Fehler
+                                valid_amounts.append((parsed_val, price_match, block))
                         except ValueError:
                             pass
+
+                val = None
+                curr = "USD"
+                
+                if valid_amounts:
+                    if name == "PSS":
+                        valid_amounts.sort(key=lambda x: x[0])
+                        best_val, best_match, best_block = valid_amounts[-1]
+                    else:
+                        best_val, best_match, best_block = valid_amounts[0]
+                        
+                    val = best_val
+                    curr = best_match.group(2).upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
                     
-                    if valid_amounts:
-                        if name == "PSS":
-                            # Für PSS sammeln wir ALLE Werte und nehmen den höchsten (z.B. das 250 EUR Update)
-                            valid_amounts.sort(key=lambda x: x[0])
-                            best_val, best_match = valid_amounts[-1]
-                        else:
-                            # Für alle anderen nehmen wir den ersten sauberen Wert, um Lesefehler am Seitenende zu meiden
-                            best_val, best_match = valid_amounts[0]
-                            
-                        val = best_val
-                        
-                        if best_match.group(2):
-                            curr = best_match.group(2).upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
-                        else:
-                            curr = "EUR" # Fallback, falls die Währung im PDF fehlt
-                        
-                        is_teu = force_teu
-                        if not is_teu and not prevent_teu:
-                            ctx = text_data[best_match.end():best_match.end()+40].lower()
-                            if 'teu' in ctx or 'teli' in ctx or ('20' in ctx and '40' not in ctx):
-                                is_teu = True
-                        
-                        if is_teu:
-                            val *= 2
-                            
-                        if val.is_integer(): return f"{name} = {int(val)} {curr}"
-                        else: return f"{name} = {val:.2f} {curr}"
-                        
+                    is_teu = force_teu
+                    if not is_teu and not prevent_teu:
+                        ctx = best_block.lower()
+                        if 'teu' in ctx or 'teli' in ctx or ('20' in ctx and '40' not in ctx):
+                            is_teu = True
+                    
+                    if is_teu:
+                        val *= 2
+
+                # --- SONDERLOGIK FÜR ZERSCHOSSENES PSS-UPDATE ---
+                if name == "PSS" and val is None:
+                    if re.search(r'\b250[,.]?(?:00|000)?\b', text_data):
+                        val = 250
+                        curr = "EUR"
+
+                if val is not None and val > 0:
+                    if val.is_integer(): return f"{name} = {int(val)} {curr}"
+                    else: return f"{name} = {val:.2f} {curr}"
+                    
                 return None
 
             # Exakte Zuweisung der Verdopplungs-Regeln
@@ -253,7 +265,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             if s_ets: prepaid_list.append(s_ets)
             s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text, force_teu=True)
             if s_feu: prepaid_list.append(s_feu)
-            s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text, prevent_teu=True) # PSS wird NICHT verdoppelt!
+            s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text, prevent_teu=True)
             if s_pss: prepaid_list.append(s_pss)
             s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF"], text, force_teu=True)
             if s_brc: prepaid_list.append(s_brc)
