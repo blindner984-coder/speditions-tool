@@ -25,7 +25,6 @@ st.markdown("""
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
-# Hier ist dein persönlicher Connection-Link inklusive Passwort sicher hinterlegt:
 MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 @st.cache_resource
@@ -34,7 +33,7 @@ def init_db():
     db = client["SpeditionsDB"]
     collection = db["Raten"]
     
-    # ⚠️ MAGIE: Erstellt einen TTL-Index. Löscht Dokumente automatisch nach 180 Tagen (15.552.000 Sekunden)
+    # Erstellt einen TTL-Index. Löscht Dokumente automatisch nach 180 Tagen (15.552.000 Sekunden)
     collection.create_index("createdAt", expireAfterSeconds=15552000)
     
     return collection
@@ -230,7 +229,6 @@ tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (A
 
 # === TAB 1: SUCHEN (LÄDT AUS DER DATENBANK) ===
 with tab_suche:
-    # Lade alle Daten aus MongoDB in den Zwischenspeicher
     cursor = collection.find({})
     daten_liste = list(cursor)
 
@@ -239,7 +237,6 @@ with tab_suche:
     else:
         df = pd.DataFrame(daten_liste)
         
-        # Datums-Spalten für die Suche in Pandas-Format zurückwandeln
         if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
         
@@ -299,14 +296,19 @@ with tab_upload:
             
                 if alle_daten:
                     df_upload = pd.concat(alle_daten, ignore_index=True)
-                    
-                    # WICHTIG: Erstellungsdatum für den MongoDB TTL-Index hinzufügen (Auto-Delete nach 6 Monaten)
                     df_upload['createdAt'] = datetime.now(timezone.utc)
-                    
-                    # Pandas Dataframe in eine Liste von Dictionarys verwandeln
                     records = df_upload.to_dict('records')
                     
                     if records:
-                        collection.insert_many(records) # Ab in die Datenbank damit!
+                        collection.insert_many(records) 
                         st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                         st.balloons()
+    
+    # --- NEU: GEFAHRENZONE (DATENBANK LEEREN) ---
+    st.markdown("---")
+    st.write("### 🚨 Gefahrenzone")
+    st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
+    
+    if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
+        ergebnis_all = collection.delete_many({})
+        st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
