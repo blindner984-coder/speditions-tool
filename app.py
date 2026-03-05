@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 import re
-import PyPDF2
 import warnings
 import io
 import requests
 import pymongo
+import pdfplumber
 from datetime import datetime, timezone
 
 # 1. Warnungen unterdrücken
@@ -165,59 +165,112 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     
     if datei.name.lower().endswith('.pdf'):
         try:
-            reader = PyPDF2.PdfReader(datei)
-            text = " ".join([page.extract_text() for page in reader.pages])
-            
-            date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
-            v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
-            v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
-            
-            # --- Ultra-strikte POL/POD Erkennung ---
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
-            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            
-            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
-            if not pod_match:
-                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
-            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
-            
-            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
-            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
-            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
-            
-            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
-            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
-            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
-            
-            if len(pol_str) > 25: pol_str = "Unbekannt"
-            if len(pod_str) > 25: pod_str = "Unbekannt"
+            with pdfplumber.open(datei) as pdf:
+                full_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+                
+            # --- 1. METADATEN (Vertrag, Datum, POL) ---
+            contract_match = re.search(r'Contract Filing Reference[\s:]*([A-Z0-9]+)', full_text, re.IGNORECASE)
+            contract_no = contract_match.group(1).strip() if contract_match else "Unbekannt"
 
-            contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
-            contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
+            valid_from, valid_to = "Unbekannt", "Unbekannt"
+            val_match = re.search(r'Valid as from (\d{2}\.\d{2}\.\d{4}).*?not beyond (\d{2}\.\d{2}\.\d{4})', full_text, re.IGNORECASE)
+            if val_match:
+                valid_from, valid_to = val_match.group(1), val_match.group(2)
+
+            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,]+)(?:\n|Validity|Ports? of Discharge)', full_text, re.IGNORECASE)
+            global_pol = pol_match.group(1).strip() if pol_match else "Unbekannt"
             
-            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
-            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text)
+            # --- 2. ZUSCHLÄGE (Prepaid) ---
+            prep_surcharges = []
+            def find_surcharge(code, name):
+                match = re.search(rf'{code}.*?(?:{name})?.*?(\d+[,.]\d{{0,2}})\s*(EUR|USD)', full_text, re.IGNORECASE)
+                if match:
+                    return f"{code} = {match.group(1).replace(',', '.')} {match.group(2).upper()}"
+                return None
+
+            for code, name in [("ETS", "Emissions Trading"), ("FEU", "Fuel EU"), ("ERC", "Logistic Fee"), ("OCC", "Operation Cost")]:
+                res = find_surcharge(code, name)
+                if res: prep_surcharges.append(res)
+                
+            prep_surcharges_str = ", ".join(prep_surcharges)
+
+            # --- 3. TABELLEN AUSLESEN (Raten & PODs) ---
+            raten_zeilen = []
+            current_pod = "Unbekannt"
             
-            df_pdf = pd.DataFrame([{
-                'Carrier': 'MSC (aus PDF)',
-                'Contract Number': contract_no,
-                'Port of Loading': pol_str,
-                'Port of Destination': pod_str,
-                'Valid from': v_from,
-                'Valid to': v_to,
-                '40HC': float(rate_match.group(1)) if rate_match else 0,
-                'Currency': rate_match.group(2) if rate_match else "USD",
-                'Included Prepaid Surcharges 40HC': f"ERC = {erc_match.group(1)} {erc_match.group(2)}" if erc_match else "",
-                'Included Collect Surcharges 40HC': "",
-                'Remark': 'Automatisch aus PDF importiert'
-            }])
+            with pdfplumber.open(datei) as pdf:
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        for row in table:
+                            # Bereinigung der Zelle (Zeilenumbrüche entfernen)
+                            clean_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
+                            row_text = " | ".join(clean_row).lower()
+                            
+                            if not any(clean_row): continue
+                            
+                            # Fall 1: Zielhafen steht als Überschrift in der Tabelle (wie im Nordafrika-PDF)
+                            if "port of discharge" in str(clean_row[0]).lower():
+                                pod_kandidat = clean_row[0].lower().replace("port of discharge", "").strip()
+                                if pod_kandidat:
+                                    current_pod = pod_kandidat.title()
+                                continue
+                                
+                            # Header-Zeilen ignorieren
+                            if "freetime" in row_text or "surcharge name" in row_text:
+                                continue
+
+                            # Raten suchen (Betrag + EUR/USD)
+                            rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
+                            
+                            if rate_matches:
+                                # Wenn es 20' und 40' gibt, nehmen wir den letzten Match (meistens die 40' Rate)
+                                target_match = rate_matches[-1] 
+                                betrag = float(target_match[0].replace(',', '.'))
+                                waehrung = target_match[1].upper()
+                                
+                                pol = global_pol
+                                pod = current_pod
+                                
+                                # Fall 2: Hafen steht in der ersten Spalte (Standard)
+                                if "via pol" not in str(clean_row[0]).lower():
+                                    potential_pod = clean_row[0]
+                                    # Ländercodes wie " QA" oder " SA" abschneiden
+                                    potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', potential_pod).strip()
+                                    if 2 < len(potential_pod) < 25 and not any(char.isdigit() for char in potential_pod):
+                                        pod = potential_pod
+                                # Fall 3: Ladehafen wird in der Tabelle überschrieben ("via POL HAM/BRV")
+                                else:
+                                    pol = str(clean_row[0]).replace("via POL", "").replace("Via POL", "").strip()
+
+                                if pod != "Unbekannt" and betrag > 0:
+                                    raten_zeilen.append({
+                                        'Carrier': 'MSC',
+                                        'Contract Number': contract_no,
+                                        'Port of Loading': pol,
+                                        'Port of Destination': pod,
+                                        'Valid from': valid_from,
+                                        'Valid to': valid_to,
+                                        '40HC': betrag,
+                                        'Currency': waehrung,
+                                        'Included Prepaid Surcharges 40HC': prep_surcharges_str,
+                                        'Included Collect Surcharges 40HC': "",
+                                        'Remark': 'Automatisch aus PDF importiert'
+                                    })
+
+            if not raten_zeilen:
+                raise ValueError("Keine Raten in den Tabellen gefunden.")
+
+            df_return = pd.DataFrame(raten_zeilen).drop_duplicates()
             
-            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
-            if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+            # Datumsfelder für deinen Filter aufbereiten
+            if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
+            if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
+
+            return df_return, "PDF"
             
-            return df_pdf, "PDF"
-        except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
+        except Exception as e: 
+            return pd.DataFrame(), f"Fehler beim PDF Import: {e}"
 
     else:
         if datei.name.endswith('.xlsx'):
