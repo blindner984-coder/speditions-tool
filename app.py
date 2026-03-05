@@ -217,21 +217,32 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
-        # --- HIER IST DER FIX FÜR MAERSK CONTRACTS ---
+        # --- 🚨 FIX FÜR MAERSK CONTRACT NUMBERS ---
         global_contract = "Unbekannt"
         
-        # 1. Check im Dateinamen
-        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): 
-            global_contract = fn_match.group(1)
+        # 1. Check im Dateinamen (jetzt auch mit Buchstaben erlaubt, z.B. QTE12345)
+        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?([a-zA-Z0-9]{6,15})', datei.name, re.IGNORECASE): 
+            global_contract = fn_match.group(1).upper()
             
-        # 2. Check in den Kopfzeilen des Dokuments (besonders wichtig für Maersk Excel-Dateien!)
-        for i in range(min(20, len(df_raw))):
-            row_str = " ".join(df_raw.iloc[i].dropna().astype(str))
-            row_lower = row_str.lower()
-            if any(w in row_lower for w in ['contract', 'quote', 'reference', 'ref']):
-                nums = re.findall(r'\b\d{6,12}\b', row_str)
-                if nums:
-                    global_contract = " / ".join(dict.fromkeys(nums))
+        # 2. Präziser Check in den Excel-Kopfzeilen (Zelle für Zelle)
+        if global_contract == "Unbekannt":
+            for i in range(min(20, len(df_raw))):
+                row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
+                for j, val in enumerate(row_vals):
+                    v_low = val.lower()
+                    if any(w in v_low for w in ['contract', 'quote', 'reference', 'ref']):
+                        # Prüft, ob die Nummer in der gleichen Zelle steht (z.B. "Contract: 1234567")
+                        nums = re.findall(r'\b[A-Z0-9]{6,15}\b', val.upper())
+                        if nums and nums[0].lower() not in ['contract', 'reference', 'quote']:
+                            global_contract = nums[0]
+                            break
+                        # Prüft, ob die Nummer in der Zelle DIREKT DANEBEN steht
+                        if j + 1 < len(row_vals):
+                            next_val = row_vals[j+1].strip()
+                            if len(next_val) >= 4:  # Mindestens 4 Zeichen lang
+                                global_contract = next_val
+                                break
+                if global_contract != "Unbekannt":
                     break
 
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
@@ -255,9 +266,9 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                 if len(val_raw) < 2: continue
                 
-                # Sichert ab, falls die Contract-Spalte zwar existiert, aber bei Maersk 'NaN' drinsteht
+                # Sichert ab, falls die Contract-Spalte existiert, aber bei Maersk leer ist
                 row_contract = str(bas_row[contract_col].values[0]) if contract_col else ""
-                if row_contract.lower() == 'nan' or not row_contract.strip():
+                if row_contract.lower() in ['nan', 'none', 'nat', ''] or not row_contract.strip():
                     row_contract = global_contract
                 
                 standard_rows.append({
