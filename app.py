@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
-import pdfplumber  # Ersetzt PyPDF2 für professionelles Tabellen-Parsing
+import pdfplumber  # WICHTIG: Pip install pdfplumber nicht vergessen!
 import warnings
 import io
 import requests
@@ -41,7 +41,6 @@ def init_db():
     client = pymongo.MongoClient(MONGO_URI)
     db = client["SpeditionsDB"]
     collection = db["Raten"]
-    # TTL Index: Dokumente nach 180 Tagen (15552000 Sekunden) löschen
     collection.create_index("createdAt", expireAfterSeconds=15552000)
     return collection
 
@@ -161,7 +160,6 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
 
 # --- HILFSFUNKTION FÜR PDF-PREISE ---
 def parse_price(val_str):
-    """Macht aus wirren Strings wie '1.250,00', '550.00' oder '450' saubere Floats"""
     s = re.sub(r'[^\d,\.]', '', val_str)
     if not s: return 0.0
     if ',' in s and len(s.split(',')[-1]) == 2:
@@ -178,11 +176,9 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
     
-    # === NEUER PDFPLUMBER PDF-PARSER ===
     if datei.name.lower().endswith('.pdf'):
         try:
             with pdfplumber.open(datei) as pdf:
-                # Metadaten vom ersten Blatt extrahieren
                 first_page_text = pdf.pages[0].extract_text() or ""
                 full_text = " ".join([p.extract_text() or "" for p in pdf.pages])
                 
@@ -205,29 +201,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 raten_liste = []
                 current_pod = "Unbekannt"
                 
-                # Tabellen auslesen und zeilenweise verarbeiten
                 for page in pdf.pages:
+                    # NEU: Flexible Tabellenerkennung (auch für "unsichtbare" Tabellen ohne Linien)
                     tables = page.extract_tables()
+                    if not tables:
+                        tables = page.extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+                        
                     for table in tables:
                         if not table: continue
                         
                         idx_40hc = -1
                         
                         for row in table:
-                            # Leere Zellen entfernen und bereinigen
                             row_texts = [str(c).replace('\n', ' ').strip() for c in row if c]
                             if not row_texts: continue
                             row_joined = " ".join(row_texts).lower()
 
-                            # Blockiere Zuschlags-Zeilen (wir wollen hier nur die Basis/All-In Rate)
                             if re.search(r'\b(surcharge|fee|thc|pss|ets|eca|bac|isps|charge|factor)\b', row_joined, re.IGNORECASE):
                                 continue
 
-                            # Sucht nach dynamischen Überschriften für POD (z.B. "Port of Discharge Casablanca")
                             pod_m = re.search(r'port of discharge\s*([a-z\s]+)', row_joined)
                             if pod_m: current_pod = pod_m.group(1).strip().title()
 
-                            # Spalten-Index für 40' Container finden
                             for i, cell in enumerate(row_texts):
                                 if re.search(r"40'?\s*(?:dv|hc|all in)", cell, re.IGNORECASE):
                                     idx_40hc = i
@@ -235,7 +230,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                             rate_val = 0
                             currency = "USD"
                             
-                            # Wenn wir wissen, wo der 40' Preis steht, ziehen wir ihn raus
                             if idx_40hc != -1 and len(row_texts) > idx_40hc:
                                 cell_val = row_texts[idx_40hc]
                                 rate_m = re.search(r'([\d\.,]{3,9})\s*(USD|EUR)', cell_val, re.IGNORECASE)
@@ -248,7 +242,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                         rate_val = parse_price(num_m.group(1))
                                         currency = "EUR" if "eur" in full_text.lower() else "USD"
 
-                            # Wenn Preis > 0 gefunden wurde -> Datensatz anlegen
                             if rate_val > 0:
                                 row_pol = default_pol
                                 if "via pol" in row_texts[0].lower():
@@ -275,19 +268,17 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                     'Remark': 'Importiert mit Tabellen-Erkennung'
                                 })
                 
-                # DataFrame aus der Liste generieren
                 if raten_liste:
                     df_pdf = pd.DataFrame(raten_liste)
                     if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
                     if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
                     return df_pdf, "PDF (Matrix)"
                 else:
-                    return pd.DataFrame(), "Keine gültigen Raten-Tabellen gefunden."
+                    return pd.DataFrame(), "Keine Raten gefunden"
 
         except Exception as e:
             return pd.DataFrame(), f"Fehler bei PDF-Verarbeitung: {e}"
 
-    # === EXCEL / CSV PARSER (UNVERÄNDERT) ===
     else:
         if datei.name.endswith('.xlsx'):
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
@@ -374,9 +365,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         return df_return, "Excel/CSV"
 
 
-# --- TABS FÜR UI ---
-tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
-
 # === TAB 1: SUCHEN ===
 with tab_suche:
     cursor = collection.find({})
@@ -446,11 +434,13 @@ with tab_upload:
                             alle_daten.append(df_teil)
                     except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
             
-                if alle_daten:
+                # NEU: Verbesserte Fehlermeldung, wenn Dateien zwar gelesen wurden, aber keine Daten extrahiert werden konnten
+                if not alle_daten:
+                    st.warning("⚠️ Die Dateien wurden gelesen, aber das Skript konnte keine gültigen 40'HC Preise darin finden. Bitte überprüfe die PDFs.")
+                else:
                     df_upload = pd.concat(alle_daten, ignore_index=True)
                     df_upload['createdAt'] = datetime.now(timezone.utc)
                     
-                    # --- NEU: VORSCHAU DER ERKANNTEN DATEN ---
                     st.write("### 👁️ Vorschau der erkannten Daten (Auszug)")
                     st.dataframe(df_upload[['Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination', '40HC', 'Currency']].head(20))
                     
@@ -458,7 +448,7 @@ with tab_upload:
                     
                     if records:
                         collection.insert_many(records) 
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich aus den Tabellen extrahiert und in die Datenbank geschrieben.")
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich extrahiert und in die Datenbank geschrieben.")
                         st.balloons()
     
     # --- GEFAHRENZONE (DATENBANK LEEREN) ---
