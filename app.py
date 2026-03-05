@@ -172,73 +172,87 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
+            # --- Ultra-strikte POL (Ladehafen) Erkennung ---
             pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,\-]{3,60}?)(?=\s+(?:Validity|Valid|Terms|Ports?\s+of\s+Discharge|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            
-            pod_block_match = re.search(r'Port\s+of\s+Discharge(.*?)(\d+x|\d+\s*TEU|TEU|\d{3,4}\s*USD|\d{3,4}\s*EUR|via\s+POL|Validity|Valid)', text, re.IGNORECASE)
-            pod_str = "Unbekannt"
-            
-            if pod_block_match:
-                pod_raw = pod_block_match.group(1)
-                stoerwoerter = ["Volume", "40' DV/HC", "40'DV/HC", "20' DV", "20'DV", "Freetime at POL", "Freetime at POD", "Freetime Origin", "Freetime Destination", "Remarks", "combined", "days", "dem/det"]
-                for word in stoerwoerter:
-                    pod_raw = re.sub(r'(?i)\b' + re.escape(word) + r'\b', '', pod_raw)
-                
-                pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_raw).strip()
-                pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip() 
-                pod_str = " ".join(pod_str.split()) 
-                
-                if len(pod_str) > 35 or len(pod_str) < 3: 
-                    pod_str = "Unbekannt"
-            
             pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
             pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
             pol_str = " ".join(pol_str.split())
             if len(pol_str) > 50: pol_str = "Unbekannt"
+
+            # --- POD (Zielhafen) ERKENNUNG (Korrigiert für Dammam/Jeddah) ---
+            # Sucht gezielt HINTER den letzten Tabellenüberschriften nach dem Hafen
+            pod_match = re.search(r'(?:Freetime at POD|Freetime Destination|Remarks)[\s\n]*([A-Za-z\s\-]+?)\s*(?:\d+x|\d+\s*TEU|\d{3,4}\s*USD|\d{3,4}\s*EUR)', text, re.IGNORECASE)
+            pod_str = "Unbekannt"
+            
+            if pod_match:
+                pod_raw = pod_match.group(1)
+                pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_raw).strip()
+                pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip() 
+                pod_str = " ".join(pod_str.split()) 
+                if len(pod_str) > 35 or len(pod_str) < 3: 
+                    pod_str = "Unbekannt"
+            
+            # Notfall-Fallback, falls die obere Suche fehlschlägt
+            if pod_str == "Unbekannt":
+                pod_fallback = re.search(r'Port\s+of\s+Discharge[\s\n]*([A-Za-z\s\-]{3,30}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
+                if pod_fallback:
+                    pod_raw = pod_fallback.group(1)
+                    for w in ["Volume", "DV", "HC", "Freetime", "Remarks"]:
+                        pod_raw = re.sub(r'(?i)\b' + w + r'\b', '', pod_raw)
+                    pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_raw).strip()
+                    pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
+                    pod_str = " ".join(pod_str.split())
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
             rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
             
-            # --- NEU: ERWEITERTE ZUSCHLÄGE EXTRAHIEREN (ERC, ETS, FEU, PSS, BRC) ---
+            # --- SUPER-ROBUSTE EXTRAKTION ALLER ZUSCHLÄGE ---
             prepaid_list = []
             
-            # 1. ERC (Logistic Fee)
-            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text, re.IGNORECASE)
-            if erc_match:
-                prepaid_list.append(f"ERC = {erc_match.group(1)} {erc_match.group(2).upper()}")
-                
-            # 2. ETS (Emissions Trading System) - wird verdoppelt (TEU Basis)
-            ets_match = re.search(r'Emissions Trading System.*?(\d+)\s*(EUR|USD)', text, re.IGNORECASE)
-            if ets_match:
-                ets_val = float(ets_match.group(1)) * 2
-                prepaid_list.append(f"ETS = {ets_val:.0f} {ets_match.group(2).upper()}")
-                
-            # 3. FEU (EU Fuel) - wird verdoppelt (TEU Basis)
-            feu_match = re.search(r'(?:EU Fuel|Fuel EU).*?(\d+)\s*(EUR|USD)', text, re.IGNORECASE)
-            if feu_match:
-                feu_val = float(feu_match.group(1)) * 2
-                prepaid_list.append(f"FEU = {feu_val:.0f} {feu_match.group(2).upper()}")
-                
-            # 4. PSS (Peak Season Surcharge) - Intelligente TEU Erkennung
-            pss_match = re.search(r'(?:Peak Season Surcharge|PSS).*?(\d+)\s*(EUR|USD)', text, re.IGNORECASE)
-            if pss_match:
-                pss_val = float(pss_match.group(1))
-                context = text[pss_match.end():pss_match.end()+30].lower() # Prüft die nächsten 30 Zeichen nach dem Wert
-                if 'teu' in context or '20' in context:
-                    pss_val *= 2
-                prepaid_list.append(f"PSS = {pss_val:.0f} {pss_match.group(2).upper()}")
+            def find_surcharge(name, regex_pattern, text_data, is_teu=False):
+                # [\s\S]{1,80}? überbrückt Zeilenumbrüche und störende Datumsangaben (z.B. Q1/2026) bis zum Preis
+                match = re.search(regex_pattern + r'[\s\S]{1,80}?([\d.,]+)\s*(EUR|USD|LISD)', text_data, re.IGNORECASE)
+                if match:
+                    val_str = match.group(1).replace(',', '.')
+                    nums = re.findall(r'\d+\.?\d*', val_str)
+                    if not nums: return None
+                    val = float(nums[0])
+                    curr = match.group(2).upper().replace('LISD', 'USD') # Behebt PDF-Scan-Fehler
+                    
+                    # TEU Prüfung (Wenn pro 20' Fuß berechnet wird, verdoppeln wir für 40'HC)
+                    if not is_teu:
+                        context = text_data[match.end():match.end()+40].lower()
+                        if 'teu' in context or 'teli' in context or '20' in context:
+                            is_teu = True
+                            
+                    if is_teu:
+                        val *= 2
+                        
+                    # Saubere Formatierung (ohne unnötige .00)
+                    if val.is_integer():
+                        return f"{name} = {int(val)} {curr}"
+                    else:
+                        return f"{name} = {val:.2f} {curr}"
+                return None
 
-            # 5. BRC / BAF (Bunker Recovery Charge) - Intelligente TEU Erkennung
-            brc_match = re.search(r'(?:Bunker Recovery Charge|BRC|BAF).*?(\d+)\s*(EUR|USD)', text, re.IGNORECASE)
-            if brc_match:
-                brc_val = float(brc_match.group(1))
-                context = text[brc_match.end():brc_match.end()+30].lower()
-                if 'teu' in context or '20' in context:
-                    brc_val *= 2
-                prepaid_list.append(f"BRC = {brc_val:.0f} {brc_match.group(2).upper()}")
-                
+            s_erc = find_surcharge("ERC", r'Logistic Fee|Equipment Repositioning', text, is_teu=False)
+            if s_erc: prepaid_list.append(s_erc)
+            
+            s_ets = find_surcharge("ETS", r'Emissions Trading System', text, is_teu=True)
+            if s_ets: prepaid_list.append(s_ets)
+            
+            s_feu = find_surcharge("FEU", r'(?:EU Fuel|Fuel EU)', text, is_teu=True)
+            if s_feu: prepaid_list.append(s_feu)
+            
+            s_pss = find_surcharge("PSS", r'(?:Peak Season Surcharge|PSS)', text, is_teu=False)
+            if s_pss: prepaid_list.append(s_pss)
+            
+            s_brc = find_surcharge("BRC", r'(?:Bunker Recovery Charge|BRC|BAF)', text, is_teu=False)
+            if s_brc: prepaid_list.append(s_brc)
+            
             prepaid_str = ", ".join(prepaid_list)
             
             df_pdf = pd.DataFrame([{
