@@ -34,8 +34,7 @@ except FileNotFoundError:
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
-MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-
+MONGO_URI = st.secrets["MONGO_URI"]
 @st.cache_resource
 def init_db():
     client = pymongo.MongoClient(MONGO_URI)
@@ -449,3 +448,4 @@ with tab_upload:
     if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
         ergebnis_all = collection.delete_many({})
         st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+
