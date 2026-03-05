@@ -35,6 +35,7 @@ st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
 MONGO_URI = st.secrets["MONGO_URI"]
+
 @st.cache_resource
 def init_db():
     client = pymongo.MongoClient(MONGO_URI)
@@ -70,7 +71,7 @@ def ist_doc_gebuehr(name):
 # --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
-    treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
+    treffer = re.findall(r'([A-Za-z0-9\s\(\)\-\']+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
     liste = []
     for t in treffer:
         try: liste.append({"name": t[0].strip().lstrip(','), "betrag": float(t[1].replace('.', '').replace(',', '.')), "waehrung": t[2].upper()})
@@ -164,105 +165,146 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     
     if datei.name.lower().endswith('.pdf'):
         try:
-            with pdfplumber.open(datei) as pdf:
-                full_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
-                
-            # --- 1. METADATEN (Vertrag, Datum, POL) ---
-            contract_match = re.search(r'Contract Filing Reference[\s:]*([A-Z0-9]+)', full_text, re.IGNORECASE)
-            contract_no = contract_match.group(1).strip() if contract_match else "Unbekannt"
-
-            valid_from, valid_to = "Unbekannt", "Unbekannt"
-            val_match = re.search(r'Valid as from (\d{2}\.\d{2}\.\d{4}).*?not beyond (\d{2}\.\d{2}\.\d{4})', full_text, re.IGNORECASE)
-            if val_match:
-                valid_from, valid_to = val_match.group(1), val_match.group(2)
-
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,]+)(?:\n|Validity|Ports? of Discharge)', full_text, re.IGNORECASE)
-            global_pol = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            
-            # --- 2. ZUSCHLÄGE (Prepaid) ---
-            prep_surcharges = []
-            def find_surcharge(code, name):
-                match = re.search(rf'{code}.*?(?:{name})?.*?(\d+[,.]\d{{0,2}})\s*(EUR|USD)', full_text, re.IGNORECASE)
-                if match:
-                    return f"{code} = {match.group(1).replace(',', '.')} {match.group(2).upper()}"
-                return None
-
-            for code, name in [("ETS", "Emissions Trading"), ("FEU", "Fuel EU"), ("ERC", "Logistic Fee"), ("OCC", "Operation Cost")]:
-                res = find_surcharge(code, name)
-                if res: prep_surcharges.append(res)
-                
-            prep_surcharges_str = ", ".join(prep_surcharges)
-
-            # --- 3. TABELLEN AUSLESEN (Raten & PODs) ---
             raten_zeilen = []
+            prep_surcharges = []
+            coll_surcharges = []
+            
+            global_pol = "Unbekannt"
+            contract_no = "Unbekannt"
+            valid_from = "Unbekannt"
+            valid_to = "Unbekannt"
             current_pod = "Unbekannt"
             
             with pdfplumber.open(datei) as pdf:
                 for page in pdf.pages:
                     tables = page.extract_tables()
                     for table in tables:
+                        is_surcharge_table = False
+                        
+                        # Prüfen, ob es eine Gebührentabelle ist
+                        for i in range(min(3, len(table))):
+                            header = " ".join([str(c).lower() for c in table[i] if c])
+                            if "surcharge name" in header or "code" in header or "currency adjustment" in header:
+                                is_surcharge_table = True
+                                break
+                        
                         for row in table:
-                            # Bereinigung der Zelle (Zeilenumbrüche entfernen)
-                            clean_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
-                            row_text = " | ".join(clean_row).lower()
-                            
+                            clean_row = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
                             if not any(clean_row): continue
+                            col0 = str(clean_row[0]).lower()
                             
-                            # Fall 1: Zielhafen steht als Überschrift in der Tabelle (wie im Nordafrika-PDF)
-                            if "port of discharge" in str(clean_row[0]).lower():
-                                pod_kandidat = clean_row[0].lower().replace("port of discharge", "").strip()
-                                if pod_kandidat:
-                                    current_pod = pod_kandidat.title()
+                            # --- 1. METADATEN (Vertrag, Datum, POL) direkt aus der Tabelle lesen ---
+                            if "ports of loading" in col0 or "port of loading" in col0:
+                                if len(clean_row) > 1 and clean_row[1]: global_pol = clean_row[1]
+                                continue
+                            if "contract filing reference" in col0 or "contract" in col0:
+                                if len(clean_row) > 1 and clean_row[1]:
+                                    m = re.search(r'([A-Z0-9]{8,15})', clean_row[1])
+                                    if m: contract_no = m.group(1)
+                                continue
+                            if "validity" in col0 or "valid" in col0:
+                                if len(clean_row) > 1 and clean_row[1]:
+                                    v_match = re.findall(r'(\d{2}\.\d{2}\.\d{4})', clean_row[1])
+                                    if len(v_match) >= 2: valid_from, valid_to = v_match[0], v_match[1]
                                 continue
                                 
-                            # Header-Zeilen ignorieren
-                            if "freetime" in row_text or "surcharge name" in row_text:
+                            # --- 2. ZUSCHLÄGE (Prepaid & Collect) ---
+                            if is_surcharge_table:
+                                row_text = " ".join(clean_row)
+                                if "surcharge name" in col0 or "code" in col0: continue
+                                
+                                code = ""
+                                code_match = re.match(r'^([A-Za-z\']{2,4})\b', clean_row[0]) 
+                                if code_match: 
+                                    code = code_match.group(1).replace("'", "") # z.B. ET'S zu ETS machen
+                                elif len(clean_row) > 1:
+                                    c2_match = re.match(r'^([A-Za-z\']{2,4})\b', clean_row[1])
+                                    if c2_match: code = c2_match.group(1).replace("'", "")
+                                    
+                                amt_match = re.search(r'(\d+(?:[,.]\d{2})?)\s*(EUR|USD)', row_text, re.IGNORECASE)
+                                if amt_match:
+                                    if not code: # Fallback, falls die Code-Spalte leer ist
+                                        if "peak season" in row_text.lower() or "pss" in row_text.lower(): code = "PSS"
+                                        elif "terminal" in row_text.lower(): code = "THC"
+                                        elif "bunker" in row_text.lower(): code = "BUC"
+                                        elif "emission" in row_text.lower(): code = "ETS"
+                                        else: code = "FEE"
+                                        
+                                    amt = amt_match.group(1).replace(',', '.')
+                                    curr = amt_match.group(2).upper()
+                                    entry = f"{code.upper()} = {amt} {curr}"
+                                    
+                                    if "collect" in row_text.lower() or "destination" in row_text.lower() or code.upper() == "OCC":
+                                        if entry not in coll_surcharges: coll_surcharges.append(entry)
+                                    else:
+                                        if entry not in prep_surcharges: prep_surcharges.append(entry)
                                 continue
-
-                            # Raten suchen (Betrag + EUR/USD)
-                            rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
                             
+                            # --- 3. RATEN & HÄFEN ---
+                            # Fall A: POD steht als Überschrift (Casablanca-PDF)
+                            if "port of discharge" in col0 and len(col0) > 17:
+                                pod_cand = col0.replace("port of discharge", "").replace(":", "").strip()
+                                if pod_cand: 
+                                    current_pod = pod_cand.title()
+                                continue
+                                
+                            if "freetime" in col0 or "volume" in col0 or "port of discharge" == col0:
+                                continue
+                                
+                            rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
                             if rate_matches:
-                                # Wenn es 20' und 40' gibt, nehmen wir den letzten Match (meistens die 40' Rate)
-                                target_match = rate_matches[-1] 
+                                target_match = rate_matches[-1] # Wenn es 20' & 40' gibt, nimm 40'
                                 betrag = float(target_match[0].replace(',', '.'))
                                 waehrung = target_match[1].upper()
                                 
-                                pol = global_pol
-                                pod = current_pod
+                                row_pol = global_pol
+                                row_pod = current_pod
                                 
-                                # Fall 2: Hafen steht in der ersten Spalte (Standard)
-                                if "via pol" not in str(clean_row[0]).lower():
-                                    potential_pod = clean_row[0]
-                                    # Ländercodes wie " QA" oder " SA" abschneiden
-                                    potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', potential_pod).strip()
-                                    if 2 < len(potential_pod) < 25 and not any(char.isdigit() for char in potential_pod):
-                                        pod = potential_pod
-                                # Fall 3: Ladehafen wird in der Tabelle überschrieben ("via POL HAM/BRV")
-                                else:
-                                    pol = str(clean_row[0]).replace("via POL", "").replace("Via POL", "").strip()
-
-                                if pod != "Unbekannt" and betrag > 0:
+                                # Fall B: POL wird in der Zeile überschrieben ("via POL HAM/BRV")
+                                via_pol_found = False
+                                for cell in clean_row:
+                                    c_str = str(cell).strip()
+                                    if c_str.lower().startswith("via pol"):
+                                        row_pol = c_str.lower().replace("via pol", "").strip().upper()
+                                        via_pol_found = True
+                                        break
+                                        
+                                # Fall C: Normaler POD steht ganz links (Dammam-PDF)
+                                if not via_pol_found and current_pod == "Unbekannt":
+                                    for cell in clean_row:
+                                        if cell:
+                                            potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', str(cell)).strip() # Länderkürzel filtern
+                                            if 2 < len(potential_pod) < 25 and not any(char.isdigit() for char in potential_pod):
+                                                row_pod = potential_pod
+                                            break
+                                            
+                                if row_pod != "Unbekannt" and betrag > 0:
                                     raten_zeilen.append({
                                         'Carrier': 'MSC',
                                         'Contract Number': contract_no,
-                                        'Port of Loading': pol,
-                                        'Port of Destination': pod,
+                                        'Port of Loading': row_pol,
+                                        'Port of Destination': row_pod,
                                         'Valid from': valid_from,
                                         'Valid to': valid_to,
                                         '40HC': betrag,
-                                        'Currency': waehrung,
-                                        'Included Prepaid Surcharges 40HC': prep_surcharges_str,
-                                        'Included Collect Surcharges 40HC': "",
-                                        'Remark': 'Automatisch aus PDF importiert'
+                                        'Currency': waehrung
                                     })
-
+            
+            # --- 4. DATEN ZUSAMMENFÜHREN ---
+            prep_str = ", ".join(prep_surcharges)
+            coll_str = ", ".join(coll_surcharges)
+            
+            for r in raten_zeilen:
+                r['Included Prepaid Surcharges 40HC'] = prep_str
+                r['Included Collect Surcharges 40HC'] = coll_str
+                r['Remark'] = 'Automatisch aus PDF importiert'
+                
             if not raten_zeilen:
                 raise ValueError("Keine Raten in den Tabellen gefunden.")
-
-            df_return = pd.DataFrame(raten_zeilen).drop_duplicates()
+                
+            # Löscht mögliche doppelte Zeilen (z.B. wenn eine Tabelle auf 2 Seiten rutscht)
+            df_return = pd.DataFrame(raten_zeilen).drop_duplicates(subset=['Port of Loading', 'Port of Destination', '40HC', 'Contract Number'])
             
-            # Datumsfelder für deinen Filter aufbereiten
             if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
             if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
@@ -384,7 +426,6 @@ with tab_suche:
 
         mask = pd.Series([True] * len(df))
         
-        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
         if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
         if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
         if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
@@ -448,4 +489,3 @@ with tab_upload:
     if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
         ergebnis_all = collection.delete_many({})
         st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
-
