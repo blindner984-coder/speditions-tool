@@ -195,30 +195,67 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
-            # --- ZUSCHLÄGE EXTRAHIEREN ---
+            # --- ZUSCHLÄGE EXTRAHIEREN (MIT NEUER PSS/TEU LOGIK) ---
             prepaid_list = []
-            def find_surcharge(name, patterns, text_data):
-                regex = r'(?:' + '|'.join(patterns) + r')[\s\S]{1,100}?([\d.,]+)\s*(EUR|USD|LISD)'
-                match = re.search(regex, text_data, re.IGNORECASE)
-                if match:
-                    val = parse_price(match.group(1))
-                    curr = match.group(2).upper().replace('LISD', 'USD')
-                    ctx = text_data[match.end():match.end()+40].lower()
-                    if 'teu' in ctx or 'teli' in ctx or '20' in ctx:
-                        val *= 2
-                    if val.is_integer(): return f"{name} = {int(val)} {curr}"
-                    else: return f"{name} = {val:.2f} {curr}"
+            
+            def find_surcharge(name, patterns, text_data, force_teu=False, prevent_teu=False):
+                # Regex akzeptiert auch Zahlen ohne Währung (wie das defekte 250,000 im PDF)
+                regex = r'(?:' + '|'.join(patterns) + r')[\s\S]{1,150}?(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)(?:\s*(EUR|USD|LISD|SEUR))?'
+                matches = list(re.finditer(regex, text_data, re.IGNORECASE))
+                
+                if matches:
+                    valid_amounts = []
+                    for m in matches:
+                        num_str = m.group(1).replace(',', '.')
+                        if num_str.count('.') > 1:
+                            num_str = num_str.rsplit('.', 1)[0].replace('.', '') + '.' + num_str.rsplit('.', 1)[1]
+                        try:
+                            parsed_val = float(num_str)
+                            if parsed_val < 5000: # Ignoriert absurde Lesefehler
+                                valid_amounts.append((parsed_val, m))
+                        except ValueError:
+                            pass
+                    
+                    if valid_amounts:
+                        if name == "PSS":
+                            # Für PSS sammeln wir ALLE Werte und nehmen den höchsten (z.B. das 250 EUR Update)
+                            valid_amounts.sort(key=lambda x: x[0])
+                            best_val, best_match = valid_amounts[-1]
+                        else:
+                            # Für alle anderen nehmen wir den ersten sauberen Wert, um Lesefehler am Seitenende zu meiden
+                            best_val, best_match = valid_amounts[0]
+                            
+                        val = best_val
+                        
+                        if best_match.group(2):
+                            curr = best_match.group(2).upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
+                        else:
+                            curr = "EUR" # Fallback, falls die Währung im PDF fehlt
+                        
+                        is_teu = force_teu
+                        if not is_teu and not prevent_teu:
+                            ctx = text_data[best_match.end():best_match.end()+40].lower()
+                            if 'teu' in ctx or 'teli' in ctx or ('20' in ctx and '40' not in ctx):
+                                is_teu = True
+                        
+                        if is_teu:
+                            val *= 2
+                            
+                        if val.is_integer(): return f"{name} = {int(val)} {curr}"
+                        else: return f"{name} = {val:.2f} {curr}"
+                        
                 return None
 
-            s_erc = find_surcharge("ERC", ["Logistic Fee", "Equipment Repositioning"], text)
+            # Exakte Zuweisung der Verdopplungs-Regeln
+            s_erc = find_surcharge("ERC", ["Logistic Fee", "Equipment Repositioning"], text, prevent_teu=True)
             if s_erc: prepaid_list.append(s_erc)
-            s_ets = find_surcharge("ETS", ["ETS", "Emissions Trading System"], text)
+            s_ets = find_surcharge("ETS", ["ETS", "Emissions Trading System"], text, force_teu=True)
             if s_ets: prepaid_list.append(s_ets)
-            s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text)
+            s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text, force_teu=True)
             if s_feu: prepaid_list.append(s_feu)
-            s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text)
+            s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text, prevent_teu=True) # PSS wird NICHT verdoppelt!
             if s_pss: prepaid_list.append(s_pss)
-            s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF"], text)
+            s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF"], text, force_teu=True)
             if s_brc: prepaid_list.append(s_brc)
             
             prepaid_str = ", ".join(prepaid_list)
@@ -227,7 +264,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             
             # --- MATRIX ODER SINGLE RATE LOGIK ---
             if "via pol" in text.lower():
-                # MULTI-RATE (Matrix PDF wie Nordafrika)
                 blocks = re.split(r'Port\s+of\s+Discharge', text, flags=re.IGNORECASE)[1:]
                 for block in blocks:
                     pod_match = re.search(r'^\s*([A-Za-z\s]+)', block)
@@ -242,11 +278,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                         if words:
                             pod_str = words[0].title()
                     
-                    # Sucht alle Routen wie "via POL HAM/BRV 425,00 EUR 550.00 EUR"
                     routes = re.finditer(r'via\s+POL\s+([A-Za-z/]+)\s+([\d.,]+)\s*(?:EUR|USD)\s+([\d.,]+)\s*(EUR|USD)', block, re.IGNORECASE)
                     for route in routes:
                         pol = route.group(1).replace('/', ' / ')
-                        rate_val = parse_price(route.group(3)) # Nimmt den zweiten Betrag (40'HC)
+                        rate_val = parse_price(route.group(3))
                         curr = route.group(4).upper()
                         
                         if rate_val > 0:
@@ -264,9 +299,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                 'Remark': 'Multi-Route Matrix Import'
                             })
             else:
-                # SINGLE-RATE (Hamad, Dammam, Jeddah)
                 pod_str = "Unbekannt"
-                # Verbesserter Matcher: Sucht bis zum Preis inkl. Kommas
                 pod_block = re.search(r'Port\s+of\s+Discharge(.*?)(\d{3,4}[.,]?\d{0,2}\s*USD|\d{3,4}[.,]?\d{0,2}\s*EUR)', text, re.IGNORECASE | re.DOTALL)
                 
                 if pod_block:
@@ -479,7 +512,7 @@ with tab_upload:
                     records = df_upload.to_dict('records')
                     
                     if records:
-                        # ANTI-DUPLIKAT LOGIK (Überschreibt alte Raten für dieselbe Route)
+                        # ANTI-DUPLIKAT LOGIK
                         for r in records:
                             collection.update_one(
                                 {
