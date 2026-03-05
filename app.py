@@ -7,18 +7,54 @@ import io
 import requests
 import pymongo
 from datetime import datetime, timezone
+import base64 # <-- Neu hinzugefügt für das Logo-Handling
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # 2. Konfiguration & Design
 st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
-st.markdown("""
+
+# --- NEU: HILFSFUNKTION FÜR DAS LOGO-WASSERZEICHEN ---
+def get_base64_of_bin_file(bin_file):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+# Versuche, das blasse Logo einzulesen.
+try:
+    # Passe den Dateinamen an, falls du ihn anders genannt hast.
+    # WICHTIG: Das Bild muss vorher manuell sehr blass gemacht werden!
+    encoded_string = get_base64_of_bin_file('logo_blass.png') # <-- Name deiner blassen Logo-Datei
+except FileNotFoundError:
+    encoded_string = None
+    st.sidebar.warning("⚠️ Die Datei 'logo_blass.png' wurde nicht gefunden. Das Wasserzeichen wird nicht angezeigt. Bitte erstelle das Bild wie in der Anleitung beschrieben.")
+
+# --- AKTUALISIERTES DESIGN & WASSERZEICHEN ---
+# Wir fügen das Logo über CSS als festen Hintergrund ein.
+if encoded_string:
+    background_css = f"""
+        [data-testid="stApp"] {{
+            background-image: url("data:image/png;base64,{encoded_string}");
+            background-repeat: no-repeat;
+            background-position: center center;
+            background-size: contain; /* containment skaliert das Bild, aber schneidet nichts ab */
+            background-attachment: fixed; /* fixiert den Hintergrund beim Scrollen */
+        }}
+    """
+else:
+    background_css = ""
+
+st.markdown(f"""
     <style>
-    .all-in-box { background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }
-    .basis-box { background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }
-    .collect-box { background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
-    .fremd-waehrung { color: #d9534f; font-weight: bold; }
+    /* Info-Boxen Styling */
+    .all-in-box {{ background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }}
+    .basis-box {{ background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }}
+    .collect-box {{ background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }}
+    .fremd-waehrung {{ color: #d9534f; font-weight: bold; }}
+
+    /* Hintergrund-Wasserzeichen Styling */
+    {background_css}
     </style>
     """, unsafe_allow_html=True)
 
@@ -52,7 +88,7 @@ st.sidebar.header("💱 Einstellungen")
 st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
 
-# --- NEU: DOKUMENTEN-FILTER ---
+# --- DOKUMENTEN-FILTER ---
 def ist_doc_gebuehr(name):
     n = str(name).lower()
     if 'b/l' in n: return True
@@ -77,11 +113,11 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     summe_gebuehren_eur = 0
     
     for g in berechne_gebuehren(str(row.get(prep_surcharge_col, ''))):
-        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
+        if ist_doc_gebuehr(g['name']): continue 
         summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
 
     for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
-        if ist_doc_gebuehr(g['name']): continue # Ignoriert BL/Docs für den All-In
+        if ist_doc_gebuehr(g['name']): continue 
         if st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
             summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
             
@@ -96,7 +132,6 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
     coll_gebuehren = berechne_gebuehren(str(row.get(coll_surcharge_col, '')))
     summe_gebuehren_eur, fremd_gebuehren, doc_gebuehren = 0, [], [] 
     
-    # NEU: Fünf Spalten für die UI (Die vierte ist für Docs)
     col_basis, col_prep, col_coll, col_doc, col_total = st.columns([1, 1.1, 1.1, 1.1, 1.2])
     
     with col_basis: 
@@ -107,7 +142,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         has_prep = False
         for g in prep_gebuehren:
             if ist_doc_gebuehr(g['name']): 
-                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
+                doc_gebuehren.append(g)
                 continue
             has_prep = True
             if g['waehrung'] == 'USD':
@@ -127,7 +162,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         has_coll = False
         for i, g in enumerate(coll_gebuehren):
             if ist_doc_gebuehr(g['name']): 
-                doc_gebuehren.append(g) # Verschiebt Docs in die neue Liste
+                doc_gebuehren.append(g)
                 continue
             has_coll = True
             if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
