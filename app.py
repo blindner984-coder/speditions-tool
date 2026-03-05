@@ -158,6 +158,19 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
+# --- HILFSFUNKTION FÜR PREISE ---
+def parse_price(val_str):
+    s = re.sub(r'[^\d,\.]', '', str(val_str))
+    if not s: return 0.0
+    if ',' in s and len(s.split(',')[-1]) == 2:
+        s = s.rsplit(',', 1)[0].replace('.', '').replace(',', '') + '.' + s.split(',')[-1]
+    elif '.' in s and len(s.split('.')[-1]) == 2:
+        s = s.rsplit('.', 1)[0].replace('.', '').replace(',', '') + '.' + s.split('.')[-1]
+    else:
+        s = s.replace('.', '').replace(',', '')
+    try: return float(s)
+    except: return 0.0
+
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
@@ -173,88 +186,128 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
             pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,\-]{3,60}?)(?=\s+(?:Validity|Valid|Terms|Ports?\s+of\s+Discharge|\d|$))', text, re.IGNORECASE)
-            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
-            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
-            pol_str = " ".join(pol_str.split())
-            if len(pol_str) > 50: pol_str = "Unbekannt"
-
-            pod_str = "Unbekannt"
-            pod_block = re.search(r'Port\s+of\s+Discharge(.*?)(\d{3,4}\s*USD|\d{3,4}\s*EUR)', text, re.IGNORECASE | re.DOTALL)
-            
-            if pod_block:
-                raw_pod = pod_block.group(1)
-                stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
-                for word in stoerwoerter:
-                    raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
-                
-                raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
-                words = [w for w in raw_pod.split() if len(w) > 2]
-                
-                if words:
-                    pod_str = words[0].title()
+            global_pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
+            global_pol_str = re.sub(r'[^A-Za-z\s\-]', '', global_pol_str).strip()
+            global_pol_str = re.sub(r'\b[A-Z]{2}\b', '', global_pol_str).strip()
+            global_pol_str = " ".join(global_pol_str.split())
+            if len(global_pol_str) > 50: global_pol_str = "Unbekannt"
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
-            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
-            
+            # --- ZUSCHLÄGE EXTRAHIEREN ---
             prepaid_list = []
-            
             def find_surcharge(name, patterns, text_data):
                 regex = r'(?:' + '|'.join(patterns) + r')[\s\S]{1,100}?([\d.,]+)\s*(EUR|USD|LISD)'
                 match = re.search(regex, text_data, re.IGNORECASE)
                 if match:
-                    num_str = match.group(1).replace(',', '.')
-                    if num_str.count('.') > 1:
-                        num_str = num_str.rsplit('.', 1)[0].replace('.', '') + '.' + num_str.rsplit('.', 1)[1]
-                    try:
-                        val = float(num_str)
-                    except ValueError:
-                        return None
-                        
+                    val = parse_price(match.group(1))
                     curr = match.group(2).upper().replace('LISD', 'USD')
-                    
                     ctx = text_data[match.end():match.end()+40].lower()
                     if 'teu' in ctx or 'teli' in ctx or '20' in ctx:
                         val *= 2
-                        
-                    if val.is_integer():
-                        return f"{name} = {int(val)} {curr}"
-                    else:
-                        return f"{name} = {val:.2f} {curr}"
+                    if val.is_integer(): return f"{name} = {int(val)} {curr}"
+                    else: return f"{name} = {val:.2f} {curr}"
                 return None
 
             s_erc = find_surcharge("ERC", ["Logistic Fee", "Equipment Repositioning"], text)
             if s_erc: prepaid_list.append(s_erc)
-            
             s_ets = find_surcharge("ETS", ["ETS", "Emissions Trading System"], text)
             if s_ets: prepaid_list.append(s_ets)
-            
             s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text)
             if s_feu: prepaid_list.append(s_feu)
-            
             s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text)
             if s_pss: prepaid_list.append(s_pss)
-            
             s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF"], text)
             if s_brc: prepaid_list.append(s_brc)
             
             prepaid_str = ", ".join(prepaid_list)
             
-            df_pdf = pd.DataFrame([{
-                'Carrier': 'MSC (aus PDF)',
-                'Contract Number': contract_no,
-                'Port of Loading': pol_str,
-                'Port of Destination': pod_str,
-                'Valid from': v_from,
-                'Valid to': v_to,
-                '40HC': float(rate_match.group(1)) if rate_match else 0,
-                'Currency': rate_match.group(2) if rate_match else "USD",
-                'Included Prepaid Surcharges 40HC': prepaid_str,
-                'Included Collect Surcharges 40HC': "",
-                'Remark': 'Automatisch aus PDF importiert'
-            }])
+            raten_liste = []
+            
+            # --- MATRIX ODER SINGLE RATE LOGIK ---
+            if "via pol" in text.lower():
+                # MULTI-RATE (Matrix PDF wie Nordafrika)
+                blocks = re.split(r'Port\s+of\s+Discharge', text, flags=re.IGNORECASE)[1:]
+                for block in blocks:
+                    pod_match = re.search(r'^\s*([A-Za-z\s]+)', block)
+                    pod_str = "Unbekannt"
+                    if pod_match:
+                        raw_pod = pod_match.group(1)
+                        stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
+                        for word in stoerwoerter:
+                            raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
+                        raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
+                        words = [w for w in raw_pod.split() if len(w) > 2]
+                        if words:
+                            pod_str = words[0].title()
+                    
+                    # Sucht alle Routen wie "via POL HAM/BRV 425,00 EUR 550.00 EUR"
+                    routes = re.finditer(r'via\s+POL\s+([A-Za-z/]+)\s+([\d.,]+)\s*(?:EUR|USD)\s+([\d.,]+)\s*(EUR|USD)', block, re.IGNORECASE)
+                    for route in routes:
+                        pol = route.group(1).replace('/', ' / ')
+                        rate_val = parse_price(route.group(3)) # Nimmt den zweiten Betrag (40'HC)
+                        curr = route.group(4).upper()
+                        
+                        if rate_val > 0:
+                            raten_liste.append({
+                                'Carrier': 'MSC (aus PDF)',
+                                'Contract Number': contract_no,
+                                'Port of Loading': pol,
+                                'Port of Destination': pod_str,
+                                'Valid from': v_from,
+                                'Valid to': v_to,
+                                '40HC': rate_val,
+                                'Currency': curr,
+                                'Included Prepaid Surcharges 40HC': prepaid_str,
+                                'Included Collect Surcharges 40HC': "",
+                                'Remark': 'Multi-Route Matrix Import'
+                            })
+            else:
+                # SINGLE-RATE (Hamad, Dammam, Jeddah)
+                pod_str = "Unbekannt"
+                # Verbesserter Matcher: Sucht bis zum Preis inkl. Kommas
+                pod_block = re.search(r'Port\s+of\s+Discharge(.*?)(\d{3,4}[.,]?\d{0,2}\s*USD|\d{3,4}[.,]?\d{0,2}\s*EUR)', text, re.IGNORECASE | re.DOTALL)
+                
+                if pod_block:
+                    raw_pod = pod_block.group(1)
+                    stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
+                    for word in stoerwoerter:
+                        raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
+                    
+                    raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
+                    words = [w for w in raw_pod.split() if len(w) > 2]
+                    if words:
+                        pod_str = words[0].title()
+                        
+                rate_val = 0
+                curr = "USD"
+                if pod_block:
+                    rate_str_full = pod_block.group(2)
+                    rate_m = re.search(r'([\d.,]+)\s*(USD|EUR)', rate_str_full, re.IGNORECASE)
+                    if rate_m:
+                        rate_val = parse_price(rate_m.group(1))
+                        curr = rate_m.group(2).upper()
+
+                if rate_val > 0:
+                    raten_liste.append({
+                        'Carrier': 'MSC (aus PDF)',
+                        'Contract Number': contract_no,
+                        'Port of Loading': global_pol_str,
+                        'Port of Destination': pod_str,
+                        'Valid from': v_from,
+                        'Valid to': v_to,
+                        '40HC': rate_val,
+                        'Currency': curr,
+                        'Included Prepaid Surcharges 40HC': prepaid_str,
+                        'Included Collect Surcharges 40HC': "",
+                        'Remark': 'Automatisch aus PDF importiert'
+                    })
+
+            if not raten_liste:
+                return pd.DataFrame(), "Fehler: Keine gültigen Raten gefunden."
+
+            df_pdf = pd.DataFrame(raten_liste)
             
             if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
             if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
@@ -426,9 +479,8 @@ with tab_upload:
                     records = df_upload.to_dict('records')
                     
                     if records:
-                        # NEU: ANTI-DUPLIKAT LOGIK
+                        # ANTI-DUPLIKAT LOGIK (Überschreibt alte Raten für dieselbe Route)
                         for r in records:
-                            # Überschreibt die Rate, wenn Contract, POL und POD exakt übereinstimmen
                             collection.update_one(
                                 {
                                     "Contract Number": r.get("Contract Number"),
