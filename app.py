@@ -25,18 +25,15 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
-# --- 🚨 NEU: LOGO IN DER SIDEBAR 🚨 ---
+# --- LOGO IN DER SIDEBAR ---
 try:
-    # Setzt das Bild ganz oben in die Seitenleiste
     st.sidebar.image("logo_farbig.png", use_container_width=True) 
 except FileNotFoundError:
-    pass # Wenn das Bild nicht da ist, wird einfach nichts angezeigt
+    pass 
 
 # --- HAUPT-ÜBERSCHRIFT ---
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
-
-# === AB HIER BLEIBT DER REST DES PROGRAMMS GLEICH ===
 
 # --- MONGODB ANBINDUNG ---
 MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
@@ -220,8 +217,22 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
+        # --- HIER IST DER FIX FÜR MAERSK CONTRACTS ---
         global_contract = "Unbekannt"
-        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): global_contract = fn_match.group(1)
+        
+        # 1. Check im Dateinamen
+        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): 
+            global_contract = fn_match.group(1)
+            
+        # 2. Check in den Kopfzeilen des Dokuments (besonders wichtig für Maersk Excel-Dateien!)
+        for i in range(min(20, len(df_raw))):
+            row_str = " ".join(df_raw.iloc[i].dropna().astype(str))
+            row_lower = row_str.lower()
+            if any(w in row_lower for w in ['contract', 'quote', 'reference', 'ref']):
+                nums = re.findall(r'\b\d{6,12}\b', row_str)
+                if nums:
+                    global_contract = " / ".join(dict.fromkeys(nums))
+                    break
 
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
@@ -244,8 +255,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                 if len(val_raw) < 2: continue
                 
+                # Sichert ab, falls die Contract-Spalte zwar existiert, aber bei Maersk 'NaN' drinsteht
+                row_contract = str(bas_row[contract_col].values[0]) if contract_col else ""
+                if row_contract.lower() == 'nan' or not row_contract.strip():
+                    row_contract = global_contract
+                
                 standard_rows.append({
-                    'Carrier': 'Maersk', 'Contract Number': str(bas_row[contract_col].values[0]) if contract_col else global_contract, 
+                    'Carrier': 'Maersk', 'Contract Number': row_contract, 
                     'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
                     '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
                     'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
