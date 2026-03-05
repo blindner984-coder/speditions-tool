@@ -179,23 +179,19 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             pol_str = " ".join(pol_str.split())
             if len(pol_str) > 50: pol_str = "Unbekannt"
 
-            # --- NEU: DER "SCHMUTZ-FILTER" FÜR DEN ZIELHAFEN ---
             pod_str = "Unbekannt"
             pod_block = re.search(r'Port\s+of\s+Discharge(.*?)(\d{3,4}\s*USD|\d{3,4}\s*EUR)', text, re.IGNORECASE | re.DOTALL)
             
             if pod_block:
                 raw_pod = pod_block.group(1)
-                # Alle bekannten Tabellen-Überschriften gnadenlos löschen
                 stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
                 for word in stoerwoerter:
                     raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
                 
-                # Alles was kein Buchstabe ist (Zahlen, Sonderzeichen) entfernen
                 raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
                 words = [w for w in raw_pod.split() if len(w) > 2]
                 
                 if words:
-                    # Das erste Wort, das diesen Filter überlebt, ist garantiert unser Hafen!
                     pod_str = words[0].title()
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
@@ -203,15 +199,12 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             
             rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
             
-            # --- NEU: INTELLIGENTE ZUSCHLAGS-EXTRAKTION ---
             prepaid_list = []
             
             def find_surcharge(name, patterns, text_data):
-                # Erlaubt bis zu 100 Zeichen Abstand (Zeilenumbrüche) zwischen Name und Betrag
                 regex = r'(?:' + '|'.join(patterns) + r')[\s\S]{1,100}?([\d.,]+)\s*(EUR|USD|LISD)'
                 match = re.search(regex, text_data, re.IGNORECASE)
                 if match:
-                    # Kommas in Punkte umwandeln für saubere Zahlen
                     num_str = match.group(1).replace(',', '.')
                     if num_str.count('.') > 1:
                         num_str = num_str.rsplit('.', 1)[0].replace('.', '') + '.' + num_str.rsplit('.', 1)[1]
@@ -220,11 +213,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                     except ValueError:
                         return None
                         
-                    # LISD-Fehler aus dem PDF korrigieren
                     curr = match.group(2).upper().replace('LISD', 'USD')
                     
-                    # TEU Prüfung (Wenn pro 20' Fuß berechnet wird, verdoppeln wir für 40'HC)
-                    # "TELI" ist ein weiterer typischer PDF-Scan-Fehler für "TEU"
                     ctx = text_data[match.end():match.end()+40].lower()
                     if 'teu' in ctx or 'teli' in ctx or '20' in ctx:
                         val *= 2
@@ -436,8 +426,20 @@ with tab_upload:
                     records = df_upload.to_dict('records')
                     
                     if records:
-                        collection.insert_many(records) 
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                        # NEU: ANTI-DUPLIKAT LOGIK
+                        for r in records:
+                            # Überschreibt die Rate, wenn Contract, POL und POD exakt übereinstimmen
+                            collection.update_one(
+                                {
+                                    "Contract Number": r.get("Contract Number"),
+                                    "Port of Loading": r.get("Port of Loading"),
+                                    "Port of Destination": r.get("Port of Destination"),
+                                    "Carrier": r.get("Carrier")
+                                },
+                                {"$set": r},
+                                upsert=True
+                            )
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich verarbeitet (Duplikate wurden automatisch überschrieben).")
                         st.balloons()
     
     # --- GEFAHRENZONE (DATENBANK LEEREN) ---
