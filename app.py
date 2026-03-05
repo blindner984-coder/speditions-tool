@@ -289,6 +289,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         
         return df_return, "Excel/CSV"
 
+
 # --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
