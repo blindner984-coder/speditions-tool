@@ -25,20 +25,15 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
-# --- 🚨 DER ÜBERARBEITETE ÜBERSCHRIFTEN-BEREICH 🚨 ---
+# --- 🚨 NEU: LOGO IN DER SIDEBAR 🚨 ---
+try:
+    # Setzt das Bild ganz oben in die Seitenleiste
+    st.sidebar.image("logo_farbig.png", use_container_width=True) 
+except FileNotFoundError:
+    pass # Wenn das Bild nicht da ist, wird einfach nichts angezeigt
 
-# Wir machen die Spalte für das Bild viel kleiner (Verhältnis 5 Teile für Titel, 1 Teil fürs Bild)
-header_title_col, header_img_col = st.columns([5, 1]) 
-
-with header_title_col:
-    st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
-
-with header_img_col:
-    try:
-        # Feste Breite (150 Pixel) verhindert, dass das Logo riesig wird!
-        st.image("logo_farbig.png", width=150) 
-    except FileNotFoundError:
-        pass # Wenn das Bild nicht da ist, zeigen wir einfach nichts an
+# --- HAUPT-ÜBERSCHRIFT ---
+st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 
 # === AB HIER BLEIBT DER REST DES PROGRAMMS GLEICH ===
