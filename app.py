@@ -7,7 +7,7 @@ import io
 import requests
 import pymongo
 from datetime import datetime, timezone
-import base64 # <-- Neu hinzugefügt für das Logo-Handling
+import base64
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -15,31 +15,28 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 # 2. Konfiguration & Design
 st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
 
-# --- NEU: HILFSFUNKTION FÜR DAS LOGO-WASSERZEICHEN ---
+# --- HILFSFUNKTION FÜR DAS LOGO-WASSERZEICHEN (Bleibt gleich) ---
 def get_base64_of_bin_file(bin_file):
     with open(bin_file, 'rb') as f:
         data = f.read()
     return base64.b64encode(data).decode()
 
-# Versuche, das blasse Logo einzulesen.
+# Versuche, das blasse Logo für das Wasserzeichen einzulesen
 try:
-    # Passe den Dateinamen an, falls du ihn anders genannt hast.
-    # WICHTIG: Das Bild muss vorher manuell sehr blass gemacht werden!
-    encoded_string = get_base64_of_bin_file('logo_blass.png') # <-- Name deiner blassen Logo-Datei
+    encoded_string = get_base64_of_bin_file('logo_blass.png')
 except FileNotFoundError:
     encoded_string = None
-    st.sidebar.warning("⚠️ Die Datei 'logo_blass.png' wurde nicht gefunden. Das Wasserzeichen wird nicht angezeigt. Bitte erstelle das Bild wie in der Anleitung beschrieben.")
+    st.sidebar.warning("⚠️ Die Datei 'logo_blass.png' wurde nicht gefunden. Das Wasserzeichen wird nicht angezeigt.")
 
-# --- AKTUALISIERTES DESIGN & WASSERZEICHEN ---
-# Wir fügen das Logo über CSS als festen Hintergrund ein.
+# --- AKTUALISIERTES DESIGN (Inklusive Wasserzeichen-Hintergrund) ---
 if encoded_string:
     background_css = f"""
         [data-testid="stApp"] {{
             background-image: url("data:image/png;base64,{encoded_string}");
             background-repeat: no-repeat;
             background-position: center center;
-            background-size: contain; /* containment skaliert das Bild, aber schneidet nichts ab */
-            background-attachment: fixed; /* fixiert den Hintergrund beim Scrollen */
+            background-size: contain;
+            background-attachment: fixed;
         }}
     """
 else:
@@ -58,7 +55,27 @@ st.markdown(f"""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
+
+# --- 🚨 NEU: DER ÜBERARBEITETE ÜBERSCHRIFTEN-BEREICH (MIT FARBIGEM LOGO) 🚨 ---
+
+# Wir erstellen zwei Spalten für den allerersten Header-Bereich ganz oben
+header_title_col, header_img_col = st.columns([2, 1]) # 2 Teile für Titel, 1 Teil für das Bild
+
+with header_title_col:
+    # Hier kommt der Titel hin, der vorher alleine stand
+    st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
+
+with header_img_col:
+    # Hier kommt das neue, farbige Bild hin (das ist der Bereich im roten Viereck)
+    # Versuche, das farbige Logo einzulesen
+    try:
+        # Das farbige Bild muss 'logo_farbig.png' heißen und darf NICHT blass sein!
+        st.image("logo_farbig.png", use_container_width=True) # use_container_width hält die Proportionen, nutzt aber die Spalte
+    except FileNotFoundError:
+        st.warning("⚠️ Die Datei 'logo_farbig.png' wurde nicht gefunden. Das farbige Logo wird oben rechts nicht angezeigt.")
+
+
+# === AB HIER BLEIBT DER REST DES PROGRAMMS GLEICH ===
 
 # --- MONGODB ANBINDUNG ---
 MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
@@ -95,7 +112,7 @@ def ist_doc_gebuehr(name):
     if re.search(r'\b(bl|doc|docs|documentation|bill of lading)\b', n): return True
     return False
 
-# --- HILFSFUNKTIONEN ---
+# --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
     treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
@@ -185,7 +202,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
-# --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
+# --- DATEI READER FÜR DEN ADMIN-UPLOAD (Bleibt gleich) ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
@@ -284,10 +301,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         return df_return, "Excel/CSV"
 
 
-# --- TABS FÜR UI ---
+# --- TABS FÜR UI --- (Hier geht's nach dem Header weiter)
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
-# === TAB 1: SUCHEN (LÄDT AUS DER DATENBANK) ===
+# === TAB 1: SUCHEN (Bleibt gleich) ===
 with tab_suche:
     cursor = collection.find({})
     daten_liste = list(cursor)
@@ -300,7 +317,7 @@ with tab_suche:
         if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
         
-        st.write(f"### 🔍 Suche in der Datenbank ({len(df)} Raten aktiv)")
+        st.write(f"### Suche in der Datenbank ({len(df)} Raten aktiv)")
         c1, c2, c3, c4 = st.columns(4)
         with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
         with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
@@ -338,7 +355,7 @@ with tab_suche:
             else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
 
-# === TAB 2: ADMIN UPLOAD ===
+# === TAB 2: ADMIN UPLOAD & LÖSCHEN (Bleibt gleich) ===
 with tab_upload:
     st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
     uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
@@ -364,7 +381,7 @@ with tab_upload:
                         st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                         st.balloons()
     
-    # --- GEFAHRENZONE (DATENBANK LEEREN) ---
+    # --- GEFAHRENZONE (DATENBANK LEEREN) (Bleibt gleich) ---
     st.markdown("---")
     st.write("### 🚨 Gefahrenzone")
     st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
