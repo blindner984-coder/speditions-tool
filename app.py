@@ -172,7 +172,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            # --- NEU: Ultra-strikte POL/POD Erkennung (Ignoriert lange Sätze komplett) ---
+            # --- NEU: Ultra-strikte POL/POD Erkennung ---
             pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
             
@@ -184,6 +184,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
             pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
             pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
+            
+            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
+            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
+            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
+            
             if len(pol_str) > 25: pol_str = "Unbekannt"
             if len(pod_str) > 25: pod_str = "Unbekannt"
 
