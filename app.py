@@ -168,51 +168,63 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             reader = PyPDF2.PdfReader(datei)
             text = " ".join([page.extract_text() for page in reader.pages])
             
+            # 1. DATUMS-EXTRAKTION (Flexibel für DD.MM.YYYY oder YYYY-MM-DD)
             date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
-            v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
-            
-            # --- Ultra-strikte POL/POD Erkennung ---
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
-            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            
-            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
-            if not pod_match:
-                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
-            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
-            
-            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
-            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
-            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
-            
-            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
-            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
-            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
-            
-            if len(pol_str) > 25: pol_str = "Unbekannt"
-            if len(pod_str) > 25: pod_str = "Unbekannt"
+            v_to = date_matches[-1] if len(date_matches) > 1 else "Unbekannt"
 
-            contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
-            contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
+            # 2. POL / POD LOGIK (Suche nach gängigen Bezeichnungen)
+            def find_port(keywords, full_text):
+                for kw in keywords:
+                    # Sucht nach Keyword + Wort bis zu 25 Zeichen (stoppt bei Zeilenumbruch oder Sonderzeichen)
+                    match = re.search(f'{kw}[:\s]+([A-Za-z\s,\-]{{3,25}})', full_text, re.IGNORECASE)
+                    if match:
+                        res = match.group(1).strip().split('\n')[0] # Nur erste Zeile falls Umbruch
+                        return re.sub(r'[^A-Za-z\s\-]', '', res).strip()
+                return "Unbekannt"
+
+            pol_str = find_port(['Port of Loading', 'POL', 'Origin Port', 'Loading Port'], text)
+            pod_str = find_port(['Port of Discharge', 'POD', 'Destination Port', 'Discharge Port', 'Place of Delivery'], text)
+
+            # 3. CARRIER ERKENNUNG
+            carrier = "Unbekannt"
+            if "msc" in text.lower(): carrier = "MSC"
+            elif "hapag" in text.lower(): carrier = "Hapag-Lloyd"
+            elif "maersk" in text.lower(): carrier = "Maersk"
+            elif "cosco" in text.lower(): carrier = "COSCO"
+
+            # 4. RATEN-LOGIK (Suche nach 40'HC Preisen)
+            # Sucht nach Beträgen (z.B. 1.250,00 oder 950) gefolgt von USD/EUR/Currency
+            rate = 0
+            # Spezielle Suche nach 40ft High Cube Mustern
+            rate_match = re.search(r'(?:40\'?HC|40ft?|High Cube)[\s:]*(?:USD|EUR|[\$€])?\s*([\d\.,]{3,9})', text, re.IGNORECASE)
+            if not rate_match:
+                # Fallback: Suche nach dem ersten großen Betrag neben einer Währung
+                rate_match = re.search(r'(\d{3,4})\s*(?:USD|EUR)', text)
             
-            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
-            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text)
-            
+            if rate_match:
+                rate_val = rate_match.group(1).replace('.', '').replace(',', '.')
+                rate = float(re.sub(r'[^\d.]', '', rate_val))
+
+            # 5. CONTRACT NUMMER
+            contract_match = re.search(r'(?:Contract|Quote|Reference|Ref\.?|Agreement)[\s#:]*([A-Z0-9]{5,20})', text, re.IGNORECASE)
+            contract_no = contract_match.group(1) if contract_match else "Unbekannt"
+
             df_pdf = pd.DataFrame([{
-                'Carrier': 'MSC (aus PDF)',
+                'Carrier': carrier,
                 'Contract Number': contract_no,
                 'Port of Loading': pol_str,
                 'Port of Destination': pod_str,
                 'Valid from': v_from,
                 'Valid to': v_to,
-                '40HC': float(rate_match.group(1)) if rate_match else 0,
-                'Currency': rate_match.group(2) if rate_match else "USD",
-                'Included Prepaid Surcharges 40HC': f"ERC = {erc_match.group(1)} {erc_match.group(2)}" if erc_match else "",
+                '40HC': rate,
+                'Currency': "EUR" if "EUR" in text.upper() else "USD",
+                'Included Prepaid Surcharges 40HC': "Extrahiert aus PDF",
                 'Included Collect Surcharges 40HC': "",
-                'Remark': 'Automatisch aus PDF importiert'
+                'Remark': 'Multi-Carrier Auto-Import'
             }])
-            
-            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
+
+            # Das Datum für den "Datumsfilter" maschinenlesbar machen
             if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
             if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
             
@@ -332,7 +344,7 @@ with tab_suche:
 
         mask = pd.Series([True] * len(df))
         
-        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
+        # .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
         if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
         if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
         if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
