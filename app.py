@@ -172,26 +172,38 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            # --- Ultra-strikte POL/POD Erkennung ---
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
+            # --- Ultra-strikte POL (Ladehafen) Erkennung ---
+            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,\-]{3,60}?)(?=\s+(?:Validity|Valid|Terms|Ports?\s+of\s+Discharge|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
             
-            # NEU: Unterstützt jetzt auch PDFs ohne die "Remarks" Spalte, indem auch auf "Freetime at POD" geprüft wird (löst das Dammam-Problem)
-            pod_match = re.search(r'(?:Remarks|Freetime at POD|Freetime Destination)[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|\d+\s*TEU|TEU|DV|HC))', text, re.IGNORECASE)
-            if not pod_match:
-                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
-            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
+            # --- NEU: SUPER-ROBUSTE POD (Zielhafen) ERKENNUNG ---
+            # Zieht den kompletten Textblock ab "Port of Discharge" bis zum ersten echten Indikator (wie "100 TEU", "150x" oder einen Preis)
+            pod_block_match = re.search(r'Port\s+of\s+Discharge(.*?)(\d+x|\d+\s*TEU|TEU|\d{3,4}\s*USD|\d{3,4}\s*EUR|via\s+POL|Validity|Valid)', text, re.IGNORECASE)
+            pod_str = "Unbekannt"
             
-            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
+            if pod_block_match:
+                pod_raw = pod_block_match.group(1)
+                
+                # Filtert alle bekannten MSC-Tabellenüberschriften heraus
+                stoerwoerter = ["Volume", "40' DV/HC", "40'DV/HC", "20' DV", "20'DV", "Freetime at POL", "Freetime at POD", "Freetime Origin", "Freetime Destination", "Remarks", "combined", "days", "dem/det"]
+                for word in stoerwoerter:
+                    pod_raw = re.sub(r'(?i)\b' + re.escape(word) + r'\b', '', pod_raw)
+                
+                # Bereinigung: Alles was keine Buchstaben sind, fliegt raus
+                pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_raw).strip()
+                # Entfernt 2-Buchstaben Ländercodes (QA, SA, AE) wie sie hinter Dammam oder Hamad stehen
+                pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip() 
+                # Doppelte Leerzeichen aufräumen
+                pod_str = " ".join(pod_str.split()) 
+                
+                if len(pod_str) > 35 or len(pod_str) < 3: 
+                    pod_str = "Unbekannt"
+            
+            # Bereinigung für den POL
             pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
-            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
-            
-            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
             pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
-            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
-            
-            if len(pol_str) > 25: pol_str = "Unbekannt"
-            if len(pod_str) > 25: pod_str = "Unbekannt"
+            pol_str = " ".join(pol_str.split())
+            if len(pol_str) > 50: pol_str = "Unbekannt"
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
@@ -213,7 +225,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 'Remark': 'Automatisch aus PDF importiert'
             }])
             
-            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
             if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
             if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
             
@@ -333,7 +344,6 @@ with tab_suche:
 
         mask = pd.Series([True] * len(df))
         
-        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
         if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
         if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
         if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
