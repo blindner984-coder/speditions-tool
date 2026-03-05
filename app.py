@@ -176,7 +176,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
             
-            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
+            # NEU: Unterstützt jetzt auch PDFs ohne die "Remarks" Spalte, indem auch auf "Freetime at POD" geprüft wird (löst das Dammam-Problem)
+            pod_match = re.search(r'(?:Remarks|Freetime at POD|Freetime Destination)[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|\d+\s*TEU|TEU|DV|HC))', text, re.IGNORECASE)
             if not pod_match:
                 pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
             pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
