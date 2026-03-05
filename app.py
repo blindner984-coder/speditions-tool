@@ -172,7 +172,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            # --- NEU: Ultra-strikte POL/POD Erkennung ---
+            # --- Ultra-strikte POL/POD Erkennung ---
             pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
             pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
             
@@ -211,6 +211,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 'Included Collect Surcharges 40HC': "",
                 'Remark': 'Automatisch aus PDF importiert'
             }])
+            
+            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
+            if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
+            if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+            
             return df_pdf, "PDF"
         except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
@@ -326,9 +331,12 @@ with tab_suche:
             such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
 
         mask = pd.Series([True] * len(df))
-        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol, case=False, na=False)
-        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod, case=False, na=False)
-        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract, case=False, na=False)
+        
+        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
+        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
+        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
+        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
+        
         if filter_datum_aktiv and 'Valid from dt' in df.columns:
             dt_search = pd.to_datetime(such_datum)
             mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
