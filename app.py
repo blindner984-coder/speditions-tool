@@ -7,7 +7,6 @@ import io
 import requests
 import pymongo
 from datetime import datetime, timezone
-import base64
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -15,64 +14,31 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 # 2. Konfiguration & Design
 st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
 
-# --- HILFSFUNKTION FÜR DAS LOGO-WASSERZEICHEN (Bleibt gleich) ---
-def get_base64_of_bin_file(bin_file):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
-    return base64.b64encode(data).decode()
-
-# Versuche, das blasse Logo für das Wasserzeichen einzulesen
-try:
-    encoded_string = get_base64_of_bin_file('logo_blass.png')
-except FileNotFoundError:
-    encoded_string = None
-    st.sidebar.warning("⚠️ Die Datei 'logo_blass.png' wurde nicht gefunden. Das Wasserzeichen wird nicht angezeigt.")
-
-# --- AKTUALISIERTES DESIGN (Inklusive Wasserzeichen-Hintergrund) ---
-if encoded_string:
-    background_css = f"""
-        [data-testid="stApp"] {{
-            background-image: url("data:image/png;base64,{encoded_string}");
-            background-repeat: no-repeat;
-            background-position: center center;
-            background-size: contain;
-            background-attachment: fixed;
-        }}
-    """
-else:
-    background_css = ""
-
-st.markdown(f"""
+st.markdown("""
     <style>
     /* Info-Boxen Styling */
-    .all-in-box {{ background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }}
-    .basis-box {{ background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }}
-    .collect-box {{ background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }}
-    .fremd-waehrung {{ color: #d9534f; font-weight: bold; }}
-
-    /* Hintergrund-Wasserzeichen Styling */
-    {background_css}
+    .all-in-box { background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }
+    .basis-box { background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }
+    .collect-box { background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
+    .fremd-waehrung { color: #d9534f; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
 
-# --- 🚨 NEU: DER ÜBERARBEITETE ÜBERSCHRIFTEN-BEREICH (MIT FARBIGEM LOGO) 🚨 ---
+# --- 🚨 DER ÜBERARBEITETE ÜBERSCHRIFTEN-BEREICH 🚨 ---
 
-# Wir erstellen zwei Spalten für den allerersten Header-Bereich ganz oben
-header_title_col, header_img_col = st.columns([2, 1]) # 2 Teile für Titel, 1 Teil für das Bild
+# Wir machen die Spalte für das Bild viel kleiner (Verhältnis 5 Teile für Titel, 1 Teil fürs Bild)
+header_title_col, header_img_col = st.columns([5, 1]) 
 
 with header_title_col:
-    # Hier kommt der Titel hin, der vorher alleine stand
     st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 with header_img_col:
-    # Hier kommt das neue, farbige Bild hin (das ist der Bereich im roten Viereck)
-    # Versuche, das farbige Logo einzulesen
     try:
-        # Das farbige Bild muss 'logo_farbig.png' heißen und darf NICHT blass sein!
-        st.image("logo_farbig.png", use_container_width=True) # use_container_width hält die Proportionen, nutzt aber die Spalte
+        # Feste Breite (150 Pixel) verhindert, dass das Logo riesig wird!
+        st.image("logo_farbig.png", width=150) 
     except FileNotFoundError:
-        st.warning("⚠️ Die Datei 'logo_farbig.png' wurde nicht gefunden. Das farbige Logo wird oben rechts nicht angezeigt.")
+        pass # Wenn das Bild nicht da ist, zeigen wir einfach nichts an
 
 
 # === AB HIER BLEIBT DER REST DES PROGRAMMS GLEICH ===
@@ -202,7 +168,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
-# --- DATEI READER FÜR DEN ADMIN-UPLOAD (Bleibt gleich) ---
+# --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
@@ -301,10 +267,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         return df_return, "Excel/CSV"
 
 
-# --- TABS FÜR UI --- (Hier geht's nach dem Header weiter)
+# --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
-# === TAB 1: SUCHEN (Bleibt gleich) ===
+# === TAB 1: SUCHEN ===
 with tab_suche:
     cursor = collection.find({})
     daten_liste = list(cursor)
@@ -355,7 +321,7 @@ with tab_suche:
             else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
 
-# === TAB 2: ADMIN UPLOAD & LÖSCHEN (Bleibt gleich) ===
+# === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
 with tab_upload:
     st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
     uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
@@ -381,7 +347,7 @@ with tab_upload:
                         st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                         st.balloons()
     
-    # --- GEFAHRENZONE (DATENBANK LEEREN) (Bleibt gleich) ---
+    # --- GEFAHRENZONE (DATENBANK LEEREN) ---
     st.markdown("---")
     st.write("### 🚨 Gefahrenzone")
     st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
