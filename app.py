@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
-import PyPDF2
+import pdfplumber  # Ersetzt PyPDF2 für professionelles Tabellen-Parsing
 import warnings
 import io
 import requests
@@ -41,6 +41,7 @@ def init_db():
     client = pymongo.MongoClient(MONGO_URI)
     db = client["SpeditionsDB"]
     collection = db["Raten"]
+    # TTL Index: Dokumente nach 180 Tagen (15552000 Sekunden) löschen
     collection.create_index("createdAt", expireAfterSeconds=15552000)
     return collection
 
@@ -158,79 +159,135 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
+# --- HILFSFUNKTION FÜR PDF-PREISE ---
+def parse_price(val_str):
+    """Macht aus wirren Strings wie '1.250,00', '550.00' oder '450' saubere Floats"""
+    s = re.sub(r'[^\d,\.]', '', val_str)
+    if not s: return 0.0
+    if ',' in s and len(s.split(',')[-1]) == 2:
+        s = s.rsplit(',', 1)[0].replace('.', '').replace(',', '') + '.' + s.split(',')[-1]
+    elif '.' in s and len(s.split('.')[-1]) == 2:
+        s = s.rsplit('.', 1)[0].replace('.', '').replace(',', '') + '.' + s.split('.')[-1]
+    else:
+        s = s.replace('.', '').replace(',', '')
+    try: return float(s)
+    except: return 0.0
+
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
     
+    # === NEUER PDFPLUMBER PDF-PARSER ===
     if datei.name.lower().endswith('.pdf'):
         try:
-            reader = PyPDF2.PdfReader(datei)
-            text = " ".join([page.extract_text() for page in reader.pages])
-            
-            # 1. DATUMS-EXTRAKTION (Flexibel für DD.MM.YYYY oder YYYY-MM-DD)
-            date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
-            v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
-            v_to = date_matches[-1] if len(date_matches) > 1 else "Unbekannt"
+            with pdfplumber.open(datei) as pdf:
+                # Metadaten vom ersten Blatt extrahieren
+                first_page_text = pdf.pages[0].extract_text() or ""
+                full_text = " ".join([p.extract_text() or "" for p in pdf.pages])
+                
+                date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', first_page_text)
+                v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
+                v_to = date_matches[-1] if len(date_matches) > 1 else "Unbekannt"
 
-            # 2. POL / POD LOGIK (Suche nach gängigen Bezeichnungen)
-            def find_port(keywords, full_text):
-                for kw in keywords:
-                    # Sucht nach Keyword + Wort bis zu 25 Zeichen (stoppt bei Zeilenumbruch oder Sonderzeichen)
-                    match = re.search(f'{kw}[:\s]+([A-Za-z\s,\-]{{3,25}})', full_text, re.IGNORECASE)
-                    if match:
-                        res = match.group(1).strip().split('\n')[0] # Nur erste Zeile falls Umbruch
-                        return re.sub(r'[^A-Za-z\s\-]', '', res).strip()
-                return "Unbekannt"
+                contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote|Ref\.?|Agreement)[\s#:]*([A-Z0-9]{5,20})', first_page_text, re.IGNORECASE)
+                contract_no = contract_match.group(1) if contract_match else "Unbekannt"
 
-            pol_str = find_port(['Port of Loading', 'POL', 'Origin Port', 'Loading Port'], text)
-            pod_str = find_port(['Port of Discharge', 'POD', 'Destination Port', 'Discharge Port', 'Place of Delivery'], text)
+                pol_match = re.search(r'(?:Ports? of Loading|POL|Origin Port)[\s:]+([A-Za-z\s,\-]{3,50})', first_page_text, re.IGNORECASE)
+                default_pol = pol_match.group(1).split('\n')[0].strip() if pol_match else "Unbekannt"
+                default_pol = re.sub(r'[^A-Za-z\s\-]', '', default_pol).strip()
 
-            # 3. CARRIER ERKENNUNG
-            carrier = "Unbekannt"
-            if "msc" in text.lower(): carrier = "MSC"
-            elif "hapag" in text.lower(): carrier = "Hapag-Lloyd"
-            elif "maersk" in text.lower(): carrier = "Maersk"
-            elif "cosco" in text.lower(): carrier = "COSCO"
+                carrier = "Unbekannt"
+                if "msc" in full_text.lower(): carrier = "MSC"
+                elif "hapag" in full_text.lower(): carrier = "Hapag-Lloyd"
+                elif "maersk" in full_text.lower(): carrier = "Maersk"
 
-            # 4. RATEN-LOGIK (Suche nach 40'HC Preisen)
-            # Sucht nach Beträgen (z.B. 1.250,00 oder 950) gefolgt von USD/EUR/Currency
-            rate = 0
-            # Spezielle Suche nach 40ft High Cube Mustern
-            rate_match = re.search(r'(?:40\'?HC|40ft?|High Cube)[\s:]*(?:USD|EUR|[\$€])?\s*([\d\.,]{3,9})', text, re.IGNORECASE)
-            if not rate_match:
-                # Fallback: Suche nach dem ersten großen Betrag neben einer Währung
-                rate_match = re.search(r'(\d{3,4})\s*(?:USD|EUR)', text)
-            
-            if rate_match:
-                rate_val = rate_match.group(1).replace('.', '').replace(',', '.')
-                rate = float(re.sub(r'[^\d.]', '', rate_val))
+                raten_liste = []
+                current_pod = "Unbekannt"
+                
+                # Tabellen auslesen und zeilenweise verarbeiten
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        if not table: continue
+                        
+                        idx_40hc = -1
+                        
+                        for row in table:
+                            # Leere Zellen entfernen und bereinigen
+                            row_texts = [str(c).replace('\n', ' ').strip() for c in row if c]
+                            if not row_texts: continue
+                            row_joined = " ".join(row_texts).lower()
 
-            # 5. CONTRACT NUMMER
-            contract_match = re.search(r'(?:Contract|Quote|Reference|Ref\.?|Agreement)[\s#:]*([A-Z0-9]{5,20})', text, re.IGNORECASE)
-            contract_no = contract_match.group(1) if contract_match else "Unbekannt"
+                            # Blockiere Zuschlags-Zeilen (wir wollen hier nur die Basis/All-In Rate)
+                            if re.search(r'\b(surcharge|fee|thc|pss|ets|eca|bac|isps|charge|factor)\b', row_joined, re.IGNORECASE):
+                                continue
 
-            df_pdf = pd.DataFrame([{
-                'Carrier': carrier,
-                'Contract Number': contract_no,
-                'Port of Loading': pol_str,
-                'Port of Destination': pod_str,
-                'Valid from': v_from,
-                'Valid to': v_to,
-                '40HC': rate,
-                'Currency': "EUR" if "EUR" in text.upper() else "USD",
-                'Included Prepaid Surcharges 40HC': "Extrahiert aus PDF",
-                'Included Collect Surcharges 40HC': "",
-                'Remark': 'Multi-Carrier Auto-Import'
-            }])
+                            # Sucht nach dynamischen Überschriften für POD (z.B. "Port of Discharge Casablanca")
+                            pod_m = re.search(r'port of discharge\s*([a-z\s]+)', row_joined)
+                            if pod_m: current_pod = pod_m.group(1).strip().title()
 
-            # Das Datum für den "Datumsfilter" maschinenlesbar machen
-            if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
-            
-            return df_pdf, "PDF"
-        except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
+                            # Spalten-Index für 40' Container finden
+                            for i, cell in enumerate(row_texts):
+                                if re.search(r"40'?\s*(?:dv|hc|all in)", cell, re.IGNORECASE):
+                                    idx_40hc = i
+                            
+                            rate_val = 0
+                            currency = "USD"
+                            
+                            # Wenn wir wissen, wo der 40' Preis steht, ziehen wir ihn raus
+                            if idx_40hc != -1 and len(row_texts) > idx_40hc:
+                                cell_val = row_texts[idx_40hc]
+                                rate_m = re.search(r'([\d\.,]{3,9})\s*(USD|EUR)', cell_val, re.IGNORECASE)
+                                if rate_m:
+                                    rate_val = parse_price(rate_m.group(1))
+                                    currency = rate_m.group(2).upper()
+                                else:
+                                    num_m = re.search(r'^([\d\.,]{3,9})$', cell_val)
+                                    if num_m:
+                                        rate_val = parse_price(num_m.group(1))
+                                        currency = "EUR" if "eur" in full_text.lower() else "USD"
 
+                            # Wenn Preis > 0 gefunden wurde -> Datensatz anlegen
+                            if rate_val > 0:
+                                row_pol = default_pol
+                                if "via pol" in row_texts[0].lower():
+                                    row_pol = row_texts[0].lower().replace("via pol", "").strip().upper()
+                                
+                                row_pod = current_pod
+                                if not "via pol" in row_texts[0].lower() and not "port of discharge" in row_texts[0].lower():
+                                    clean_pod = re.sub(r'[^A-Za-z\s]', '', row_texts[0]).strip()
+                                    clean_pod = re.sub(r'\b[A-Z]{2}\b', '', clean_pod).strip()
+                                    if len(clean_pod) > 2 and len(clean_pod) < 30:
+                                        row_pod = clean_pod.title()
+
+                                raten_liste.append({
+                                    'Carrier': carrier,
+                                    'Contract Number': contract_no,
+                                    'Port of Loading': row_pol,
+                                    'Port of Destination': row_pod,
+                                    'Valid from': v_from,
+                                    'Valid to': v_to,
+                                    '40HC': rate_val,
+                                    'Currency': currency,
+                                    'Included Prepaid Surcharges 40HC': "Auto-Extrahiert (PDF Matrix)",
+                                    'Included Collect Surcharges 40HC': "",
+                                    'Remark': 'Importiert mit Tabellen-Erkennung'
+                                })
+                
+                # DataFrame aus der Liste generieren
+                if raten_liste:
+                    df_pdf = pd.DataFrame(raten_liste)
+                    if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
+                    if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+                    return df_pdf, "PDF (Matrix)"
+                else:
+                    return pd.DataFrame(), "Keine gültigen Raten-Tabellen gefunden."
+
+        except Exception as e:
+            return pd.DataFrame(), f"Fehler bei PDF-Verarbeitung: {e}"
+
+    # === EXCEL / CSV PARSER (UNVERÄNDERT) ===
     else:
         if datei.name.endswith('.xlsx'):
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
@@ -344,7 +401,6 @@ with tab_suche:
 
         mask = pd.Series([True] * len(df))
         
-        # .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
         if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
         if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
         if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
@@ -382,7 +438,7 @@ with tab_upload:
     if uploaded_files:
         if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
             alle_daten = []
-            with st.spinner("Lese Dateien und speichere in Datenbank..."):
+            with st.spinner("Lese Dateien und bereite Vorschau vor..."):
                 for datei in uploaded_files:
                     try:
                         df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
@@ -393,11 +449,16 @@ with tab_upload:
                 if alle_daten:
                     df_upload = pd.concat(alle_daten, ignore_index=True)
                     df_upload['createdAt'] = datetime.now(timezone.utc)
+                    
+                    # --- NEU: VORSCHAU DER ERKANNTEN DATEN ---
+                    st.write("### 👁️ Vorschau der erkannten Daten (Auszug)")
+                    st.dataframe(df_upload[['Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination', '40HC', 'Currency']].head(20))
+                    
                     records = df_upload.to_dict('records')
                     
                     if records:
                         collection.insert_many(records) 
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich aus den Tabellen extrahiert und in die Datenbank geschrieben.")
                         st.balloons()
     
     # --- GEFAHRENZONE (DATENBANK LEEREN) ---
