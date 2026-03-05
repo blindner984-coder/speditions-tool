@@ -330,36 +330,36 @@ with tab_suche:
             filter_datum_aktiv = st.checkbox("📅 Datumsfilter aktiv", value=True)
             such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
 
-    mask = pd.Series([True] * len(df))
-    
-    # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
-    if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
-    if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
-    if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
-    
-    if filter_datum_aktiv and 'Valid from dt' in df.columns:
-        dt_search = pd.to_datetime(such_datum)
-        mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
-    
-    treffer = df[mask].copy()
-    if '40HC' in treffer.columns:
-        treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
-        treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
+        mask = pd.Series([True] * len(df))
         
-        if not treffer.empty:
-            treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
-            treffer = treffer.sort_values(by='Total_EUR_Sort')
+        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
+        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
+        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
+        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
+        
+        if filter_datum_aktiv and 'Valid from dt' in df.columns:
+            dt_search = pd.to_datetime(such_datum)
+            mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
+        
+        treffer = df[mask].copy()
+        if '40HC' in treffer.columns:
+            treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
+            treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
             
-            st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
-            
-            for _, row in treffer.head(50).iterrows():
-                is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
-                label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
+            if not treffer.empty:
+                treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
+                treffer = treffer.sort_values(by='Total_EUR_Sort')
                 
-                with st.expander(label):
-                    anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
-                    if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
-        else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
+                st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
+                
+                for _, row in treffer.head(50).iterrows():
+                    is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
+                    label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
+                    
+                    with st.expander(label):
+                        anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
+                        if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
+            else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
 
 # === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
