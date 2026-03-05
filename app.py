@@ -158,19 +158,6 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
-# --- HILFSFUNKTION FÜR PREISE ---
-def parse_price(val_str):
-    s = re.sub(r'[^\d,\.]', '', str(val_str))
-    if not s: return 0.0
-    if ',' in s and len(s.split(',')[-1]) == 2:
-        s = s.rsplit(',', 1)[0].replace('.', '').replace(',', '') + '.' + s.split(',')[-1]
-    elif '.' in s and len(s.split('.')[-1]) == 2:
-        s = s.rsplit('.', 1)[0].replace('.', '').replace(',', '') + '.' + s.split('.')[-1]
-    else:
-        s = s.replace('.', '').replace(',', '')
-    try: return float(s)
-    except: return 0.0
-
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
@@ -185,182 +172,47 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s,\-]{3,60}?)(?=\s+(?:Validity|Valid|Terms|Ports?\s+of\s+Discharge|\d|$))', text, re.IGNORECASE)
-            global_pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            global_pol_str = re.sub(r'[^A-Za-z\s\-]', '', global_pol_str).strip()
-            global_pol_str = re.sub(r'\b[A-Z]{2}\b', '', global_pol_str).strip()
-            global_pol_str = " ".join(global_pol_str.split())
-            if len(global_pol_str) > 50: global_pol_str = "Unbekannt"
+            # --- Ultra-strikte POL/POD Erkennung ---
+            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
+            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
+            
+            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
+            if not pod_match:
+                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
+            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
+            
+            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
+            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
+            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
+            
+            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
+            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
+            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
+            
+            if len(pol_str) > 25: pol_str = "Unbekannt"
+            if len(pod_str) > 25: pod_str = "Unbekannt"
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
-            # --- ZUSCHLÄGE EXTRAHIEREN (MIT VERBESSERTEM SCHMUTZ-FILTER) ---
-            prepaid_list = []
+            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
+            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text)
             
-            def find_surcharge(name, patterns, text_data, force_teu=False, prevent_teu=False):
-                regex_name = r'(?:' + '|'.join(patterns) + r')'
-                valid_amounts = []
-                
-                for m in re.finditer(regex_name, text_data, re.IGNORECASE):
-                    # Schneidet 120 Zeichen nach dem gefundenen Wort (z.B. "ETS") aus
-                    block = text_data[m.end():m.end()+120]
-                    
-                    # BLOCKER: Wir schauen uns die ersten 50 Zeichen an. Wenn dort steht, dass die Gebühr inkludiert ist, brechen wir ab!
-                    if re.search(r'\b(?:not subject to|incl\.?|included|n/a|ind\.?)\b', block[:50], re.IGNORECASE):
-                        continue
-                    
-                    # Sucht zwingend nach einer Zahl gefolgt von Währung!
-                    price_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)\s*(EUR|USD|LISD|SEUR)', block, re.IGNORECASE)
-                    
-                    if price_match:
-                        num_str = price_match.group(1).replace(',', '.')
-                        if num_str.count('.') > 1:
-                            num_str = num_str.rsplit('.', 1)[0].replace('.', '') + '.' + num_str.rsplit('.', 1)[1]
-                        try:
-                            parsed_val = float(num_str)
-                            if parsed_val < 5000: # Ignoriert Fehler
-                                valid_amounts.append((parsed_val, price_match, block))
-                        except ValueError:
-                            pass
-
-                val = None
-                curr = "USD"
-                
-                if valid_amounts:
-                    if name == "PSS":
-                        valid_amounts.sort(key=lambda x: x[0])
-                        best_val, best_match, best_block = valid_amounts[-1]
-                    else:
-                        best_val, best_match, best_block = valid_amounts[0]
-                        
-                    val = best_val
-                    curr = best_match.group(2).upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
-                    
-                    is_teu = force_teu
-                    if not is_teu and not prevent_teu:
-                        ctx = best_block.lower()
-                        if 'teu' in ctx or 'teli' in ctx or ('20' in ctx and '40' not in ctx):
-                            is_teu = True
-                    
-                    if is_teu:
-                        val *= 2
-
-                # --- SONDERLOGIK FÜR ZERSCHOSSENES PSS-UPDATE ---
-                if name == "PSS" and val is None:
-                    if re.search(r'\b250[,.]?(?:00|000)?\b', text_data):
-                        val = 250
-                        curr = "EUR"
-
-                if val is not None and val > 0:
-                    if val.is_integer(): return f"{name} = {int(val)} {curr}"
-                    else: return f"{name} = {val:.2f} {curr}"
-                    
-                return None
-
-            # Exakte Zuweisung der Verdopplungs-Regeln
-            s_erc = find_surcharge("ERC", ["Logistic Fee", "Equipment Repositioning"], text, prevent_teu=True)
-            if s_erc: prepaid_list.append(s_erc)
+            df_pdf = pd.DataFrame([{
+                'Carrier': 'MSC (aus PDF)',
+                'Contract Number': contract_no,
+                'Port of Loading': pol_str,
+                'Port of Destination': pod_str,
+                'Valid from': v_from,
+                'Valid to': v_to,
+                '40HC': float(rate_match.group(1)) if rate_match else 0,
+                'Currency': rate_match.group(2) if rate_match else "USD",
+                'Included Prepaid Surcharges 40HC': f"ERC = {erc_match.group(1)} {erc_match.group(2)}" if erc_match else "",
+                'Included Collect Surcharges 40HC': "",
+                'Remark': 'Automatisch aus PDF importiert'
+            }])
             
-            s_ets = find_surcharge("ETS", ["ETS", "Emissions Trading System"], text, force_teu=True)
-            if s_ets: prepaid_list.append(s_ets)
-            
-            s_feu = find_surcharge("FEU", ["FEU", "EU Fuel", "Fuel EU"], text, force_teu=True)
-            if s_feu: prepaid_list.append(s_feu)
-            
-            s_pss = find_surcharge("PSS", ["PSS", "Peak Season Surcharge"], text, prevent_teu=True)
-            if s_pss: prepaid_list.append(s_pss)
-            
-            s_eca = find_surcharge("ECA", ["ECA", "Emission Control Area"], text, force_teu=True)
-            if s_eca: prepaid_list.append(s_eca)
-            
-            s_brc = find_surcharge("BRC", ["BRC", "Bunker Recovery", "BAF", "BAC"], text, force_teu=True)
-            if s_brc: prepaid_list.append(s_brc)
-            
-            prepaid_str = ", ".join(prepaid_list)
-            
-            raten_liste = []
-            
-            # --- MATRIX ODER SINGLE RATE LOGIK ---
-            if "via pol" in text.lower():
-                blocks = re.split(r'Port\s+of\s+Discharge', text, flags=re.IGNORECASE)[1:]
-                for block in blocks:
-                    pod_match = re.search(r'^\s*([A-Za-z\s]+)', block)
-                    pod_str = "Unbekannt"
-                    if pod_match:
-                        raw_pod = pod_match.group(1)
-                        stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
-                        for word in stoerwoerter:
-                            raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
-                        raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
-                        words = [w for w in raw_pod.split() if len(w) > 2]
-                        if words:
-                            pod_str = words[0].title()
-                    
-                    routes = re.finditer(r'via\s+POL\s+([A-Za-z/]+)\s+([\d.,]+)\s*(?:EUR|USD)\s+([\d.,]+)\s*(EUR|USD)', block, re.IGNORECASE)
-                    for route in routes:
-                        pol = route.group(1).replace('/', ' / ')
-                        rate_val = parse_price(route.group(3))
-                        curr = route.group(4).upper()
-                        
-                        if rate_val > 0:
-                            raten_liste.append({
-                                'Carrier': 'MSC (aus PDF)',
-                                'Contract Number': contract_no,
-                                'Port of Loading': pol,
-                                'Port of Destination': pod_str,
-                                'Valid from': v_from,
-                                'Valid to': v_to,
-                                '40HC': rate_val,
-                                'Currency': curr,
-                                'Included Prepaid Surcharges 40HC': prepaid_str,
-                                'Included Collect Surcharges 40HC': "",
-                                'Remark': 'Multi-Route Matrix Import'
-                            })
-            else:
-                pod_str = "Unbekannt"
-                pod_block = re.search(r'Port\s+of\s+Discharge(.*?)(\d{3,4}[.,]?\d{0,2}\s*USD|\d{3,4}[.,]?\d{0,2}\s*EUR)', text, re.IGNORECASE | re.DOTALL)
-                
-                if pod_block:
-                    raw_pod = pod_block.group(1)
-                    stoerwoerter = ["Volume", "DV", "HC", "Freetime", "at", "POL", "POD", "Origin", "Destination", "Remarks", "combined", "days", "dem", "det", "TEU", "SA", "QA", "AE"]
-                    for word in stoerwoerter:
-                        raw_pod = re.sub(r'(?i)\b' + re.escape(word) + r'\b', ' ', raw_pod)
-                    
-                    raw_pod = re.sub(r'[^a-zA-Z\s]', ' ', raw_pod)
-                    words = [w for w in raw_pod.split() if len(w) > 2]
-                    if words:
-                        pod_str = words[0].title()
-                        
-                rate_val = 0
-                curr = "USD"
-                if pod_block:
-                    rate_str_full = pod_block.group(2)
-                    rate_m = re.search(r'([\d.,]+)\s*(USD|EUR)', rate_str_full, re.IGNORECASE)
-                    if rate_m:
-                        rate_val = parse_price(rate_m.group(1))
-                        curr = rate_m.group(2).upper()
-
-                if rate_val > 0:
-                    raten_liste.append({
-                        'Carrier': 'MSC (aus PDF)',
-                        'Contract Number': contract_no,
-                        'Port of Loading': global_pol_str,
-                        'Port of Destination': pod_str,
-                        'Valid from': v_from,
-                        'Valid to': v_to,
-                        '40HC': rate_val,
-                        'Currency': curr,
-                        'Included Prepaid Surcharges 40HC': prepaid_str,
-                        'Included Collect Surcharges 40HC': "",
-                        'Remark': 'Automatisch aus PDF importiert'
-                    })
-
-            if not raten_liste:
-                return pd.DataFrame(), "Fehler: Keine gültigen Raten gefunden."
-
-            df_pdf = pd.DataFrame(raten_liste)
-            
+            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
             if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
             if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
             
@@ -478,35 +330,36 @@ with tab_suche:
             filter_datum_aktiv = st.checkbox("📅 Datumsfilter aktiv", value=True)
             such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
 
-        mask = pd.Series([True] * len(df))
+    mask = pd.Series([True] * len(df))
+    
+    # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
+    if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
+    if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
+    if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
+    
+    if filter_datum_aktiv and 'Valid from dt' in df.columns:
+        dt_search = pd.to_datetime(such_datum)
+        mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
+    
+    treffer = df[mask].copy()
+    if '40HC' in treffer.columns:
+        treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
+        treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
         
-        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
-        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
-        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
-        
-        if filter_datum_aktiv and 'Valid from dt' in df.columns:
-            dt_search = pd.to_datetime(such_datum)
-            mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
-        
-        treffer = df[mask].copy()
-        if '40HC' in treffer.columns:
-            treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
-            treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
+        if not treffer.empty:
+            treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
+            treffer = treffer.sort_values(by='Total_EUR_Sort')
             
-            if not treffer.empty:
-                treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
-                treffer = treffer.sort_values(by='Total_EUR_Sort')
+            st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
+            
+            for _, row in treffer.head(50).iterrows():
+                is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
+                label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
                 
-                st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
-                
-                for _, row in treffer.head(50).iterrows():
-                    is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
-                    label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
-                    
-                    with st.expander(label):
-                        anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
-                        if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
-            else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
+                with st.expander(label):
+                    anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
+                    if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
+        else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
 
 # === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
@@ -531,19 +384,8 @@ with tab_upload:
                     records = df_upload.to_dict('records')
                     
                     if records:
-                        # ANTI-DUPLIKAT LOGIK
-                        for r in records:
-                            collection.update_one(
-                                {
-                                    "Contract Number": r.get("Contract Number"),
-                                    "Port of Loading": r.get("Port of Loading"),
-                                    "Port of Destination": r.get("Port of Destination"),
-                                    "Carrier": r.get("Carrier")
-                                },
-                                {"$set": r},
-                                upsert=True
-                            )
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich verarbeitet (Duplikate wurden automatisch überschrieben).")
+                        collection.insert_many(records) 
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                         st.balloons()
     
     # --- GEFAHRENZONE (DATENBANK LEEREN) ---
