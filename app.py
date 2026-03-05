@@ -217,31 +217,38 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
-        # --- 🚨 FIX FÜR MAERSK CONTRACT NUMBERS ---
+        # --- 🚨 FIX FÜR MAERSK CONTRACT NUMBERS (Mit Ziffern-Erkennung) ---
         global_contract = "Unbekannt"
         
-        # 1. Check im Dateinamen (jetzt auch mit Buchstaben erlaubt, z.B. QTE12345)
-        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?([a-zA-Z0-9]{6,15})', datei.name, re.IGNORECASE): 
+        # 1. Check im Dateinamen
+        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?([a-zA-Z0-9]{5,15})', datei.name, re.IGNORECASE): 
             global_contract = fn_match.group(1).upper()
             
-        # 2. Präziser Check in den Excel-Kopfzeilen (Zelle für Zelle)
+        # 2. Präziser Check in den Excel-Kopfzeilen (Überspringt reine Text-Zellen)
         if global_contract == "Unbekannt":
             for i in range(min(20, len(df_raw))):
                 row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
                 for j, val in enumerate(row_vals):
                     v_low = val.lower()
                     if any(w in v_low for w in ['contract', 'quote', 'reference', 'ref']):
-                        # Prüft, ob die Nummer in der gleichen Zelle steht (z.B. "Contract: 1234567")
-                        nums = re.findall(r'\b[A-Z0-9]{6,15}\b', val.upper())
-                        if nums and nums[0].lower() not in ['contract', 'reference', 'quote']:
-                            global_contract = nums[0]
+                        # Prüft, ob die Zelle selbst Ziffern enthält (z.B. "Contract: 123456")
+                        tokens = re.findall(r'\b[A-Z0-9]*\d+[A-Z0-9]*\b', val.upper())
+                        valid_tokens = [t for t in tokens if len(t) >= 5]
+                        if valid_tokens:
+                            global_contract = valid_tokens[0]
                             break
-                        # Prüft, ob die Nummer in der Zelle DIREKT DANEBEN steht
-                        if j + 1 < len(row_vals):
-                            next_val = row_vals[j+1].strip()
-                            if len(next_val) >= 4:  # Mindestens 4 Zeichen lang
-                                global_contract = next_val
-                                break
+                        
+                        # Prüft die nächsten 3 Zellen auf einen Wert mit Ziffern (ignoriert "Number", "No.", etc.)
+                        for k in range(1, 4):
+                            if j + k < len(row_vals):
+                                next_val = row_vals[j+k].upper()
+                                next_tokens = re.findall(r'\b[A-Z0-9]*\d+[A-Z0-9]*\b', next_val)
+                                valid_next = [t for t in next_tokens if len(t) >= 5]
+                                if valid_next:
+                                    global_contract = valid_next[0]
+                                    break
+                        if global_contract != "Unbekannt":
+                            break
                 if global_contract != "Unbekannt":
                     break
 
