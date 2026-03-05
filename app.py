@@ -24,7 +24,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-
 # --- LOGO IN DER SIDEBAR ---
 try:
     st.sidebar.image("logo_farbig.png", use_container_width=True) 
@@ -33,7 +32,6 @@ except FileNotFoundError:
 
 # --- HAUPT-ÜBERSCHRIFT ---
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
-
 
 # --- MONGODB ANBINDUNG ---
 MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
@@ -217,22 +215,38 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
-        # --- INTELLIGENTE CONTRACT ERKENNUNG ---
+        # --- 🚨 FIX FÜR DIE PRÄZISE CONTRACT NUMBER (Ignoriert Quote Number) ---
         global_contract = "Unbekannt"
         
-        # 1. Check im Dateinamen
-        if fn_match := re.search(r'(?:rate|quote|contract|ref)[\s_0-9-]*?(\d{5,})', datei.name, re.IGNORECASE): 
-            global_contract = fn_match.group(1)
-            
-        # 2. Check in den Kopfzeilen (für Maersk Excel!)
+        # 1. Zuerst gezielt nach dem Wort "Contract" in den Excel-Kopfzeilen suchen
         for i in range(min(20, len(df_raw))):
-            row_str = " ".join(df_raw.iloc[i].dropna().astype(str))
-            row_lower = row_str.lower()
-            if any(w in row_lower for w in ['contract', 'quote', 'reference', 'ref']):
-                nums = re.findall(r'\b\d{6,12}\b', row_str)
-                if nums:
-                    global_contract = " / ".join(dict.fromkeys(nums))
+            row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
+            for j, val in enumerate(row_vals):
+                v_low = val.lower()
+                # Wir suchen explizit nach "Contract", um nicht die darüber stehende Quote zu nehmen
+                if 'contract' in v_low:
+                    # Suche nach einer Nummer direkt in dieser Zelle (z.B. "Contract Number 299424203")
+                    nums = re.findall(r'\b\d{6,10}\b', val)
+                    if nums:
+                        global_contract = nums[0]
+                        break
+                    # Falls nicht in derselben Zelle, schaue in die nächsten 3 Zellen rechts daneben
+                    for k in range(1, 4):
+                        if j + k < len(row_vals):
+                            next_val = row_vals[j+k].upper()
+                            next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
+                            if next_tokens:
+                                global_contract = next_tokens[0]
+                                break
+                if global_contract != "Unbekannt":
                     break
+            if global_contract != "Unbekannt":
+                break
+
+        # 2. Nur wenn oben nichts gefunden wurde, Fallback auf den Dateinamen
+        if global_contract == "Unbekannt":
+            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
+                global_contract = fn_match.group(1)
 
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
@@ -255,9 +269,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                 if len(val_raw) < 2: continue
                 
-                row_contract = str(bas_row[contract_col].values[0]) if contract_col else ""
-                if row_contract.lower() == 'nan' or not row_contract.strip():
-                    row_contract = global_contract
+                # Wir priorisieren die gefundene globale Contract Number
+                row_contract = global_contract
                 
                 standard_rows.append({
                     'Carrier': 'Maersk', 'Contract Number': row_contract, 
@@ -268,7 +281,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 })
             df_return = pd.DataFrame(standard_rows)
         else:
-            df_raw['Contract Number'] = df_raw[contract_col].astype(str).fillna(global_contract) if contract_col else global_contract
+            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
             df_return = df_raw
             
         if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
