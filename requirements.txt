@@ -3,3 +3,5 @@ pandas
 PyPDF2
 pymongo
 requests
+openpyxl
+dnspython
