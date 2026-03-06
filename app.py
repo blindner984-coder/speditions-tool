@@ -186,6 +186,14 @@ def normalisiere_pol_text(pol_text):
     return "/".join(out) if out else "Unbekannt"
 
 
+def extrahiere_pol_tokens(pol_text):
+    normalisiert = normalisiere_pol_text(pol_text)
+    if normalisiert == "Unbekannt":
+        return set()
+    teile = [t.strip().lower() for t in re.split(r"[/,]", normalisiert) if t.strip()]
+    return set(teile)
+
+
 def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in str(text).splitlines() if ln and ln.strip()]
     if not lines:
@@ -229,6 +237,48 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
         ziel.append((str(code).strip().upper() or "SUR", float(amount), str(waehrung).upper()))
 
     sea_start = next((i for i, line in enumerate(lines) if "surcharges related to sea freight" in line.lower()), None)
+    origin_thc_eintraege = []
+
+    origin_start = next((i for i, line in enumerate(lines) if "surcharges related to origin" in line.lower()), None)
+    if origin_start is not None:
+        origin_end = len(lines)
+        for i in range(origin_start + 1, len(lines)):
+            if sea_start is not None and i >= sea_start:
+                origin_end = i
+                break
+            if re.match(r"^\d+\.\s", lines[i]):
+                origin_end = i
+                break
+
+        for line in lines[origin_start + 1:origin_end]:
+            low = line.lower()
+            if low.startswith("code ") or "surcharge name amount" in low:
+                continue
+            if not re.match(r"^THC\b", line, re.IGNORECASE):
+                continue
+
+            betrag_match = re.search(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE)
+            if not betrag_match:
+                continue
+
+            betrag = parse_decimal_wert(betrag_match.group(1))
+            waehrung = betrag_match.group(2).upper()
+            if betrag is None:
+                continue
+
+            ort_match = re.search(r"-\s*(.+?)\s+\d[\d\.,]*\s*(USD|EUR)\b", line, re.IGNORECASE)
+            ort_roh = ort_match.group(1).strip() if ort_match else ""
+            ort_norm = normalisiere_pol_text(ort_roh) if ort_roh else ""
+
+            origin_thc_eintraege.append(
+                {
+                    "amount": float(betrag),
+                    "waehrung": waehrung,
+                    "tokens": extrahiere_pol_tokens(ort_norm),
+                    "seq": len(origin_thc_eintraege),
+                }
+            )
+
     if sea_start is not None:
         sea_end = len(lines)
         for i in range(sea_start + 1, len(lines)):
@@ -363,7 +413,38 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
                 suffix = "" if collect_code_counter[last_code] == 1 else f"_{collect_code_counter[last_code]}"
                 fuege_gebuehr_hinzu(collect_liste, f"{last_code}{suffix}", amount, waehrung)
 
-    prepaid_str = ", ".join([f"{c} = {a:.2f} {w}" for c, a, w in prepaid_liste])
+    def baue_prepaid_string(via_pol_text):
+        route_prepaid = list(prepaid_liste)
+        if not any(str(code).upper().startswith("THC") for code, _, _ in route_prepaid):
+            route_tokens = extrahiere_pol_tokens(via_pol_text)
+            passende_thc = []
+
+            for eintrag in origin_thc_eintraege:
+                tokens = eintrag["tokens"]
+                if not route_tokens:
+                    passende_thc.append(eintrag)
+                    continue
+                # THC im Origin-Block kann Hafen-Alternativen enthalten (z.B. HAM/BRV).
+                if tokens and route_tokens & tokens:
+                    passende_thc.append(eintrag)
+
+            if passende_thc:
+                best = max(passende_thc, key=lambda t: (t["amount"], -t["seq"]))
+                vergleich = [t for t in passende_thc if t is not best]
+                nebenwert = max(vergleich, key=lambda t: (t["amount"], -t["seq"])) if vergleich else None
+
+                code_label = "THC"
+                if nebenwert and (
+                    nebenwert["amount"] != best["amount"]
+                    or nebenwert["waehrung"] != best["waehrung"]
+                ):
+                    code_label = f"THC (ALT {nebenwert['amount']:.2f} {nebenwert['waehrung']})"
+
+                route_prepaid.append((code_label, best["amount"], best["waehrung"]))
+
+        return ", ".join([f"{c} = {a:.2f} {w}" for c, a, w in route_prepaid])
+
+    prepaid_str = baue_prepaid_string(pol_str)
     collect_str = ", ".join([f"{c} = {a:.2f} {w}" for c, a, w in collect_liste])
 
     route_rows = []
@@ -402,7 +483,7 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
                 'Valid to': v_to,
                 '40HC': rate_value,
                 'Currency': rate_currency,
-                'Included Prepaid Surcharges 40HC': prepaid_str,
+                'Included Prepaid Surcharges 40HC': baue_prepaid_string(via_pol_raw),
                 'Included Collect Surcharges 40HC': collect_str,
                 'Remark': f"Automatisch aus MSC Quote PDF importiert ({via_hinweis})".strip(),
             })
