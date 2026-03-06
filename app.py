@@ -218,7 +218,8 @@ def berechne_gebuehren(zuschlaege_str):
 
 def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
     basis = parse_decimal_wert(row.get(price_col))
-    if basis is None or basis <= 0: return 99999999 
+    if basis is None:
+        return 99999999
     
     basis_eur = basis * usd_to_eur if str(row.get('Currency', 'USD')).upper() == 'USD' else basis
     summe_gebuehren_eur = 0
@@ -236,7 +237,7 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
 
 def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
     basis = parse_decimal_wert(row.get(price_col))
-    if basis is None or basis <= 0:
+    if basis is None:
         st.warning("Basispreis konnte nicht eindeutig gelesen werden.")
         return
 
@@ -250,7 +251,8 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
     col_basis, col_prep, col_coll, col_doc, col_total = st.columns([1, 1.1, 1.1, 1.1, 1.2])
     
     with col_basis: 
-        st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
+        basis_hinweis = "<br><small class='fremd-waehrung'>Hinweis: negative Basisfracht (z.B. Rabatt/Korrektur)</small>" if basis < 0 else ""
+        st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small>{basis_hinweis}</div>', unsafe_allow_html=True)
         
     with col_prep:
         st.write("**Zusammensetzung (Prepaid):**")
@@ -484,7 +486,7 @@ with tab_suche:
         treffer = df[mask].copy()
         if '40HC' in treffer.columns:
             treffer['40HC_Check'] = treffer['40HC'].apply(parse_decimal_wert)
-            treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
+            treffer = treffer[treffer['40HC_Check'].notna()].reset_index(drop=True)
             
             if not treffer.empty:
                 treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
