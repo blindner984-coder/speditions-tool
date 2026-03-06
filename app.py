@@ -771,9 +771,13 @@ RATEN_PROJECTION = {
     'Remark': 1,
 }
 
+MAX_DB_FETCH = 1200
+MAX_RESULT_ANZEIGE = 200
+RESULTS_PRO_SEITE = 25
+
 
 @st.cache_data(ttl=120)
-def lade_raten_aus_db(such_pol="", such_pod="", such_contract=""):
+def lade_raten_aus_db(such_pol="", such_pod="", such_contract="", fetch_limit=MAX_DB_FETCH):
     query = {}
     if str(such_pol).strip():
         query['Port of Loading'] = {'$regex': re.escape(str(such_pol).strip()), '$options': 'i'}
@@ -782,8 +786,12 @@ def lade_raten_aus_db(such_pol="", such_pod="", such_contract=""):
     if str(such_contract).strip():
         query['Contract Number'] = {'$regex': re.escape(str(such_contract).strip()), '$options': 'i'}
 
-    rows = list(collection.find(query, RATEN_PROJECTION))
-    return pd.DataFrame(rows)
+    cursor = collection.find(query, RATEN_PROJECTION).limit(int(fetch_limit) + 1)
+    rows = list(cursor)
+    ist_gekuerzt = len(rows) > int(fetch_limit)
+    if ist_gekuerzt:
+        rows = rows[:int(fetch_limit)]
+    return pd.DataFrame(rows), ist_gekuerzt
 
 
 # --- TABS FÜR UI ---
@@ -792,7 +800,7 @@ tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (A
 # === TAB 1: SUCHEN ===
 with tab_suche:
     st.write("### Suche in der Datenbank")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
     with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
     with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
@@ -807,9 +815,16 @@ with tab_suche:
             value=datetime.now(timezone.utc).date(),
             disabled=historische_raten,
         )
+    with c5:
+        fetch_limit = st.selectbox(
+            "⚡ Max. DB-Treffer",
+            options=[300, 600, 1200],
+            index=2,
+            help="Schützt vor langen Ladezeiten. Bei sehr breiten Suchen bitte kleiner wählen oder Suche eingrenzen.",
+        )
 
     with st.spinner("Lade Raten aus Datenbank..."):
-        df = lade_raten_aus_db(such_pol, such_pod, such_contract)
+        df, ist_gekuerzt = lade_raten_aus_db(such_pol, such_pod, such_contract, fetch_limit=fetch_limit)
 
     if df.empty:
         if any([such_pol, such_pod, such_contract]):
@@ -817,6 +832,12 @@ with tab_suche:
         else:
             st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
     else:
+        if ist_gekuerzt:
+            st.warning(
+                f"Es wurden mehr als {fetch_limit} Raten gefunden. Aus Performance-Gründen wurden nur die ersten {fetch_limit} geladen. "
+                "Bitte Suche weiter eingrenzen (POL/POD/Contract)."
+            )
+
         if 'Valid from dt' in df.columns:
             df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         if 'Valid to dt' in df.columns:
@@ -840,12 +861,30 @@ with tab_suche:
                 treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
                 treffer = treffer.sort_values(by='Total_EUR_Sort')
 
-                if historische_raten:
-                    st.success(f"✅ {len(treffer)} Raten gefunden (inkl. historischer). Zeige die Top {min(50, len(treffer))} günstigsten an:")
+                anzeige_df = treffer.head(MAX_RESULT_ANZEIGE).reset_index(drop=True)
+                seiten_anzahl = (len(anzeige_df) + RESULTS_PRO_SEITE - 1) // RESULTS_PRO_SEITE
+                if seiten_anzahl > 1:
+                    seite = st.number_input(
+                        "Seite",
+                        min_value=1,
+                        max_value=seiten_anzahl,
+                        value=1,
+                        step=1,
+                        key="search_page",
+                    )
                 else:
-                    st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
+                    seite = 1
 
-                for _, row in treffer.head(50).iterrows():
+                start_idx = (seite - 1) * RESULTS_PRO_SEITE
+                end_idx = start_idx + RESULTS_PRO_SEITE
+                seiten_df = anzeige_df.iloc[start_idx:end_idx]
+
+                if historische_raten:
+                    st.success(f"✅ {len(treffer)} Raten gefunden (inkl. historischer). Zeige Top {len(anzeige_df)} (Seite {seite}/{max(seiten_anzahl, 1)}) an:")
+                else:
+                    st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige Top {len(anzeige_df)} (Seite {seite}/{max(seiten_anzahl, 1)}) an:")
+
+                for _, row in seiten_df.iterrows():
                     is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
                     label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
 
