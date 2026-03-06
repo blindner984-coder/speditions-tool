@@ -164,9 +164,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
     
-    # ==========================================
-    # 1. PDF VERARBEITUNG (Z.B. MSC QUOTES)
-    # ==========================================
+    # PDF VERARBEITUNG
     if datei.name.lower().endswith('.pdf'):
         try:
             with pdfplumber.open(datei) as pdf:
@@ -197,161 +195,109 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 
             current_pod = "Unbekannt"
             
-            with pdfplumber.open(datei) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        for row in table:
-                            clean_row = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
-                            if not any(clean_row): continue
-                            
-                            col0 = clean_row[0].lower()
-                            row_text = " ".join(clean_row).lower()
-                            
-                            is_surcharge = any(x in row_text for x in ["surcharge", "fee", "factor", "thc", "emission", "bunker", "recovery"])
-                            if is_surcharge and not "freetime" in row_text and not "via pol" in row_text:
-                                amt_match = re.search(r'(\d+(?:[,.]\d{2})?)\s*(EUR|USD)', row_text, re.IGNORECASE)
-                                if amt_match:
-                                    code = "FEE"
-                                    if "thc" in row_text or "terminal" in row_text: code = "THC"
-                                    elif "pss" in row_text or "peak season" in row_text: code = "PSS"
-                                    elif "ets" in row_text or "emissions trading" in row_text: code = "ETS"
-                                    elif "feu" in row_text or "fuel eu" in row_text: code = "FEU"
-                                    elif "erc" in row_text or "logistic" in row_text or "equipment" in row_text: code = "ERC"
-                                    elif "occ" in row_text or "operation" in row_text: code = "OCC"
-                                    elif "eca" in row_text or "emission control" in row_text: code = "ECA"
-                                    elif "buc" in row_text or "bunker" in row_text: code = "BUC"
-                                    
-                                    if "20'" in row_text and "40'" not in row_text and "per 20" in row_text:
-                                        continue
-                                        
-                                    amt = amt_match.group(1).replace(',', '.')
-                                    curr = amt_match.group(2).upper()
-                                    entry = f"{code} = {amt} {curr}"
-                                    
-                                    if code == "OCC" or "collect" in row_text:
-                                        if entry not in coll_surcharges: coll_surcharges.append(entry)
-                                    else:
-                                        if entry not in prep_surcharges: prep_surcharges.append(entry)
-                                continue
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        clean_row = [str(c).replace('\n', ' ').strip() if c else "" for c in row]
+                        if not any(clean_row): continue
+                        
+                        col0 = clean_row[0].lower()
+                        row_text = " ".join(clean_row).lower()
+                        
+                        is_surcharge = any(x in row_text for x in ["surcharge", "fee", "factor", "thc", "emission", "bunker", "recovery"])
+                        if is_surcharge and not "freetime" in row_text and not "via pol" in row_text:
+                            amt_match = re.search(r'(\d+(?:[,.]\d{2})?)\s*(EUR|USD)', row_text, re.IGNORECASE)
+                            if amt_match:
+                                code = "FEE"
+                                if "thc" in row_text or "terminal" in row_text: code = "THC"
+                                elif "pss" in row_text or "peak season" in row_text: code = "PSS"
+                                elif "ets" in row_text or "emissions trading" in row_text: code = "ETS"
+                                elif "feu" in row_text or "fuel eu" in row_text: code = "FEU"
+                                elif "erc" in row_text or "logistic" in row_text or "equipment" in row_text: code = "ERC"
+                                elif "occ" in row_text or "operation" in row_text: code = "OCC"
+                                
+                                amt = amt_match.group(1).replace(',', '.')
+                                curr = amt_match.group(2).upper()
+                                entry = f"{code} = {amt} {curr}"
+                                
+                                if code == "OCC" or "collect" in row_text:
+                                    if entry not in coll_surcharges: coll_surcharges.append(entry)
+                                else:
+                                    if entry not in prep_surcharges: prep_surcharges.append(entry)
+                            continue
 
-                            if "port of discharge" in col0 and len(col0) > 17:
-                                pod_cand = col0.replace("port of discharge", "").replace(":", "").strip()
-                                if pod_cand:
-                                    current_pod = pod_cand.title()
-                                continue
-                                
-                            if "freetime" in col0 or "volume" in col0 or "remarks" in col0:
-                                continue
-                                
-                            rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
-                            if rate_matches:
-                                target_match = rate_matches[-1] 
-                                betrag = float(target_match[0].replace(',', '.'))
-                                waehrung = target_match[1].upper()
-                                
-                                row_pol = global_pol
-                                row_pod = current_pod
-                                
-                                if "via pol" in col0:
-                                    row_pol = clean_row[0].lower().replace("via pol", "").strip().upper()
-                                elif current_pod == "Unbekannt":
-                                    potential_pod = clean_row[0]
-                                    potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', potential_pod).strip()
-                                    if 2 < len(potential_pod) < 25 and not any(char.isdigit() for char in potential_pod):
-                                        row_pod = potential_pod.title()
-                                        
-                                if row_pod != "Unbekannt" and betrag > 0:
-                                    raten_zeilen.append({
-                                        'Carrier': 'MSC',
-                                        'Contract Number': contract_no,
-                                        'Port of Loading': row_pol,
-                                        'Port of Destination': row_pod,
-                                        'Valid from': valid_from,
-                                        'Valid to': valid_to,
-                                        '40HC': betrag,
-                                        'Currency': waehrung
-                                    })
+                        if "port of discharge" in col0 and len(col0) > 17:
+                            pod_cand = col0.replace("port of discharge", "").replace(":", "").strip()
+                            if pod_cand: current_pod = pod_cand.title()
+                            continue
+                            
+                        rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
+                        if rate_matches:
+                            target_match = rate_matches[-1] 
+                            betrag = float(target_match[0].replace(',', '.'))
+                            waehrung = target_match[1].upper()
+                            
+                            row_pol = global_pol
+                            row_pod = current_pod
+                            
+                            if "via pol" in col0: row_pol = clean_row[0].lower().replace("via pol", "").strip().upper()
+                            elif current_pod == "Unbekannt":
+                                potential_pod = clean_row[0]
+                                potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', potential_pod).strip()
+                                if 2 < len(potential_pod) < 25 and not any(char.isdigit() for char in potential_pod):
+                                    row_pod = potential_pod.title()
+                                    
+                            if row_pod != "Unbekannt" and betrag > 0:
+                                raten_zeilen.append({
+                                    'Carrier': 'MSC',
+                                    'Contract Number': contract_no,
+                                    'Port of Loading': row_pol,
+                                    'Port of Destination': row_pod,
+                                    'Valid from': valid_from,
+                                    'Valid to': valid_to,
+                                    '40HC': betrag,
+                                    'Currency': waehrung
+                                })
             
             prep_str = ", ".join(prep_surcharges)
             coll_str = ", ".join(coll_surcharges)
-            
             for r in raten_zeilen:
                 r['Included Prepaid Surcharges 40HC'] = prep_str
                 r['Included Collect Surcharges 40HC'] = coll_str
-                r['Remark'] = 'Automatisch aus PDF importiert'
+                r['Remark'] = 'PDF Import'
                 
-            if not raten_zeilen:
-                raise ValueError("Keine Raten in den Tabellen gefunden.")
-                
-            df_return = pd.DataFrame(raten_zeilen).drop_duplicates()
-            
-            if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
-
-            return df_return, "PDF"
-            
+            return pd.DataFrame(raten_zeilen).drop_duplicates(), "PDF"
         except Exception as e: 
-            return pd.DataFrame(), f"Systemfehler beim Auslesen: {e}"
+            return pd.DataFrame(), f"PDF Fehler: {e}"
 
-    # ==========================================
-    # 2. EXCEL / CSV VERARBEITUNG (MAERSK & CO)
-    # ==========================================
+    # EXCEL / CSV VERARBEITUNG
     else:
         try:
-            # FIX 1: Ignoriert Groß-/Kleinschreibung bei Endungen (.XLSX)
-            if datei.name.lower().endswith('.xlsx') or datei.name.lower().endswith('.xls'):
-                try:
-                    excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
-                except ImportError:
-                    return pd.DataFrame(), "FEHLENDES PAKET: 'openpyxl' fehlt. Bitte in die requirements.txt auf GitHub eintragen!"
-                except Exception as e:
-                    return pd.DataFrame(), f"Fehler beim Öffnen der Excel: {e}"
-                
+            # Endung prüfen (ignoriert Großschreibung)
+            is_excel = datei.name.lower().endswith(('.xlsx', '.xls'))
+            if is_excel:
+                excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
                 ziel_sheet, header_idx = None, 0
                 for sheet_name, df_preview in excel_preview.items():
                     for i in range(len(df_preview)):
-                        # Sicherstellen, dass alles Strings sind, bevor gesucht wird
                         row_str = " ".join([str(x) for x in df_preview.iloc[i].dropna()])
-                        if any(x in row_str for x in ['40HDRY', 'Port of Destination', '40HC All In', '40HC']):
+                        if any(x in row_str for x in ['40HDRY', '40HC All In', '40HC']):
                             ziel_sheet, header_idx = sheet_name, i
                             break
                     if ziel_sheet: break
                 df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
-            
-            # Falls es eine .csv ist
             else:
                 df_raw = pd.read_csv(datei, header=None, low_memory=False)
                 header_idx = 0
                 for i in range(min(20, len(df_raw))):
                     row_str = " ".join([str(x) for x in df_raw.iloc[i].dropna()])
-                    if any(x in row_str for x in ['40HDRY', '40HC All In', 'Port of Destination', '40HC']):
+                    if any(x in row_str for x in ['40HDRY', '40HC All In', '40HC']):
                         header_idx = i; break
 
+            # Contract Suche
             global_contract = "Unbekannt"
-            for i in range(min(20, len(df_raw))):
-                row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
-                for j, val in enumerate(row_vals):
-                    v_low = val.lower()
-                    if 'contract' in v_low:
-                        nums = re.findall(r'\b\d{6,10}\b', val)
-                        if nums:
-                            global_contract = nums[0]
-                            break
-                        for k in range(1, 4):
-                            if j + k < len(row_vals):
-                                next_val = row_vals[j+k].upper()
-                                next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
-                                if next_tokens:
-                                    global_contract = next_tokens[0]
-                                    break
-                    if global_contract != "Unbekannt": break
-                if global_contract != "Unbekannt": break
-
-            if global_contract == "Unbekannt":
-                if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
-                    global_contract = fn_match.group(1)
-
+            # Spaltenköpfe bereinigen
             rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
             neue_spalten, gesehen = [], {}
             for s in rohe_spalten:
@@ -361,17 +307,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 else: 
                     gesehen[s] = 0
                     neue_spalten.append(s)
-                    
             df_raw.columns = neue_spalten
             df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
-            
-            # Sicheres Auffinden der Contract-Spalte
-            contract_col = next((str(c) for c in df_raw.columns if any(x in str(c).lower() for x in ['contract', 'quote', 'reference'])), None)
-            
-            if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
-            # 2A. MAERSK TENDER FORMAT (BAS / DDF / EBS)
+            # Maersk Tender Format
             if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
                 standard_rows = []
                 for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
@@ -379,36 +318,34 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                     if bas_row.empty: continue
                     val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                     if len(val_raw) < 2: continue
-                    
                     standard_rows.append({
-                        'Carrier': 'Maersk', 'Contract Number': global_contract, 
+                        'Carrier': 'Maersk', 'Contract Number': 'Tender', 
                         'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
                         '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
-                        'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
-                        'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
+                        'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows()]),
+                        'Included Collect Surcharges 40HC': "", 'Remark': 'Maersk Tender'
                     })
                 df_return = pd.DataFrame(standard_rows)
-                
-            # 2B. STANDARD EXPORT FORMAT (inkl. korrektem Currency-Match)
             else:
-                df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
-                
+                # Standard CSV/Excel
                 if '40HC' in neue_spalten:
                     idx_40hc = neue_spalten.index('40HC')
-                    if idx_40hc + 1 < len(neue_spalten) and 'currency' in rohe_spalten[idx_40hc + 1].lower():
+                    if idx_40hc + 1 < len(neue_spalten):
                         df_raw['Currency'] = df_raw[neue_spalten[idx_40hc + 1]]
-                        
                 df_return = df_raw
-                
-            if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
+            
+            # Datumsfilter vorbereiten
+            for col in ['Valid from', 'Effective Date']:
+                if col in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return[col], errors='coerce').astype(str)
+            for col in ['Valid to', 'Expiry Date']:
+                if col in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return[col], errors='coerce').astype(str)
             
             return df_return, "Excel/CSV"
-            
         except Exception as e:
-            return pd.DataFrame(), f"Systemfehler beim Verarbeiten der Excel/CSV: {str(e)}"
+            return pd.DataFrame(), f"Excel Fehler: {e}"
 
-# === TAB 1 & 2 UI LOGIK ===
+
+# --- TABS ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
 with tab_suche:
@@ -416,84 +353,60 @@ with tab_suche:
     daten_liste = list(cursor)
 
     if not daten_liste:
-        st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
+        st.info("💡 Datenbank ist leer.")
     else:
         df = pd.DataFrame(daten_liste)
-        
         if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
         
-        st.write(f"### Suche in der Datenbank ({len(df)} Raten aktiv)")
+        st.write(f"### Suche ({len(df)} Raten)")
         c1, c2, c3, c4 = st.columns(4)
-        with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
-        with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
-        with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
+        with c1: such_pol = st.text_input("📍 POL:")
+        with c2: such_pod = st.text_input("🏁 POD:")
+        with c3: such_contract = st.text_input("📄 Contract:")
         with c4:
-            filter_datum_aktiv = st.checkbox("📅 Datumsfilter aktiv", value=True)
-            such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
+            filter_datum_aktiv = st.checkbox("📅 Datumsfilter", value=True)
+            such_datum = st.date_input("Gültig am:", disabled=not filter_datum_aktiv)
 
         mask = pd.Series([True] * len(df))
-        
-        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
-        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
-        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
-        
+        if such_pol: mask &= df['Port of Loading'].astype(str).str.contains(such_pol, case=False, na=False)
+        if such_pod: mask &= df['Port of Destination'].astype(str).str.contains(such_pod, case=False, na=False)
+        if such_contract: mask &= df['Contract Number'].astype(str).str.contains(such_contract, case=False, na=False)
         if filter_datum_aktiv and 'Valid from dt' in df.columns:
-            dt_search = pd.to_datetime(such_datum)
-            mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
+            dt_s = pd.to_datetime(such_datum)
+            mask &= (df['Valid from dt'] <= dt_s) & (df['Valid to dt'] >= dt_s)
         
         treffer = df[mask].copy()
-        if '40HC' in treffer.columns:
-            treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
-            treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
-            
-            if not treffer.empty:
-                treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
-                treffer = treffer.sort_values(by='Total_EUR_Sort')
-                
-                st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
-                
-                for _, row in treffer.head(50).iterrows():
-                    is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
-                    label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
-                    
-                    with st.expander(label):
-                        anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
-                        if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
-            else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
+        if not treffer.empty and '40HC' in treffer.columns:
+            treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
+            treffer = treffer.sort_values(by='Total_EUR_Sort')
+            for _, row in treffer.head(50).iterrows():
+                with st.expander(f"🚢 {row.get('Carrier')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')} | {row.get('Total_EUR_Sort', 0):.2f} EUR"):
+                    anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
 
 with tab_upload:
-    st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
-    uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
+    st.write("### 📥 Neue Raten importieren")
+    # GEÄNDERTE ZEILE HIER:
+    uploaded_files = st.file_uploader("Dateien auswählen", accept_multiple_files=True)
     
     if uploaded_files:
-        if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
+        if st.button("🚀 In Datenbank speichern", type="primary"):
             alle_daten = []
-            with st.spinner("Lese Dateien und speichere in Datenbank..."):
-                for datei in uploaded_files:
-                    try:
-                        df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
-                        if not df_teil.empty:
-                            alle_daten.append(df_teil)
-                        else:
-                            st.error(f"❌ Keine Raten in '{datei.name}' gefunden. Grund: {format_name}")
-                    except Exception as e: 
-                        st.error(f"❌ Unerwarteter Fehler bei '{datei.name}': {e}")
+            for datei in uploaded_files:
+                df_teil, msg = lade_und_uebersetze_cached(datei.name, datei.getvalue())
+                if not df_teil.empty:
+                    alle_daten.append(df_teil)
+                else:
+                    st.error(f"Fehler in {datei.name}: {msg}")
             
-                if alle_daten:
-                    df_upload = pd.concat(alle_daten, ignore_index=True)
-                    df_upload['createdAt'] = datetime.now(timezone.utc)
-                    records = df_upload.to_dict('records')
-                    
-                    if records:
-                        collection.insert_many(records) 
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
-                        st.balloons()
+            if alle_daten:
+                df_u = pd.concat(alle_daten, ignore_index=True)
+                df_u['createdAt'] = datetime.now(timezone.utc)
+                collection.insert_many(df_u.to_dict('records'))
+                st.success(f"{len(df_u)} Raten gespeichert!")
+                st.balloons()
     
     st.markdown("---")
-    st.write("### 🚨 Gefahrenzone")
-    st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank.")
-    
-    if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
-        ergebnis_all = collection.delete_many({})
-        st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+    if st.button("🗑️ Datenbank leeren"):
+        collection.delete_many({})
+        st.success("Geleert!")
