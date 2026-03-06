@@ -34,8 +34,8 @@ except FileNotFoundError:
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
-MONGO_URI = st.secrets["mongo"]["uri"]
-@st.cache_resource
+# Ersetze die harte URL durch diesen dynamischen Abruf
+MONGO_URI = st.secrets["mongo"]["uri"]@st.cache_resource
 def init_db():
     client = pymongo.MongoClient(MONGO_URI)
     db = client["SpeditionsDB"]
@@ -377,4 +377,5 @@ with tab_upload:
     if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
         ergebnis_all = collection.delete_many({})
         st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+
 
