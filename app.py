@@ -158,17 +158,20 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
+
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
     
+    # ==========================================
+    # 1. PDF VERARBEITUNG (Z.B. MSC QUOTES)
+    # ==========================================
     if datei.name.lower().endswith('.pdf'):
         try:
             with pdfplumber.open(datei) as pdf:
                 full_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
                 try:
-                    # layout=True behält die visuelle Struktur (Spalten) von MSC bei
                     layout_text = "\n".join([page.extract_text(layout=True) for page in pdf.pages if page.extract_text(layout=True)])
                 except:
                     layout_text = full_text
@@ -177,7 +180,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             prep_surcharges = []
             coll_surcharges = []
             
-            # --- 1. METADATEN (Vertrag, Datum, POL) ---
             c_match = re.search(r'\b([A-Z0-9]{14,16})\b', full_text)
             contract_no = c_match.group(1) if c_match else "Unbekannt"
             
@@ -185,7 +187,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             valid_from = v_match.group(1) if v_match else "Unbekannt"
             valid_to = v_match.group(2) if v_match else "Unbekannt"
             
-            # POL über visuelles Layout extrahieren
             pol_match = re.search(r'Ports?\s+of\s+Loading\s{2,}([A-Za-z\s,]+)', layout_text, re.IGNORECASE)
             if pol_match and len(pol_match.group(1).strip()) > 2:
                 global_pol = pol_match.group(1).strip()
@@ -194,7 +195,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             else:
                 global_pol = "Unbekannt"
                 
-            # --- 2. TABELLEN-EXTRAKTION (Raten & Gebühren) ---
             current_pod = "Unbekannt"
             
             with pdfplumber.open(datei) as pdf:
@@ -208,10 +208,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                             col0 = clean_row[0].lower()
                             row_text = " ".join(clean_row).lower()
                             
-                            # A) Gebühren erkennen (z.B. PSS, ERC, THC)
                             is_surcharge = any(x in row_text for x in ["surcharge", "fee", "factor", "thc", "emission", "bunker", "recovery"])
                             if is_surcharge and not "freetime" in row_text and not "via pol" in row_text:
-                                # Sucht auch nach Beträgen ohne Komma (wie "10 EUR")
                                 amt_match = re.search(r'(\d+(?:[,.]\d{2})?)\s*(EUR|USD)', row_text, re.IGNORECASE)
                                 if amt_match:
                                     code = "FEE"
@@ -224,7 +222,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                     elif "eca" in row_text or "emission control" in row_text: code = "ECA"
                                     elif "buc" in row_text or "bunker" in row_text: code = "BUC"
                                     
-                                    # 20' spezifische Zuschläge überspringen
                                     if "20'" in row_text and "40'" not in row_text and "per 20" in row_text:
                                         continue
                                         
@@ -236,33 +233,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                         if entry not in coll_surcharges: coll_surcharges.append(entry)
                                     else:
                                         if entry not in prep_surcharges: prep_surcharges.append(entry)
-                                continue # Zeile ist eine Gebühr -> Keine Rate auslesen!
+                                continue
 
-                            # B) Zielhäfen als Überschrift (Casablanca/Nordafrika Logik)
                             if "port of discharge" in col0 and len(col0) > 17:
                                 pod_cand = col0.replace("port of discharge", "").replace(":", "").strip()
                                 if pod_cand:
                                     current_pod = pod_cand.title()
                                 continue
                                 
-                            # C) Zeilen mit Tabellen-Köpfen ignorieren
                             if "freetime" in col0 or "volume" in col0 or "remarks" in col0:
                                 continue
                                 
-                            # D) Raten und Häfen auslesen
                             rate_matches = re.findall(r'(\d{3,4}(?:[,.]\d{2})?)\s*(USD|EUR)', " ".join(clean_row), re.IGNORECASE)
                             if rate_matches:
-                                target_match = rate_matches[-1] # Nimm letzte Rate (meistens 40HC)
+                                target_match = rate_matches[-1] 
                                 betrag = float(target_match[0].replace(',', '.'))
                                 waehrung = target_match[1].upper()
                                 
                                 row_pol = global_pol
                                 row_pod = current_pod
                                 
-                                # Wenn der Ladehafen in der Zeile überschrieben wird (z.B. "via POL HAM/BRV")
                                 if "via pol" in col0:
                                     row_pol = clean_row[0].lower().replace("via pol", "").strip().upper()
-                                # Wenn der POD direkt am Anfang der Zeile steht (z.B. Dammam, Hamad)
                                 elif current_pod == "Unbekannt":
                                     potential_pod = clean_row[0]
                                     potential_pod = re.sub(r'\b[A-Z]{2}\b$', '', potential_pod).strip()
@@ -281,7 +273,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                                         'Currency': waehrung
                                     })
             
-            # --- 3. DATEN ZUSAMMENFÜHREN ---
             prep_str = ", ".join(prep_surcharges)
             coll_str = ", ".join(coll_surcharges)
             
@@ -303,8 +294,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         except Exception as e: 
             return pd.DataFrame(), f"Systemfehler beim Auslesen: {e}"
 
+    # ==========================================
+    # 2. EXCEL / CSV VERARBEITUNG (MAERSK & CO)
+    # ==========================================
     else:
-        # --- EXCEL / CSV VERARBEITUNG ---
         if datei.name.endswith('.xlsx'):
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
             ziel_sheet, header_idx = None, 0
@@ -322,7 +315,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
-        # Globale Contract-Nummer suchen
         global_contract = "Unbekannt"
         for i in range(min(20, len(df_raw))):
             row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
@@ -347,7 +339,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
                 global_contract = fn_match.group(1)
 
-        # Spaltennamen bereinigen und Duplikate (wie Currency) durchnummerieren
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
         for s in rohe_spalten:
@@ -365,7 +356,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
         if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
-        # 1. MAERSK FORMAT (z.B. Q2 2026 E1E FMS.xlsx)
+        # 2A. MAERSK TENDER FORMAT (BAS / DDF / EBS)
         if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
@@ -383,11 +374,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 })
             df_return = pd.DataFrame(standard_rows)
             
-        # 2. STANDARD EXPORT FORMAT (z.B. Kopie von rate_...)
+        # 2B. STANDARD EXPORT FORMAT (inkl. korrektem Currency-Match)
         else:
             df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
             
-            # WICHTIGER FIX: Sucht exakt die Währung, die rechts neben "40HC" steht
             if '40HC' in neue_spalten:
                 idx_40hc = neue_spalten.index('40HC')
                 if idx_40hc + 1 < len(neue_spalten) and 'currency' in rohe_spalten[idx_40hc + 1].lower():
