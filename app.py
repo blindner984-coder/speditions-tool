@@ -186,10 +186,13 @@ def normalisiere_pol_text(pol_text):
     return "/".join(out) if out else "Unbekannt"
 
 
-def extrahiere_msc_quote_pdf_daten(text):
+def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in str(text).splitlines() if ln and ln.strip()]
     if not lines:
         return None
+
+    modus = str(monatswert_modus).strip().lower()
+    bevorzuge_neu = modus not in {"alt", "aelter", "aeltere", "old", "older", "first"}
 
     joined = "\n".join(lines)
     lower_joined = joined.lower()
@@ -233,7 +236,7 @@ def extrahiere_msc_quote_pdf_daten(text):
                 sea_end = i
                 break
 
-        beste_codes = {}
+        code_kandidaten = {}
         seq = 0
         for line in lines[sea_start + 1:sea_end]:
             low = line.lower()
@@ -278,12 +281,47 @@ def extrahiere_msc_quote_pdf_daten(text):
                 "amount": amount * multiplier,
                 "waehrung": waehrung,
             }
-            alt = beste_codes.get(code)
-            if alt is None or kandidat["priority"] > alt["priority"] or (kandidat["priority"] == alt["priority"] and kandidat["seq"] > alt["seq"]):
-                beste_codes[code] = kandidat
+            code_kandidaten.setdefault(code, []).append(kandidat)
 
-        for code, val in sorted(beste_codes.items(), key=lambda kv: kv[1]["seq"]):
-            fuege_gebuehr_hinzu(prepaid_liste, code, val["amount"], val["waehrung"])
+        gewaehlte_codes = []
+        for code, kandidaten in code_kandidaten.items():
+            if not kandidaten:
+                continue
+
+            if bevorzuge_neu:
+                best = max(kandidaten, key=lambda c: (c["priority"], c["seq"]))
+                vergleich = [
+                    c for c in kandidaten
+                    if c["priority"] == best["priority"] and c["seq"] < best["seq"]
+                ]
+                nebenwert = max(vergleich, key=lambda c: c["seq"]) if vergleich else None
+            else:
+                best = min(kandidaten, key=lambda c: (-c["priority"], c["seq"]))
+                vergleich = [
+                    c for c in kandidaten
+                    if c["priority"] == best["priority"] and c["seq"] > best["seq"]
+                ]
+                nebenwert = min(vergleich, key=lambda c: c["seq"]) if vergleich else None
+
+            code_label = code
+            if nebenwert and (
+                nebenwert["amount"] != best["amount"]
+                or nebenwert["waehrung"] != best["waehrung"]
+            ):
+                marker = "ALT" if bevorzuge_neu else "NEU"
+                code_label = f"{code} ({marker} {nebenwert['amount']:.2f} {nebenwert['waehrung']})"
+
+            gewaehlte_codes.append(
+                {
+                    "seq": best["seq"],
+                    "label": code_label,
+                    "amount": best["amount"],
+                    "waehrung": best["waehrung"],
+                }
+            )
+
+        for item in sorted(gewaehlte_codes, key=lambda x: x["seq"]):
+            fuege_gebuehr_hinzu(prepaid_liste, item["label"], item["amount"], item["waehrung"])
 
     dest_start = next((i for i, line in enumerate(lines) if "destination charges" in line.lower()), None)
     if dest_start is not None:
@@ -464,7 +502,7 @@ def ist_doc_gebuehr(name):
 # --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
-    treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
+    treffer = re.findall(r"([A-Za-z0-9\s\(\)\-\./,:+'&]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})", zuschlaege_str)
     liste = []
     for t in treffer:
         try:
@@ -563,7 +601,7 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
 
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
-def lade_und_uebersetze_cached(file_name, file_bytes):
+def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
     
@@ -574,7 +612,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             if not text.strip():
                 return pd.DataFrame(), "Fehler: PDF enthält keinen auslesbaren Text."
 
-            msc_quote_data = extrahiere_msc_quote_pdf_daten(text)
+            msc_quote_data = extrahiere_msc_quote_pdf_daten(text, monatswert_modus=monatswert_modus)
             if msc_quote_data:
                 msc_rows = msc_quote_data if isinstance(msc_quote_data, list) else [msc_quote_data]
                 df_pdf = pd.DataFrame(msc_rows)
@@ -790,6 +828,14 @@ with tab_upload:
     if is_admin:
         st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
         st.caption(f"Maximale Dateigröße pro Datei: {MAX_UPLOAD_SIZE_MB} MB")
+        monatswert_auswahl = st.radio(
+            "Bei mehrfachen Monatswerten in PDF-Zuschlägen verwenden:",
+            options=["Neuester Betrag", "Älterer Betrag"],
+            index=0,
+            horizontal=True,
+            help="Gilt nur für MSC Quote PDFs mit mehrfachen Monatswerten (z.B. Feb/März).",
+        )
+        monatswert_modus = "neu" if monatswert_auswahl == "Neuester Betrag" else "alt"
         uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
         
         if uploaded_files:
@@ -803,7 +849,11 @@ with tab_upload:
                                 st.error(f"Datei {datei.name} ist größer als {MAX_UPLOAD_SIZE_MB} MB und wurde übersprungen.")
                                 continue
 
-                            df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei_bytes)
+                            df_teil, format_name = lade_und_uebersetze_cached(
+                                datei.name,
+                                datei_bytes,
+                                monatswert_modus=monatswert_modus,
+                            )
                             if not df_teil.empty:
                                 alle_daten.append(df_teil)
                         except Exception as e:
