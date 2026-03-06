@@ -1,6 +1,5 @@
 streamlit
 pandas
-requests
+PyPDF2
 pymongo
-pdfplumber
-openpyxl
+requests
