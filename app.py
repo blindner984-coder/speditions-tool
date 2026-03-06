@@ -16,7 +16,6 @@ st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
 
 st.markdown("""
     <style>
-    /* Styling für die Preis-Boxen */
     .all-in-box { background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }
     .basis-box { background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }
     .fremd-waehrung { color: #d9534f; font-weight: bold; }
@@ -32,19 +31,14 @@ except:
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
-# SICHERHEITS-HINWEIS: Nutze st.secrets für die produktive Nutzung!
-try:
-    MONGO_URI = st.secrets["mongo"]["uri"]
-except:
-    # Fallback auf deinen bisherigen Link (nur für Tests)
-    MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 @st.cache_resource
 def init_db():
     client = pymongo.MongoClient(MONGO_URI)
     db = client["SpeditionsDB"]
     collection = db["Raten"]
-    collection.create_index("createdAt", expireAfterSeconds=15552000) # Auto-Löschen nach 6 Monaten
+    collection.create_index("createdAt", expireAfterSeconds=15552000)
     return collection
 
 collection = init_db()
@@ -68,33 +62,39 @@ def ist_doc_gebuehr(name):
     return any(x in n for x in ['b/l', 'bl', 'doc', 'documentation'])
 
 def parse_price(val_str):
-    s = re.sub(r'[^\d,\.]', '', str(val_str))
-    if not s: return 0.0
-    if ',' in s and len(s.split(',')[-1]) == 2:
-        s = s.rsplit(',', 1)[0].replace('.', '').replace(',', '') + '.' + s.split(',')[-1]
-    elif '.' in s and len(s.split('.')[-1]) == 2:
-        s = s.rsplit('.', 1)[0].replace('.', '').replace(',', '') + '.' + s.split('.')[-1]
-    else:
-        s = s.replace('.', '').replace(',', '')
-    try: return float(s)
-    except: return 0.0
+    """Wandelt Strings mit Kommas oder Punkten sicher in Floats um."""
+    if not val_str: return 0.0
+    s = str(val_str).replace(' ', '').replace('EUR', '').replace('USD', '').replace('LISD', '')
+    # Entferne Tausenderpunkte, ersetze Dezimalkomma durch Punkt
+    if ',' in s and '.' in s:
+        if s.find('.') < s.find(','): s = s.replace('.', '')
+    s = s.replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
 def berechne_total_eur_dynamic(row, price_col, prep_col):
-    basis = pd.to_numeric(row.get(price_col), errors='coerce')
-    if pd.isna(basis) or basis <= 0: return 99999999 
+    """Berechnet den Gesamtpreis und fängt Fehler bei der Konvertierung ab."""
+    basis = parse_price(row.get(price_col))
+    if basis <= 0: return 99999999 
+    
     basis_eur = basis * usd_to_eur if str(row.get('Currency', 'USD')).upper() == 'USD' else basis
     
     sum_geb = 0
     raw_geb = str(row.get(prep_col, ''))
-    treffer = re.findall(r'([A-Z0-9\s]+?)\s*=\s*([\d,\.]+)\s*([A-Z]{3})', raw_geb)
-    for t in treffer:
-        if not ist_doc_gebuehr(t[0]):
-            val = float(t[1])
-            sum_geb += (val * usd_to_eur) if t[2] == 'USD' else val
+    # Suche Muster: NAME = BETRAG WÄHRUNG
+    matches = re.findall(r'([A-Z0-9\s]+?)\s*=\s*([\d,\.]+)\s*([A-Z]{3})', raw_geb)
+    
+    for m in matches:
+        if not ist_doc_gebuehr(m[0]):
+            val = parse_price(m[1])
+            sum_geb += (val * usd_to_eur) if m[2] == 'USD' else val
+            
     return basis_eur + sum_geb
 
 def anzeige_container_daten(row, size_label, price_col, prep_col):
-    basis = pd.to_numeric(row.get(price_col), errors='coerce')
+    basis = parse_price(row.get(price_col))
     curr = str(row.get('Currency', 'USD')).upper()
     basis_eur = basis * usd_to_eur if curr == 'USD' else basis
     
@@ -106,10 +106,12 @@ def anzeige_container_daten(row, size_label, price_col, prep_col):
     geb_list = re.findall(r'([A-Z0-9\s]+?)\s*=\s*([\d,\.]+)\s*([A-Z]{3})', prep_raw)
     total_prep_eur = 0
     with col2:
-        st.write("**Prepaid Zuschläge:**")
+        st.write("**Zusammensetzung (Prepaid):**")
+        if not geb_list:
+            st.write("<small>Keine extra Gebühren</small>", unsafe_allow_html=True)
         for g in geb_list:
             if ist_doc_gebuehr(g[0]): continue
-            val = float(g[1])
+            val = parse_price(g[1])
             umg = (val * usd_to_eur) if g[2] == 'USD' else val
             total_prep_eur += umg
             st.write(f"➕ {g[0]}: {val:.2f} {g[2]}")
@@ -118,14 +120,13 @@ def anzeige_container_daten(row, size_label, price_col, prep_col):
         total = basis_eur + total_prep_eur
         st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:24px; font-weight:bold;">{total:.2f} EUR</span></div>', unsafe_allow_html=True)
 
-# --- PDF READER (SCHARFSCHÜTZEN-LOGIK) ---
+# --- PDF READER ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
     try:
         reader = PyPDF2.PdfReader(datei)
         text = " ".join([p.extract_text() for p in reader.pages])
         
-        # Validitätsdaten extrahieren [cite: 23, 115, 205, 237]
         dates = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
         v_from = dates[0] if dates else "Unbekannt"
         v_to = dates[-1] if len(dates) > 1 else "Unbekannt"
@@ -133,75 +134,66 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
         cont = re.search(r'(?:Contract|Quote|Reference)[\s#:]*([A-Z0-9]{5,20})', text, re.I)
         contract_no = cont.group(1) if cont else "Unbekannt"
         
-        # Zuschlags-Logik (Scharfschütze für ECA, ETS, FEU, PSS) [cite: 33, 125, 228, 251]
         prepaid_list = []
         def get_sur(name, keys, f_teu=False, p_teu=False):
             regex = r'(?:' + '|'.join(keys) + r')'
             for m in re.finditer(regex, text, re.I):
                 block = text[m.end():m.end()+130]
-                # Inkludiert-Check (Not subject to / incl) [cite: 33, 228, 251]
                 if re.search(r'\b(?:not subject to|incl|ind|included|n/a)\b', block[:60], re.I): continue
-                # Preis-Check (Zahl muss eine Währung direkt danach haben) [cite: 125, 251]
-                p_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,2})?)\s*(EUR|USD|LISD|SEUR)', block, re.I)
+                p_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)\s*(EUR|USD|LISD|SEUR)', block, re.I)
                 if p_match:
                     val = parse_price(p_match[1])
                     curr = p_match[2].upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
-                    # TEU Logik (Verdopplung für 40'HC) [cite: 125, 251]
                     if f_teu or (not p_teu and 'teu' in block.lower()): val *= 2
                     return f"{name} = {val:.2f} {curr}"
             return None
 
-        # Zuschläge scannen 
-        for s in [("ERC", ["Logistic Fee"]), 
-                  ("ETS", ["ETS", "Emissions Trading"], True), 
-                  ("FEU", ["Fuel EU", "FEU"], True), 
-                  ("PSS", ["Peak Season"], False, True),
-                  ("ECA", ["ECA", "Emission Control Area"], True), 
-                  ("BRC", ["BRC", "BAC", "Bunker Recovery"], True)]:
+        # Zuschläge scannen
+        for s in [("ERC", ["Logistic Fee"]), ("ETS", ["ETS", "Emissions Trading"], True), 
+                  ("FEU", ["Fuel EU", "FEU"], True), ("PSS", ["PSS", "Peak Season"], False, True),
+                  ("ECA", ["ECA", "Emission Control Area"], True), ("BRC", ["BRC", "BAC", "Bunker Recovery"], True)]:
             res = get_sur(s[0], s[1], *s[2:])
             if res: prepaid_list.append(res)
         
         prep_str = ", ".join(prepaid_list)
         res_list = []
 
-        # Routen-Erkennung (Unterscheidung Matrix vs Single Quote) [cite: 31, 123, 213, 247]
         if "via pol" in text.lower():
-            # Matrix-Logik (z.B. Nordafrika) [cite: 247]
             for block in re.split(r'Port\s+of\s+Discharge', text, flags=re.I)[1:]:
                 pod_m = re.search(r'^\s*([A-Za-z\s\-]+)', block)
                 pod = pod_m.group(1).split()[0].title() if pod_m else "Unbekannt"
                 for r in re.finditer(r'via\s+POL\s+([A-Za-z/]+)\s+[\d.,]+\s*[A-Z]{3}\s+([\d.,]+)\s*([A-Z]{3})', block, re.I):
                     res_list.append({'Carrier': 'MSC', 'Contract Number': contract_no, 'Port of Loading': r.group(1), 'Port of Destination': pod, 'Valid from': v_from, 'Valid to': v_to, '40HC': parse_price(r.group(2)), 'Currency': r.group(3).upper(), 'Included Prepaid Surcharges 40HC': prep_str})
         else:
-            # Single-Rate Logik (Hamad, Dammam, Jeddah) [cite: 31, 123, 213]
             pod_m = re.search(r'Port\s+of\s+Discharge[\s\n]*([A-Za-z\s\-]+)', text, re.I)
             pod = re.sub(r'(?i)Volume|DV|HC|Freetime|at|POD|Origin|Remarks', '', pod_m.group(1)).strip().split()[0].title() if pod_m else "Unbekannt"
-            # Suche Preis im 40'HC Bereich [cite: 31, 123, 213]
             rate_m = re.search(r'(\d{3,4}(?:[.,]\d{1,2})?)\s*(USD|EUR)', text[text.find("40'"):text.find("40'")+120])
             if rate_m:
                 res_list.append({'Carrier': 'MSC', 'Contract Number': contract_no, 'Port of Loading': 'Hamburg', 'Port of Destination': pod, 'Valid from': v_from, 'Valid to': v_to, '40HC': parse_price(rate_m.group(1)), 'Currency': rate_m.group(2).upper(), 'Included Prepaid Surcharges 40HC': prep_str})
 
         df = pd.DataFrame(res_list)
-        for c in ['Valid from', 'Valid to']: df[c + ' dt'] = pd.to_datetime(df[c], dayfirst=True, errors='coerce').astype(str)
+        for c in ['Valid from', 'Valid to']:
+            df[c + ' dt'] = pd.to_datetime(df[c], dayfirst=True, errors='coerce').astype(str)
         return df, "PDF"
     except Exception as e: return pd.DataFrame(), f"Error: {e}"
 
-# --- UI TABS ---
+# --- UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
 with tab_suche:
     data = list(collection.find({}))
     if not data:
-        st.info("💡 Datenbank leer. Bitte zuerst Raten im Admin-Tab hochladen.")
+        st.info("Datenbank leer.")
     else:
         df = pd.DataFrame(data)
+        c1, c2, c3 = st.columns(3)
+        pol = c1.text_input("POL:")
+        pod = c2.text_input("POD:")
+        datum = pd.to_datetime(c3.date_input("Gültig am:"))
+        
+        # Sicherstellen, dass Datumsvergleiche funktionieren
         df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
         df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
-        
-        c1, c2, c3 = st.columns(3)
-        pol = c1.text_input("📍 Ladehafen (POL):")
-        pod = c2.text_input("🏁 Zielhafen (POD):")
-        datum = pd.to_datetime(c3.date_input("📅 Gültig am:"))
         
         mask = (df['Valid from dt'] <= datum) & (df['Valid to dt'] >= datum)
         if pol: mask &= df['Port of Loading'].str.contains(pol, case=False, na=False)
@@ -213,29 +205,17 @@ with tab_suche:
             for _, r in treffer.sort_values('Sort').iterrows():
                 with st.expander(f"🚢 {r['Carrier']} | {r['Port of Loading']} ➡️ {r['Port of Destination']} | All-In: {r['Sort']:.2f} EUR"):
                     anzeige_container_daten(r, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC')
-        else:
-            st.warning("Keine passenden Raten für dieses Datum/Hafen gefunden.")
 
 with tab_upload:
-    st.write("### 📥 PDFs hochladen")
-    uploaded = st.file_uploader("PDF-Dateien auswählen", type="pdf", accept_multiple_files=True)
-    if uploaded and st.button("🚀 In Datenbank speichern"):
+    uploaded = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+    if uploaded and st.button("Speichern"):
         for f in uploaded:
             df_new, _ = lade_und_uebersetze_cached(f.name, f.getvalue())
             if not df_new.empty:
                 for rec in df_new.to_dict('records'):
                     rec['createdAt'] = datetime.now(timezone.utc)
-                    # Upsert Logik: Vermeidet doppelte Einträge bei gleichem Contract/Route
-                    collection.update_one(
-                        {"Contract Number": rec["Contract Number"], "Port of Loading": rec["Port of Loading"], "Port of Destination": rec["Port of Destination"]}, 
-                        {"$set": rec}, 
-                        upsert=True
-                    )
-        st.success("✅ Raten erfolgreich verarbeitet und gespeichert!")
-        st.balloons()
-    
-    st.markdown("---")
-    if st.button("🗑️ Datenbank komplett leeren"):
+                    collection.update_one({"Contract Number": rec["Contract Number"], "Port of Loading": rec["Port of Loading"], "Port of Destination": rec["Port of Destination"]}, {"$set": rec}, upsert=True)
+        st.success("Erfolgreich hochgeladen!")
+    if st.button("🗑️ Datenbank leeren"):
         collection.delete_many({})
-        st.success("Datenbank geleert.")
         st.rerun()
