@@ -172,25 +172,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
             v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
             
-            # --- Ultra-strikte POL/POD Erkennung ---
-            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
-            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-            
-            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
-            if not pod_match:
-                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
-            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
-            
-            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
-            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
-            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
-            
-            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
-            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
-            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
-            
-            if len(pol_str) > 25: pol_str = "Unbekannt"
-            if len(pod_str) > 25: pod_str = "Unbekannt"
+            pol_match = re.search(r'(?:POL|Port of Loading|From)[\s:]{1,3}([A-Za-z\s\.,]+)(?:POD|Port of Discharge|To|Vessel|Voyage|\n)', text, re.IGNORECASE)
+            pod_match = re.search(r'(?:POD|Port of Discharge|Destination|To)[\s:]{1,3}([A-Za-z\s\.,]+)(?:Vessel|Voyage|Commodity|Term|\n)', text, re.IGNORECASE)
 
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
@@ -201,8 +184,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             df_pdf = pd.DataFrame([{
                 'Carrier': 'MSC (aus PDF)',
                 'Contract Number': contract_no,
-                'Port of Loading': pol_str,
-                'Port of Destination': pod_str,
+                'Port of Loading': pol_match.group(1).strip() if pol_match else "Unbekannt",
+                'Port of Destination': pod_match.group(1).strip() if pod_match else "Unbekannt",
                 'Valid from': v_from,
                 'Valid to': v_to,
                 '40HC': float(rate_match.group(1)) if rate_match else 0,
@@ -211,11 +194,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 'Included Collect Surcharges 40HC': "",
                 'Remark': 'Automatisch aus PDF importiert'
             }])
-            
-            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
-            if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
-            if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
-            
             return df_pdf, "PDF"
         except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
@@ -237,17 +215,22 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
                     header_idx = i; break
 
+        # --- 🚨 FIX FÜR DIE PRÄZISE CONTRACT NUMBER (Ignoriert Quote Number) ---
         global_contract = "Unbekannt"
         
+        # 1. Zuerst gezielt nach dem Wort "Contract" in den Excel-Kopfzeilen suchen
         for i in range(min(20, len(df_raw))):
             row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
             for j, val in enumerate(row_vals):
                 v_low = val.lower()
+                # Wir suchen explizit nach "Contract", um nicht die darüber stehende Quote zu nehmen
                 if 'contract' in v_low:
+                    # Suche nach einer Nummer direkt in dieser Zelle (z.B. "Contract Number 299424203")
                     nums = re.findall(r'\b\d{6,10}\b', val)
                     if nums:
                         global_contract = nums[0]
                         break
+                    # Falls nicht in derselben Zelle, schaue in die nächsten 3 Zellen rechts daneben
                     for k in range(1, 4):
                         if j + k < len(row_vals):
                             next_val = row_vals[j+k].upper()
@@ -260,6 +243,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             if global_contract != "Unbekannt":
                 break
 
+        # 2. Nur wenn oben nichts gefunden wurde, Fallback auf den Dateinamen
         if global_contract == "Unbekannt":
             if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
                 global_contract = fn_match.group(1)
@@ -285,6 +269,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
                 if len(val_raw) < 2: continue
                 
+                # Wir priorisieren die gefundene globale Contract Number
                 row_contract = global_contract
                 
                 standard_rows.append({
@@ -331,12 +316,9 @@ with tab_suche:
             such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
 
         mask = pd.Series([True] * len(df))
-        
-        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
-        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
-        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
-        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
-        
+        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol, case=False, na=False)
+        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod, case=False, na=False)
+        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract, case=False, na=False)
         if filter_datum_aktiv and 'Valid from dt' in df.columns:
             dt_search = pd.to_datetime(such_datum)
             mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
@@ -396,3 +378,4 @@ with tab_upload:
     if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
         ergebnis_all = collection.delete_many({})
         st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+
