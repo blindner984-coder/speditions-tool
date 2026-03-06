@@ -76,7 +76,7 @@ collection = init_db()
 @st.cache_data(ttl=3600)
 def hole_live_wechselkurs():
     try:
-        response = requests.get("https://api.frankfurter.app/latest?from=USD&to=EUR", timeout=5)
+        response = requests.get("https://api.frankfurter.app/latest?from=USD&to=EUR", timeout=2)
         response.raise_for_status()
         eur_rate = response.json().get("rates", {}).get("EUR")
         if isinstance(eur_rate, (int, float)):
@@ -1043,10 +1043,29 @@ with tab_suche:
             disabled=historische_raten,
         )
 
-    with st.spinner("Lade Raten aus Datenbank..."):
-        df, ist_gekuerzt = lade_raten_aus_db(such_pol, such_pod, such_contract, fetch_limit=MAX_DB_FETCH)
+    action_col, info_col = st.columns([1, 2])
+    with action_col:
+        suche_starten = st.button("🔎 Suche starten", type="primary", use_container_width=True)
+    with info_col:
+        st.caption("Schneller Start aktiv: Daten werden erst nach Klick auf 'Suche starten' geladen.")
 
-    if df.empty:
+    if suche_starten:
+        st.session_state["suche_gestartet"] = True
+        st.session_state["search_page"] = 1
+
+    suchlauf_aktiv = st.session_state.get("suche_gestartet", False)
+    if not suchlauf_aktiv:
+        st.info("Für schnelleren Seitenstart wurde die Auto-Suche deaktiviert. Bitte auf 'Suche starten' klicken.")
+
+    df = None
+    ist_gekuerzt = False
+    if suchlauf_aktiv:
+        with st.spinner("Lade Raten aus Datenbank..."):
+            df, ist_gekuerzt = lade_raten_aus_db(such_pol, such_pod, such_contract, fetch_limit=MAX_DB_FETCH)
+
+    if df is None:
+        pass
+    elif df.empty:
         if any([such_pol, such_pod, such_contract]):
             st.warning("Keine Raten für diese Suchkriterien gefunden.")
         else:
