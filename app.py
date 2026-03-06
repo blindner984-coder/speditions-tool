@@ -881,6 +881,22 @@ def lade_raten_aus_db(such_pol="", such_pod="", such_contract="", fetch_limit=MA
     return pd.DataFrame(rows), ist_gekuerzt
 
 
+def formatiere_datum_fuer_header(value):
+    if value is None:
+        return "?"
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.to_datetime(value).strftime("%d.%m.%Y")
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return "?"
+
+    parsed = pd.to_datetime(text, dayfirst=True, errors='coerce')
+    if pd.notna(parsed):
+        return parsed.strftime("%d.%m.%Y")
+    return text
+
+
 # --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
@@ -966,7 +982,13 @@ with tab_suche:
 
                 for _, row in seiten_df.iterrows():
                     is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
-                    label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
+                    valid_from_label = formatiere_datum_fuer_header(row.get('Valid from'))
+                    valid_to_label = formatiere_datum_fuer_header(row.get('Valid to'))
+                    gueltigkeit_label = f"{valid_from_label} bis {valid_to_label}" if (valid_from_label != "?" or valid_to_label != "?") else "Unbekannt"
+                    label = (
+                        f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | "
+                        f"{row.get('Port of Loading')} ➡️ {row.get('Port of Destination')} | 📅 {gueltigkeit_label}"
+                    )
 
                     with st.expander(label):
                         anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
