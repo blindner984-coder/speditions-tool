@@ -460,16 +460,26 @@ with tab_suche:
         with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
         with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
         with c4:
-            filter_datum_aktiv = st.checkbox("📅 Datumsfilter aktiv", value=True)
-            such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
+            historische_raten = st.checkbox(
+                "🕘 Historische/abgelaufene Raten anzeigen",
+                value=False,
+                help="Wenn aktiviert, werden auch alte und nicht mehr gültige Raten angezeigt.",
+            )
+            such_datum = st.date_input(
+                "Rate gültig am:",
+                value=datetime.now(timezone.utc).date(),
+                disabled=historische_raten,
+            )
 
         mask = pd.Series([True] * len(df))
         if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol, case=False, na=False)
         if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod, case=False, na=False)
         if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract, case=False, na=False)
-        if filter_datum_aktiv and 'Valid from dt' in df.columns:
+        if not historische_raten and 'Valid from dt' in df.columns and 'Valid to dt' in df.columns:
             dt_search = pd.to_datetime(such_datum)
             mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
+        elif historische_raten:
+            st.warning("Historische Ansicht aktiv: Es werden auch abgelaufene Raten angezeigt.")
         
         treffer = df[mask].copy()
         if '40HC' in treffer.columns:
@@ -479,8 +489,11 @@ with tab_suche:
             if not treffer.empty:
                 treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
                 treffer = treffer.sort_values(by='Total_EUR_Sort')
-                
-                st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
+
+                if historische_raten:
+                    st.success(f"✅ {len(treffer)} Raten gefunden (inkl. historischer). Zeige die Top {min(50, len(treffer))} günstigsten an:")
+                else:
+                    st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
                 
                 for _, row in treffer.head(50).iterrows():
                     is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
