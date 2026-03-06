@@ -156,8 +156,34 @@ def normalisiere_datum_token(date_text):
     parts = re.split(r"[./-]", token)
     if len(parts) == 3 and len(parts[1]) == 3 and parts[1].startswith("0"):
         parts[1] = parts[1][:2]
+    if len(parts) == 3:
         return f"{parts[0]}.{parts[1]}.{parts[2]}"
     return token
+
+
+def normalisiere_pol_text(pol_text):
+    abkuerzungen = {
+        "HAM": "Hamburg",
+        "BRV": "Bremerhaven",
+        "ANR": "Antwerp",
+        "RTM": "Rotterdam",
+    }
+    text = str(pol_text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^via\s+POL\s+", "", text, flags=re.IGNORECASE)
+    text = re.split(r"\bValidity\b", text, flags=re.IGNORECASE)[0]
+
+    teile = [t.strip().strip(" .,-") for t in re.split(r"[/,]|\band\b", text, flags=re.IGNORECASE)]
+    out = []
+    gesehen = set()
+    for t in teile:
+        if not t:
+            continue
+        norm = abkuerzungen.get(t.upper(), t)
+        if norm not in gesehen:
+            out.append(norm)
+            gesehen.add(norm)
+    return "/".join(out) if out else "Unbekannt"
 
 
 def extrahiere_msc_quote_pdf_daten(text):
@@ -173,10 +199,9 @@ def extrahiere_msc_quote_pdf_daten(text):
     contract_match = re.search(r"\bR\d{8,}\b", joined, re.IGNORECASE)
     contract_no = contract_match.group(0).upper() if contract_match else "Unbekannt"
 
-    pol_match = re.search(r"Ports?\s+of\s+Loading\s+([A-Za-z][A-Za-z\s\-/]+)", joined, re.IGNORECASE)
-    pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
-    pol_str = re.split(r"\bValidity\b", pol_str, flags=re.IGNORECASE)[0].strip(" .,-")
-    pol_str = re.sub(r"\s+", " ", pol_str).strip()
+    pol_match = re.search(r"Ports?\s+of\s+Loading\s+([A-Za-z][A-Za-z\s\-/,]+)", joined, re.IGNORECASE)
+    pol_raw = pol_match.group(1).strip() if pol_match else "Unbekannt"
+    pol_str = normalisiere_pol_text(pol_raw)
 
     normalized_text = re.sub(r"\s+", " ", joined)
     valid_match = re.search(
@@ -191,6 +216,161 @@ def extrahiere_msc_quote_pdf_daten(text):
         date_matches = [normalisiere_datum_token(d) for d in re.findall(r"(\d{1,2}[./-]\d{1,3}[./-]\d{2,4})", normalized_text)]
         v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
         v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
+
+    prepaid_liste = []
+    collect_liste = []
+
+    def fuege_gebuehr_hinzu(ziel, code, amount, waehrung):
+        if amount is None:
+            return
+        ziel.append((str(code).strip().upper() or "SUR", float(amount), str(waehrung).upper()))
+
+    sea_start = next((i for i, line in enumerate(lines) if "surcharges related to sea freight" in line.lower()), None)
+    if sea_start is not None:
+        sea_end = len(lines)
+        for i in range(sea_start + 1, len(lines)):
+            if re.match(r"^\d+\.\s", lines[i]):
+                sea_end = i
+                break
+
+        beste_codes = {}
+        seq = 0
+        for line in lines[sea_start + 1:sea_end]:
+            low = line.lower()
+            if "not subject to" in low:
+                continue
+            if low.startswith("code ") or "surcharge name amount" in low:
+                continue
+            if low.startswith("haz ") or "hazardous cargo" in low:
+                continue
+
+            treffer = list(re.finditer(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE))
+            if not treffer:
+                continue
+
+            code_match = re.match(r"^([A-Z]{2,5})\b", line)
+            code = code_match.group(1).upper() if code_match else "SUR"
+
+            if re.search(r"per\s*40|40['´]", line, re.IGNORECASE):
+                priority = 4
+                multiplier = 1
+            elif re.search(r"\bTEU\b", line, re.IGNORECASE):
+                priority = 3
+                multiplier = 2
+            elif re.search(r"\bContainer\b", line, re.IGNORECASE):
+                priority = 2
+                multiplier = 1
+            elif re.search(r"per\s*20|20['´]", line, re.IGNORECASE):
+                priority = 1
+                multiplier = 1
+            else:
+                priority = 0
+                multiplier = 1
+
+            amount = parse_decimal_wert(treffer[0].group(1))
+            waehrung = treffer[0].group(2).upper()
+            if amount is None:
+                continue
+            seq += 1
+            kandidat = {
+                "priority": priority,
+                "seq": seq,
+                "amount": amount * multiplier,
+                "waehrung": waehrung,
+            }
+            alt = beste_codes.get(code)
+            if alt is None or kandidat["priority"] > alt["priority"] or (kandidat["priority"] == alt["priority"] and kandidat["seq"] > alt["seq"]):
+                beste_codes[code] = kandidat
+
+        for code, val in sorted(beste_codes.items(), key=lambda kv: kv[1]["seq"]):
+            fuege_gebuehr_hinzu(prepaid_liste, code, val["amount"], val["waehrung"])
+
+    dest_start = next((i for i, line in enumerate(lines) if "destination charges" in line.lower()), None)
+    if dest_start is not None:
+        dest_end = len(lines)
+        for i in range(dest_start + 1, len(lines)):
+            low = lines[i].lower()
+            if "named account" in low or "contract filing reference" in low or "rate applicability" in low:
+                dest_end = i
+                break
+
+        last_code = "COLLECT"
+        collect_code_counter = {}
+        for line in lines[dest_start + 1:dest_end]:
+            low = line.lower()
+            if "collect" not in low:
+                continue
+
+            treffer = list(re.finditer(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE))
+            if not treffer:
+                continue
+
+            code_match = re.match(r"^([A-Z]{2,5})\b", line)
+            if code_match:
+                last_code = code_match.group(1).upper()
+
+            bevorzugt = []
+            for m in treffer:
+                tail = line[m.end(): m.end() + 30].lower()
+                if "per 40" in tail or "40´" in tail or "40'" in tail:
+                    bevorzugt.append(m)
+            kandidaten = bevorzugt if bevorzugt else treffer
+
+            for m in kandidaten:
+                amount = parse_decimal_wert(m.group(1))
+                waehrung = m.group(2).upper()
+                if amount is None:
+                    continue
+                collect_code_counter[last_code] = collect_code_counter.get(last_code, 0) + 1
+                suffix = "" if collect_code_counter[last_code] == 1 else f"_{collect_code_counter[last_code]}"
+                fuege_gebuehr_hinzu(collect_liste, f"{last_code}{suffix}", amount, waehrung)
+
+    prepaid_str = ", ".join([f"{c} = {a:.2f} {w}" for c, a, w in prepaid_liste])
+    collect_str = ", ".join([f"{c} = {a:.2f} {w}" for c, a, w in collect_liste])
+
+    route_rows = []
+    current_pod = None
+    for line in lines:
+        header_match = re.search(r"^Port of Discharge\s+(.+?)\s+20['´]DV\s+40['´]DV/HC", line, re.IGNORECASE)
+        if header_match:
+            current_pod = header_match.group(1).strip(" .,-")
+            continue
+
+        if current_pod and re.search(r"^via\s+POL\s+", line, re.IGNORECASE):
+            if "on rqst" in line.lower():
+                continue
+
+            treffer = list(re.finditer(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE))
+            if len(treffer) < 2:
+                continue
+
+            forty_match = treffer[1]
+            rate_value = parse_decimal_wert(forty_match.group(1))
+            rate_currency = forty_match.group(2).upper()
+            if rate_value is None:
+                continue
+
+            via_match = re.search(r"via\s+POL\s+(.+?)(?=\s+\d[\d\.,]*\s*(?:USD|EUR)|\s+on\s+rqst|$)", line, re.IGNORECASE)
+            via_pol_raw = via_match.group(1).strip() if via_match else pol_str
+            via_pol = normalisiere_pol_text(via_pol_raw)
+            via_hinweis = f"via POL {via_pol_raw}" if via_match else ""
+
+            route_rows.append({
+                'Carrier': 'MSC (aus PDF)',
+                'Contract Number': contract_no,
+                'Port of Loading': via_pol,
+                'Port of Destination': current_pod,
+                'Valid from': v_from,
+                'Valid to': v_to,
+                '40HC': rate_value,
+                'Currency': rate_currency,
+                'Included Prepaid Surcharges 40HC': prepaid_str,
+                'Included Collect Surcharges 40HC': collect_str,
+                'Remark': f"Automatisch aus MSC Quote PDF importiert ({via_hinweis})".strip(),
+            })
+
+    if route_rows:
+        return route_rows
 
     route_line = ""
     for idx, line in enumerate(lines):
@@ -216,82 +396,6 @@ def extrahiere_msc_quote_pdf_daten(text):
     pod_raw = re.sub(r"^[A-Z]{2,3}\s+(?=[A-Za-z])", "", pod_raw).strip()
     pod_str = re.sub(r"\s+", " ", pod_raw).strip(" .,-") or "Unbekannt"
 
-    prepaid_liste = []
-    collect_liste = []
-    gesehen = set()
-    code_zaehler = {}
-
-    def fuege_gebuehr_hinzu(ziel, name, amount, waehrung):
-        if amount is None:
-            return
-
-        basis_name = str(name).strip().upper() or "SUR"
-        code_zaehler[basis_name] = code_zaehler.get(basis_name, 0) + 1
-        final_name = basis_name if code_zaehler[basis_name] == 1 else f"{basis_name}_{code_zaehler[basis_name]}"
-        eintrag = f"{final_name} = {amount:.2f} {waehrung}"
-        if eintrag not in gesehen:
-            ziel.append(eintrag)
-            gesehen.add(eintrag)
-
-    sea_start = next((i for i, line in enumerate(lines) if "surcharges related to sea freight" in line.lower()), None)
-    if sea_start is not None:
-        sea_end = len(lines)
-        for i in range(sea_start + 1, len(lines)):
-            if re.match(r"^\d+\.\s", lines[i]):
-                sea_end = i
-                break
-
-        for line in lines[sea_start + 1:sea_end]:
-            low = line.lower()
-            if "not subject to" in low:
-                continue
-            if low.startswith("code ") or "surcharge name amount" in low:
-                continue
-            if low.startswith("haz ") or "hazardous cargo" in low:
-                continue
-
-            treffer = list(re.finditer(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE))
-            if not treffer:
-                continue
-
-            code_match = re.match(r"^([A-Z]{2,5})\b", line)
-            code = code_match.group(1).upper() if code_match else "SUR"
-            multiplier = 2 if re.search(r"\bTEU\b", line, re.IGNORECASE) else 1
-
-            for m in treffer:
-                amount = parse_decimal_wert(m.group(1))
-                waehrung = m.group(2).upper()
-                if amount is not None:
-                    fuege_gebuehr_hinzu(prepaid_liste, code, amount * multiplier, waehrung)
-
-    dest_start = next((i for i, line in enumerate(lines) if "destination charges" in line.lower()), None)
-    if dest_start is not None:
-        dest_end = len(lines)
-        for i in range(dest_start + 1, len(lines)):
-            low = lines[i].lower()
-            if "named account" in low or "contract filing reference" in low or "rate applicability" in low:
-                dest_end = i
-                break
-
-        last_code = "COLLECT"
-        for line in lines[dest_start + 1:dest_end]:
-            low = line.lower()
-            if "collect" not in low:
-                continue
-
-            treffer = list(re.finditer(r"(\d[\d\.,]*)\s*(USD|EUR)\b", line, re.IGNORECASE))
-            if not treffer:
-                continue
-
-            code_match = re.match(r"^([A-Z]{2,5})\b", line)
-            if code_match:
-                last_code = code_match.group(1).upper()
-
-            for m in treffer:
-                amount = parse_decimal_wert(m.group(1))
-                waehrung = m.group(2).upper()
-                fuege_gebuehr_hinzu(collect_liste, last_code, amount, waehrung)
-
     return {
         'Carrier': 'MSC (aus PDF)',
         'Contract Number': contract_no,
@@ -301,8 +405,8 @@ def extrahiere_msc_quote_pdf_daten(text):
         'Valid to': v_to,
         '40HC': rate_value,
         'Currency': rate_currency,
-        'Included Prepaid Surcharges 40HC': ", ".join(prepaid_liste),
-        'Included Collect Surcharges 40HC': ", ".join(collect_liste),
+        'Included Prepaid Surcharges 40HC': prepaid_str,
+        'Included Collect Surcharges 40HC': collect_str,
         'Remark': 'Automatisch aus MSC Quote PDF importiert',
     }
 
@@ -470,9 +574,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             if not text.strip():
                 return pd.DataFrame(), "Fehler: PDF enthält keinen auslesbaren Text."
 
-            msc_quote_row = extrahiere_msc_quote_pdf_daten(text)
-            if msc_quote_row:
-                df_pdf = pd.DataFrame([msc_quote_row])
+            msc_quote_data = extrahiere_msc_quote_pdf_daten(text)
+            if msc_quote_data:
+                msc_rows = msc_quote_data if isinstance(msc_quote_data, list) else [msc_quote_data]
+                df_pdf = pd.DataFrame(msc_rows)
                 if 'Valid from' in df_pdf.columns:
                     df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
                 if 'Valid to' in df_pdf.columns:
