@@ -754,54 +754,88 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         return df_return, "Excel/CSV"
 
 
+RATEN_PROJECTION = {
+    '_id': 0,
+    'Carrier': 1,
+    'Contract Number': 1,
+    'Port of Loading': 1,
+    'Port of Destination': 1,
+    'Valid from': 1,
+    'Valid to': 1,
+    'Valid from dt': 1,
+    'Valid to dt': 1,
+    '40HC': 1,
+    'Currency': 1,
+    'Included Prepaid Surcharges 40HC': 1,
+    'Included Collect Surcharges 40HC': 1,
+    'Remark': 1,
+}
+
+
+@st.cache_data(ttl=120)
+def lade_raten_aus_db(such_pol="", such_pod="", such_contract=""):
+    query = {}
+    if str(such_pol).strip():
+        query['Port of Loading'] = {'$regex': re.escape(str(such_pol).strip()), '$options': 'i'}
+    if str(such_pod).strip():
+        query['Port of Destination'] = {'$regex': re.escape(str(such_pod).strip()), '$options': 'i'}
+    if str(such_contract).strip():
+        query['Contract Number'] = {'$regex': re.escape(str(such_contract).strip()), '$options': 'i'}
+
+    rows = list(collection.find(query, RATEN_PROJECTION))
+    return pd.DataFrame(rows)
+
+
 # --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
 # === TAB 1: SUCHEN ===
 with tab_suche:
-    cursor = collection.find({})
-    daten_liste = list(cursor)
+    st.write("### Suche in der Datenbank")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
+    with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
+    with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
+    with c4:
+        historische_raten = st.checkbox(
+            "🕘 Historische/abgelaufene Raten anzeigen",
+            value=False,
+            help="Wenn aktiviert, werden auch alte und nicht mehr gültige Raten angezeigt.",
+        )
+        such_datum = st.date_input(
+            "Rate gültig am:",
+            value=datetime.now(timezone.utc).date(),
+            disabled=historische_raten,
+        )
 
-    if not daten_liste:
-        st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
+    with st.spinner("Lade Raten aus Datenbank..."):
+        df = lade_raten_aus_db(such_pol, such_pod, such_contract)
+
+    if df.empty:
+        if any([such_pol, such_pod, such_contract]):
+            st.warning("Keine Raten für diese Suchkriterien gefunden.")
+        else:
+            st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
     else:
-        df = pd.DataFrame(daten_liste)
-        
-        if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
-        if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
-        
-        st.write(f"### Suche in der Datenbank ({len(df)} Raten aktiv)")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
-        with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
-        with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
-        with c4:
-            historische_raten = st.checkbox(
-                "🕘 Historische/abgelaufene Raten anzeigen",
-                value=False,
-                help="Wenn aktiviert, werden auch alte und nicht mehr gültige Raten angezeigt.",
-            )
-            such_datum = st.date_input(
-                "Rate gültig am:",
-                value=datetime.now(timezone.utc).date(),
-                disabled=historische_raten,
-            )
+        if 'Valid from dt' in df.columns:
+            df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
+        if 'Valid to dt' in df.columns:
+            df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
+
+        st.caption(f"{len(df)} Raten im geladenen Suchbereich")
 
         mask = pd.Series([True] * len(df))
-        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol, case=False, na=False)
-        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod, case=False, na=False)
-        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract, case=False, na=False)
         if not historische_raten and 'Valid from dt' in df.columns and 'Valid to dt' in df.columns:
             dt_search = pd.to_datetime(such_datum)
             mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
         elif historische_raten:
             st.warning("Historische Ansicht aktiv: Es werden auch abgelaufene Raten angezeigt.")
-        
+
         treffer = df[mask].copy()
         if '40HC' in treffer.columns:
             treffer['40HC_Check'] = treffer['40HC'].apply(parse_decimal_wert)
             treffer = treffer[treffer['40HC_Check'].notna()].reset_index(drop=True)
-            
+
             if not treffer.empty:
                 treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
                 treffer = treffer.sort_values(by='Total_EUR_Sort')
@@ -810,15 +844,17 @@ with tab_suche:
                     st.success(f"✅ {len(treffer)} Raten gefunden (inkl. historischer). Zeige die Top {min(50, len(treffer))} günstigsten an:")
                 else:
                     st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
-                
+
                 for _, row in treffer.head(50).iterrows():
                     is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
                     label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
-                    
+
                     with st.expander(label):
                         anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
-                        if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
-            else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
+                        if pd.notna(row.get('Remark')) and row.get('Remark') != "":
+                            st.info(f"**💡 Bemerkung:** {row['Remark']}")
+            else:
+                st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
 
 # === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
@@ -866,6 +902,7 @@ with tab_upload:
                         
                         if records:
                             collection.insert_many(records)
+                            lade_raten_aus_db.clear()
                             st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                             st.balloons()
         
@@ -880,6 +917,7 @@ with tab_upload:
         
         if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)", disabled=not delete_allowed):
             ergebnis_all = collection.delete_many({})
+            lade_raten_aus_db.clear()
             st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
     else:
         st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
