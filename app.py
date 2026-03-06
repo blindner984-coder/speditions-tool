@@ -16,18 +16,21 @@ st.set_page_config(page_title="Raten-Finder Pro (40'HC)", layout="wide")
 
 st.markdown("""
     <style>
+    /* Info-Boxen Styling */
     .all-in-box { background-color: #e6f4ea; border: 2px solid #28a745; padding: 15px; border-radius: 10px; text-align: center; }
     .basis-box { background-color: #e8f0fe; border: 1px solid #1a73e8; padding: 15px; border-radius: 10px; text-align: center; }
+    .collect-box { background-color: #fff3cd; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
     .fremd-waehrung { color: #d9534f; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- LOGO ---
+# --- LOGO IN DER SIDEBAR ---
 try:
     st.sidebar.image("logo_farbig.png", use_container_width=True) 
-except:
+except FileNotFoundError:
     pass 
 
+# --- HAUPT-ÜBERSCHRIFT ---
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
 # --- MONGODB ANBINDUNG ---
@@ -49,173 +52,347 @@ def hole_live_wechselkurs():
     try:
         response = requests.get("https://api.frankfurter.app/latest?from=USD&to=EUR", timeout=5)
         return round(response.json()['rates']['EUR'], 3)
-    except:
+    except Exception:
         return 0.92
 
 aktueller_kurs = hole_live_wechselkurs()
+
 st.sidebar.header("💱 Einstellungen")
+st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
 
-# --- HILFSFUNKTIONEN ---
+# --- DOKUMENTEN-FILTER ---
 def ist_doc_gebuehr(name):
     n = str(name).lower()
-    return any(x in n for x in ['b/l', 'bl', 'doc', 'documentation'])
+    if 'b/l' in n: return True
+    if re.search(r'\b(bl|doc|docs|documentation|bill of lading)\b', n): return True
+    return False
 
-def parse_price(val_str):
-    """Wandelt Strings mit Kommas oder Punkten sicher in Floats um."""
-    if not val_str: return 0.0
-    s = str(val_str).replace(' ', '').replace('EUR', '').replace('USD', '').replace('LISD', '')
-    # Entferne Tausenderpunkte, ersetze Dezimalkomma durch Punkt
-    if ',' in s and '.' in s:
-        if s.find('.') < s.find(','): s = s.replace('.', '')
-    s = s.replace(',', '.')
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
+# --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
+def berechne_gebuehren(zuschlaege_str):
+    if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']: return []
+    treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
+    liste = []
+    for t in treffer:
+        try: liste.append({"name": t[0].strip().lstrip(','), "betrag": float(t[1].replace('.', '').replace(',', '.')), "waehrung": t[2].upper()})
+        except (ValueError, IndexError): pass
+    return liste
 
-def berechne_total_eur_dynamic(row, price_col, prep_col):
-    """Berechnet den Gesamtpreis und fängt Fehler bei der Konvertierung ab."""
-    basis = parse_price(row.get(price_col))
-    if basis <= 0: return 99999999 
+def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
+    basis = pd.to_numeric(row.get(price_col), errors='coerce')
+    if pd.isna(basis) or basis <= 0: return 99999999 
     
     basis_eur = basis * usd_to_eur if str(row.get('Currency', 'USD')).upper() == 'USD' else basis
+    summe_gebuehren_eur = 0
     
-    sum_geb = 0
-    raw_geb = str(row.get(prep_col, ''))
-    # Suche Muster: NAME = BETRAG WÄHRUNG
-    matches = re.findall(r'([A-Z0-9\s]+?)\s*=\s*([\d,\.]+)\s*([A-Z]{3})', raw_geb)
-    
-    for m in matches:
-        if not ist_doc_gebuehr(m[0]):
-            val = parse_price(m[1])
-            sum_geb += (val * usd_to_eur) if m[2] == 'USD' else val
+    for g in berechne_gebuehren(str(row.get(prep_surcharge_col, ''))):
+        if ist_doc_gebuehr(g['name']): continue 
+        summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
+
+    for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
+        if ist_doc_gebuehr(g['name']): continue 
+        if st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
+            summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
             
-    return basis_eur + sum_geb
+    return basis_eur + summe_gebuehren_eur
 
-def anzeige_container_daten(row, size_label, price_col, prep_col):
-    basis = parse_price(row.get(price_col))
-    curr = str(row.get('Currency', 'USD')).upper()
-    basis_eur = basis * usd_to_eur if curr == 'USD' else basis
+def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
+    basis = pd.to_numeric(row.get(price_col), errors='coerce')
+    curr_basis = str(row.get('Currency', 'USD')).upper()
+    basis_eur = basis * usd_to_eur if curr_basis == 'USD' else basis
     
-    col1, col2, col3 = st.columns([1, 1.5, 1])
-    with col1:
-        st.markdown(f'<div class="basis-box"><b>Basis {size_label}</b><br>{basis:,.2f} {curr}<br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
+    prep_gebuehren = berechne_gebuehren(str(row.get(prep_surcharge_col, '')))
+    coll_gebuehren = berechne_gebuehren(str(row.get(coll_surcharge_col, '')))
+    summe_gebuehren_eur, fremd_gebuehren, doc_gebuehren = 0, [], [] 
     
-    prep_raw = str(row.get(prep_col, ''))
-    geb_list = re.findall(r'([A-Z0-9\s]+?)\s*=\s*([\d,\.]+)\s*([A-Z]{3})', prep_raw)
-    total_prep_eur = 0
-    with col2:
+    col_basis, col_prep, col_coll, col_doc, col_total = st.columns([1, 1.1, 1.1, 1.1, 1.2])
+    
+    with col_basis: 
+        st.markdown(f'<div class="basis-box"><b>Basisfracht {size_label}</b><br><span style="font-size:20px;">{basis:,.2f} {curr_basis}</span><br><small>≈ {basis_eur:.2f} EUR</small></div>', unsafe_allow_html=True)
+        
+    with col_prep:
         st.write("**Zusammensetzung (Prepaid):**")
-        if not geb_list:
-            st.write("<small>Keine extra Gebühren</small>", unsafe_allow_html=True)
-        for g in geb_list:
-            if ist_doc_gebuehr(g[0]): continue
-            val = parse_price(g[1])
-            umg = (val * usd_to_eur) if g[2] == 'USD' else val
-            total_prep_eur += umg
-            st.write(f"➕ {g[0]}: {val:.2f} {g[2]}")
+        has_prep = False
+        for g in prep_gebuehren:
+            if ist_doc_gebuehr(g['name']): 
+                doc_gebuehren.append(g)
+                continue
+            has_prep = True
+            if g['waehrung'] == 'USD':
+                umgerechnet = g['betrag'] * usd_to_eur
+                summe_gebuehren_eur += umgerechnet
+                st.write(f"➕ {g['name']}: {g['betrag']:.2f} USD <small>(≈ {umgerechnet:.2f} EUR)</small>", unsafe_allow_html=True)
+            elif g['waehrung'] == 'EUR':
+                summe_gebuehren_eur += g['betrag']
+                st.write(f"➕ {g['name']}: {g['betrag']:.2f} EUR", unsafe_allow_html=True)
+            else:
+                fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']})")
+                st.markdown(f"➕ <span class='fremd-waehrung'>{g['name']}: {g['betrag']:.2f} {g['waehrung']}</span>", unsafe_allow_html=True)
+        if not has_prep: st.write("<small>Keine extra Prepaid Gebühren</small>", unsafe_allow_html=True)
+                
+    with col_coll:
+        st.write("**🏢 Collect (Zielort):**")
+        has_coll = False
+        for i, g in enumerate(coll_gebuehren):
+            if ist_doc_gebuehr(g['name']): 
+                doc_gebuehren.append(g)
+                continue
+            has_coll = True
+            if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
+                if g['waehrung'] == 'USD': summe_gebuehren_eur += (g['betrag'] * usd_to_eur)
+                elif g['waehrung'] == 'EUR': summe_gebuehren_eur += g['betrag']
+                else: fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']} - Collect)")
+        if not has_coll: st.write("<small>Keine Collect Gebühren</small>", unsafe_allow_html=True)
 
-    with col3:
-        total = basis_eur + total_prep_eur
-        st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:24px; font-weight:bold;">{total:.2f} EUR</span></div>', unsafe_allow_html=True)
+    with col_doc:
+        st.write("**📄 BL & Docs:**")
+        if not doc_gebuehren: 
+            st.write("<small>-</small>", unsafe_allow_html=True)
+        else:
+            st.write("<small><i>(Nicht im All-In)</i></small>", unsafe_allow_html=True)
+            for g in doc_gebuehren:
+                st.markdown(f"🔹 {g['name']}: {g['betrag']:.2f} {g['waehrung']}")
 
-# --- PDF READER ---
+    with col_total:
+        total_eur = basis_eur + summe_gebuehren_eur
+        zusatz = f"<br><br><span class='fremd-waehrung'><b>⚠️ Zzgl. Fremdwährungen:</b><br>" + "<br>".join(fremd_gebuehren) + "</span>" if fremd_gebuehren else ""
+        st.markdown(f'<div class="all-in-box"><b>Echter All-In Preis</b><br><span style="font-size:26px; font-weight:bold; color:#1e7e34;">{total_eur:.2f} EUR</span>{zusatz}</div>', unsafe_allow_html=True)
+
+# --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes):
     datei = io.BytesIO(file_bytes)
-    try:
-        reader = PyPDF2.PdfReader(datei)
-        text = " ".join([p.extract_text() for p in reader.pages])
-        
-        dates = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
-        v_from = dates[0] if dates else "Unbekannt"
-        v_to = dates[-1] if len(dates) > 1 else "Unbekannt"
-        
-        cont = re.search(r'(?:Contract|Quote|Reference)[\s#:]*([A-Z0-9]{5,20})', text, re.I)
-        contract_no = cont.group(1) if cont else "Unbekannt"
-        
-        prepaid_list = []
-        def get_sur(name, keys, f_teu=False, p_teu=False):
-            regex = r'(?:' + '|'.join(keys) + r')'
-            for m in re.finditer(regex, text, re.I):
-                block = text[m.end():m.end()+130]
-                if re.search(r'\b(?:not subject to|incl|ind|included|n/a)\b', block[:60], re.I): continue
-                p_match = re.search(r'(?<!\d)(\d{1,4}(?:[.,]\d{1,3})?)\s*(EUR|USD|LISD|SEUR)', block, re.I)
-                if p_match:
-                    val = parse_price(p_match[1])
-                    curr = p_match[2].upper().replace('LISD', 'USD').replace('SEUR', 'EUR')
-                    if f_teu or (not p_teu and 'teu' in block.lower()): val *= 2
-                    return f"{name} = {val:.2f} {curr}"
-            return None
+    datei.name = file_name
+    
+    if datei.name.lower().endswith('.pdf'):
+        try:
+            reader = PyPDF2.PdfReader(datei)
+            text = " ".join([page.extract_text() for page in reader.pages])
+            
+            date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
+            v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
+            v_to = date_matches[1] if len(date_matches) > 1 else "Unbekannt"
+            
+            # --- Ultra-strikte POL/POD Erkennung ---
+            pol_match = re.search(r'Ports?\s+of\s+Loading[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Validity|Valid|Terms|\d|$))', text, re.IGNORECASE)
+            pol_str = pol_match.group(1).strip() if pol_match else "Unbekannt"
+            
+            pod_match = re.search(r'Remarks[\s"\n]*([A-Za-z\s]{3,20}?)(?=\s+(?:QA|AE|SA|OM|BH|KW|IQ|IR|TR|\d+x|DV|HC))', text, re.IGNORECASE)
+            if not pod_match:
+                pod_match = re.search(r'Port\s+of\s+Discharge[\s:]*([A-Za-z\s]{3,20}?)(?=\s+(?:Volume|Freetime|\d|$))', text, re.IGNORECASE)
+            pod_str = pod_match.group(1).strip() if pod_match else "Unbekannt"
+            
+            # Bereinigung: Sonderzeichen und zu lange Texte radikal blockieren
+            pol_str = re.sub(r'[^A-Za-z\s\-]', '', pol_str).strip()
+            pod_str = re.sub(r'[^A-Za-z\s\-]', '', pod_str).strip()
+            
+            # NEU: Entfernt alleinstehende 2-Buchstaben-Ländercodes (wie QA, AE, DE)
+            pol_str = re.sub(r'\b[A-Z]{2}\b', '', pol_str).strip()
+            pod_str = re.sub(r'\b[A-Z]{2}\b', '', pod_str).strip()
+            
+            if len(pol_str) > 25: pol_str = "Unbekannt"
+            if len(pod_str) > 25: pod_str = "Unbekannt"
 
-        # Zuschläge scannen
-        for s in [("ERC", ["Logistic Fee"]), ("ETS", ["ETS", "Emissions Trading"], True), 
-                  ("FEU", ["Fuel EU", "FEU"], True), ("PSS", ["PSS", "Peak Season"], False, True),
-                  ("ECA", ["ECA", "Emission Control Area"], True), ("BRC", ["BRC", "BAC", "Bunker Recovery"], True)]:
-            res = get_sur(s[0], s[1], *s[2:])
-            if res: prepaid_list.append(res)
-        
-        prep_str = ", ".join(prepaid_list)
-        res_list = []
+            contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
+            contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
+            
+            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
+            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text)
+            
+            df_pdf = pd.DataFrame([{
+                'Carrier': 'MSC (aus PDF)',
+                'Contract Number': contract_no,
+                'Port of Loading': pol_str,
+                'Port of Destination': pod_str,
+                'Valid from': v_from,
+                'Valid to': v_to,
+                '40HC': float(rate_match.group(1)) if rate_match else 0,
+                'Currency': rate_match.group(2) if rate_match else "USD",
+                'Included Prepaid Surcharges 40HC': f"ERC = {erc_match.group(1)} {erc_match.group(2)}" if erc_match else "",
+                'Included Collect Surcharges 40HC': "",
+                'Remark': 'Automatisch aus PDF importiert'
+            }])
+            
+            # NEU: Das Datum für den "Datumsfilter" auch bei PDFs maschinenlesbar machen
+            if 'Valid from' in df_pdf.columns: df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
+            if 'Valid to' in df_pdf.columns: df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+            
+            return df_pdf, "PDF"
+        except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
-        if "via pol" in text.lower():
-            for block in re.split(r'Port\s+of\s+Discharge', text, flags=re.I)[1:]:
-                pod_m = re.search(r'^\s*([A-Za-z\s\-]+)', block)
-                pod = pod_m.group(1).split()[0].title() if pod_m else "Unbekannt"
-                for r in re.finditer(r'via\s+POL\s+([A-Za-z/]+)\s+[\d.,]+\s*[A-Z]{3}\s+([\d.,]+)\s*([A-Z]{3})', block, re.I):
-                    res_list.append({'Carrier': 'MSC', 'Contract Number': contract_no, 'Port of Loading': r.group(1), 'Port of Destination': pod, 'Valid from': v_from, 'Valid to': v_to, '40HC': parse_price(r.group(2)), 'Currency': r.group(3).upper(), 'Included Prepaid Surcharges 40HC': prep_str})
+    else:
+        if datei.name.endswith('.xlsx'):
+            excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
+            ziel_sheet, header_idx = None, 0
+            for sheet_name, df_preview in excel_preview.items():
+                for i in range(len(df_preview)):
+                    if any(x in " ".join(df_preview.iloc[i].dropna().astype(str)) for x in ['40HDRY', 'Port of Destination', '40HC All In']):
+                        ziel_sheet, header_idx = sheet_name, i
+                        break
+                if ziel_sheet: break
+            df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
         else:
-            pod_m = re.search(r'Port\s+of\s+Discharge[\s\n]*([A-Za-z\s\-]+)', text, re.I)
-            pod = re.sub(r'(?i)Volume|DV|HC|Freetime|at|POD|Origin|Remarks', '', pod_m.group(1)).strip().split()[0].title() if pod_m else "Unbekannt"
-            rate_m = re.search(r'(\d{3,4}(?:[.,]\d{1,2})?)\s*(USD|EUR)', text[text.find("40'"):text.find("40'")+120])
-            if rate_m:
-                res_list.append({'Carrier': 'MSC', 'Contract Number': contract_no, 'Port of Loading': 'Hamburg', 'Port of Destination': pod, 'Valid from': v_from, 'Valid to': v_to, '40HC': parse_price(rate_m.group(1)), 'Currency': rate_m.group(2).upper(), 'Included Prepaid Surcharges 40HC': prep_str})
+            df_raw = pd.read_csv(datei, header=None, low_memory=False)
+            header_idx = 0
+            for i in range(min(20, len(df_raw))):
+                if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
+                    header_idx = i; break
 
-        df = pd.DataFrame(res_list)
-        for c in ['Valid from', 'Valid to']:
-            df[c + ' dt'] = pd.to_datetime(df[c], dayfirst=True, errors='coerce').astype(str)
-        return df, "PDF"
-    except Exception as e: return pd.DataFrame(), f"Error: {e}"
+        global_contract = "Unbekannt"
+        
+        for i in range(min(20, len(df_raw))):
+            row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
+            for j, val in enumerate(row_vals):
+                v_low = val.lower()
+                if 'contract' in v_low:
+                    nums = re.findall(r'\b\d{6,10}\b', val)
+                    if nums:
+                        global_contract = nums[0]
+                        break
+                    for k in range(1, 4):
+                        if j + k < len(row_vals):
+                            next_val = row_vals[j+k].upper()
+                            next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
+                            if next_tokens:
+                                global_contract = next_tokens[0]
+                                break
+                if global_contract != "Unbekannt":
+                    break
+            if global_contract != "Unbekannt":
+                break
 
-# --- UI ---
+        if global_contract == "Unbekannt":
+            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
+                global_contract = fn_match.group(1)
+
+        rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
+        neue_spalten, gesehen = [], {}
+        for s in rohe_spalten:
+            if s in gesehen: gesehen[s] += 1; neue_spalten.append(f"{s}.{gesehen[s]}")
+            else: gesehen[s] = 0; neue_spalten.append(s)
+                
+        df_raw.columns = neue_spalten
+        df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
+        contract_col = next((c for c in df_raw.columns if any(x in c.lower() for x in ['contract', 'quote', 'reference'])), None)
+        
+        if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
+        if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
+
+        if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
+            standard_rows = []
+            for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
+                bas_row = group[group['Charge'] == 'BAS']
+                if bas_row.empty: continue
+                val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
+                if len(val_raw) < 2: continue
+                
+                row_contract = global_contract
+                
+                standard_rows.append({
+                    'Carrier': 'Maersk', 'Contract Number': row_contract, 
+                    'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
+                    '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
+                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
+                    'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
+                })
+            df_return = pd.DataFrame(standard_rows)
+        else:
+            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
+            df_return = df_raw
+            
+        if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
+        if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
+        
+        return df_return, "Excel/CSV"
+
+
+# --- TABS FÜR UI ---
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
 
+# === TAB 1: SUCHEN ===
 with tab_suche:
-    data = list(collection.find({}))
-    if not data:
-        st.info("Datenbank leer.")
+    cursor = collection.find({})
+    daten_liste = list(cursor)
+
+    if not daten_liste:
+        st.info("💡 Die Datenbank ist aktuell leer. Bitte lade im Reiter 'Daten hochladen (Admin)' zuerst Raten hoch.")
     else:
-        df = pd.DataFrame(data)
-        c1, c2, c3 = st.columns(3)
-        pol = c1.text_input("POL:")
-        pod = c2.text_input("POD:")
-        datum = pd.to_datetime(c3.date_input("Gültig am:"))
+        df = pd.DataFrame(daten_liste)
         
-        # Sicherstellen, dass Datumsvergleiche funktionieren
-        df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
-        df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
+        if 'Valid from dt' in df.columns: df['Valid from dt'] = pd.to_datetime(df['Valid from dt'], errors='coerce')
+        if 'Valid to dt' in df.columns: df['Valid to dt'] = pd.to_datetime(df['Valid to dt'], errors='coerce')
         
-        mask = (df['Valid from dt'] <= datum) & (df['Valid to dt'] >= datum)
-        if pol: mask &= df['Port of Loading'].str.contains(pol, case=False, na=False)
-        if pod: mask &= df['Port of Destination'].str.contains(pod, case=False, na=False)
+        st.write(f"### Suche in der Datenbank ({len(df)} Raten aktiv)")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
+        with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
+        with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
+        with c4:
+            filter_datum_aktiv = st.checkbox("📅 Datumsfilter aktiv", value=True)
+            such_datum = st.date_input("Rate gültig am:", disabled=not filter_datum_aktiv)
+
+        mask = pd.Series([True] * len(df))
+        
+        # NEU: .strip() schneidet unsichtbare Leerzeichen ab, regex=False verhindert Fehler
+        if such_pol and 'Port of Loading' in df.columns: mask &= df['Port of Loading'].astype(str).str.contains(such_pol.strip(), case=False, na=False, regex=False)
+        if such_pod and 'Port of Destination' in df.columns: mask &= df['Port of Destination'].astype(str).str.contains(such_pod.strip(), case=False, na=False, regex=False)
+        if such_contract and 'Contract Number' in df.columns: mask &= df['Contract Number'].astype(str).str.contains(such_contract.strip(), case=False, na=False, regex=False)
+        
+        if filter_datum_aktiv and 'Valid from dt' in df.columns:
+            dt_search = pd.to_datetime(such_datum)
+            mask &= (df['Valid from dt'] <= dt_search) & (df['Valid to dt'] >= dt_search)
         
         treffer = df[mask].copy()
-        if not treffer.empty:
-            treffer['Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC'), axis=1)
-            for _, r in treffer.sort_values('Sort').iterrows():
-                with st.expander(f"🚢 {r['Carrier']} | {r['Port of Loading']} ➡️ {r['Port of Destination']} | All-In: {r['Sort']:.2f} EUR"):
-                    anzeige_container_daten(r, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC')
+        if '40HC' in treffer.columns:
+            treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
+            treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
+            
+            if not treffer.empty:
+                treffer['Total_EUR_Sort'] = treffer.apply(lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name), axis=1)
+                treffer = treffer.sort_values(by='Total_EUR_Sort')
+                
+                st.success(f"✅ {len(treffer)} gültige Raten gefunden. Zeige die Top {min(50, len(treffer))} günstigsten an:")
+                
+                for _, row in treffer.head(50).iterrows():
+                    is_best = (row['Total_EUR_Sort'] == treffer['Total_EUR_Sort'].iloc[0])
+                    label = f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | {row.get('Port of Loading')} ➡️ {row.get('Port of Destination')}"
+                    
+                    with st.expander(label):
+                        anzeige_container_daten(row, "40' HC", '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', row.name)
+                        if pd.notna(row.get('Remark')) and row.get('Remark') != "": st.info(f"**💡 Bemerkung:** {row['Remark']}")
+            else: st.warning("Keine gültigen Raten für diese Suche gefunden.")
 
+
+# === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
 with tab_upload:
-    uploaded = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
-    if uploaded and st.button("Speichern"):
-        for f in uploaded:
-            df_new, _ = lade_und_uebersetze_cached(f.name, f.getvalue())
-            if not df_new.empty:
-                for rec in df_new.to_dict('records'):
-                    rec['createdAt'] = datetime.now(timezone.utc)
-                    collection.update_one({"Contract Number": rec["Contract Number"], "Port of Loading": rec["Port of Loading"], "Port of Destination": rec["Port of Destination"]}, {"$set": rec}, upsert=True)
-        st.success("Erfolgreich hochgeladen!")
-    if st.button("🗑️ Datenbank leeren"):
-        collection.delete_many({})
-        st.rerun()
+    st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
+    uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
+            alle_daten = []
+            with st.spinner("Lese Dateien und speichere in Datenbank..."):
+                for datei in uploaded_files:
+                    try:
+                        df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
+                        if not df_teil.empty:
+                            alle_daten.append(df_teil)
+                    except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
+            
+                if alle_daten:
+                    df_upload = pd.concat(alle_daten, ignore_index=True)
+                    df_upload['createdAt'] = datetime.now(timezone.utc)
+                    records = df_upload.to_dict('records')
+                    
+                    if records:
+                        collection.insert_many(records) 
+                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                        st.balloons()
+    
+    # --- GEFAHRENZONE (DATENBANK LEEREN) ---
+    st.markdown("---")
+    st.write("### 🚨 Gefahrenzone")
+    st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
+    
+    if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
+        ergebnis_all = collection.delete_many({})
+        st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
