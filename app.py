@@ -860,7 +860,7 @@ RATEN_PROJECTION = {
 
 MAX_DB_FETCH = 1200
 MAX_RESULT_ANZEIGE = 50
-RESULTS_PRO_SEITE = 25
+RESULTS_PRO_SEITE = 50
 
 
 @st.cache_data(ttl=120)
@@ -887,7 +887,7 @@ tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (A
 # === TAB 1: SUCHEN ===
 with tab_suche:
     st.write("### Suche in der Datenbank")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     with c1: such_pol = st.text_input("📍 Ladehafen (POL):", placeholder="z.B. Hamburg")
     with c2: such_pod = st.text_input("🏁 Zielhafen (POD):", placeholder="z.B. Hamad")
     with c3: such_contract = st.text_input("📄 Contract Nr.:", placeholder="z.B. 299424203")
@@ -902,16 +902,9 @@ with tab_suche:
             value=datetime.now(timezone.utc).date(),
             disabled=historische_raten,
         )
-    with c5:
-        fetch_limit = st.selectbox(
-            "⚡ Max. DB-Treffer",
-            options=[300, 600, 1200],
-            index=2,
-            help="Schützt vor langen Ladezeiten. Bei sehr breiten Suchen bitte kleiner wählen oder Suche eingrenzen.",
-        )
 
     with st.spinner("Lade Raten aus Datenbank..."):
-        df, ist_gekuerzt = lade_raten_aus_db(such_pol, such_pod, such_contract, fetch_limit=fetch_limit)
+        df, ist_gekuerzt = lade_raten_aus_db(such_pol, such_pod, such_contract, fetch_limit=MAX_DB_FETCH)
 
     if df.empty:
         if any([such_pol, such_pod, such_contract]):
@@ -921,7 +914,7 @@ with tab_suche:
     else:
         if ist_gekuerzt:
             st.warning(
-                f"Es wurden mehr als {fetch_limit} Raten gefunden. Aus Performance-Gründen wurden nur die ersten {fetch_limit} geladen. "
+                f"Es wurden mehr als {MAX_DB_FETCH} Raten gefunden. Aus Performance-Gründen wurden nur die ersten {MAX_DB_FETCH} geladen. "
                 "Bitte Suche weiter eingrenzen (POL/POD/Contract)."
             )
 
