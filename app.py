@@ -1,16 +1,3 @@
-Ah, ich verstehe das Problem jetzt! Das ist der absolute Klassiker bei solchen Upload-Funktionen: Ein **"Stiller Fehler" (Silent Fail)**.
-
-Das Skript ist beim Einlesen intern auf einen Fehler gestoßen oder hat die Raten nicht gefunden. Da ich aber keine Fehlermeldung programmiert hatte, die in der Benutzeroberfläche auftaucht, hat die App den Upload einfach stumm ignoriert. Daher passiert "nichts".
-
-Außerdem habe ich nachgezählt: Du hast völlig recht! Casablanca (2), Tunis (2), Algeria (2), Jeddah (1), Hamad (1), Dammam (1) = **Exakt 9 Raten**.
-
-Die PDFs von MSC haben leider keine "echten" Tabellenlinien, weshalb der `pdfplumber` sie falsch gelesen und Teile (inkl. Ladehafen) verschluckt hat. **Die Lösung:** Wir lesen das PDF jetzt zeilenweise als reinen Text aus. Das ist bei Speditions-Angeboten fast immer die robusteste Methode.
-
-Ich habe das Skript jetzt so umgeschrieben, dass es **alle 9 Raten findet**, die **Zuschläge exakt zuordnet** und – ganz wichtig – dir ab sofort in der App **genau anzeigt, wenn und warum eine Datei fehlschlägt**.
-
-Hier ist der fertige, aktualisierte Code. Ersetze einfach wieder deine komplette `app.py`:
-
-```python
 import streamlit as st
 import pandas as pd
 import re
@@ -458,5 +445,3 @@ with tab_upload:
     if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
         ergebnis_all = collection.delete_many({})
         st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
-
-```
