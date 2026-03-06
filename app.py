@@ -861,6 +861,7 @@ RATEN_PROJECTION = {
 MAX_DB_FETCH = 1200
 MAX_RESULT_ANZEIGE = 50
 RESULTS_PRO_SEITE = 50
+DB_INSERT_BATCH_SIZE = 1000
 
 
 @st.cache_data(ttl=120)
@@ -895,6 +896,67 @@ def formatiere_datum_fuer_header(value):
     if pd.notna(parsed):
         return parsed.strftime("%d.%m.%Y")
     return text
+
+
+def ermittle_erste_spalte(df, kandidaten):
+    spalten_map = {str(c).strip().lower(): c for c in df.columns}
+    for kandidat in kandidaten:
+        hit = spalten_map.get(str(kandidat).strip().lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def normalisiere_upload_dataframe(df_upload):
+    out = df_upload.copy()
+
+    if 'Contract Number' not in out.columns:
+        contract_col = ermittle_erste_spalte(out, ['Contract number', 'Contract No', 'Contract Nr', 'Contract'])
+        if contract_col is not None:
+            out['Contract Number'] = out[contract_col]
+
+    if 'Currency' not in out.columns:
+        waehrung_col = ermittle_erste_spalte(out, ['Currency.4', 'Currency.3', 'Currency.2', 'Currency.1', 'Currency'])
+        if waehrung_col is not None:
+            out['Currency'] = out[waehrung_col]
+    elif '40HC' in out.columns and 'Currency.4' in out.columns:
+        # Bei breiten Excel-Exports beschreibt Currency.4 i.d.R. die 40HC-Waehrung.
+        out['Currency'] = out['Currency.4']
+
+    if 'Remark' not in out.columns:
+        remark_col = ermittle_erste_spalte(out, ['Remarks', 'Remark / Notes', 'Notes'])
+        out['Remark'] = out[remark_col] if remark_col is not None else ""
+
+    if 'Included Prepaid Surcharges 40HC' not in out.columns:
+        out['Included Prepaid Surcharges 40HC'] = ""
+    if 'Included Collect Surcharges 40HC' not in out.columns:
+        out['Included Collect Surcharges 40HC'] = ""
+
+    return out
+
+
+def speichere_dataframe_batchweise(df_upload):
+    total = len(df_upload)
+    if total == 0:
+        return 0
+
+    fortschritt = st.progress(0)
+    status = st.empty()
+    gespeichert = 0
+
+    for start_idx in range(0, total, DB_INSERT_BATCH_SIZE):
+        end_idx = min(start_idx + DB_INSERT_BATCH_SIZE, total)
+        batch_records = df_upload.iloc[start_idx:end_idx].to_dict('records')
+        if not batch_records:
+            continue
+        collection.insert_many(batch_records, ordered=False)
+        gespeichert += len(batch_records)
+        fortschritt.progress(min(gespeichert / total, 1.0))
+        status.caption(f"💾 Speichere in Datenbank: {gespeichert}/{total} Zeilen")
+
+    fortschritt.empty()
+    status.empty()
+    return gespeichert
 
 
 # --- TABS FÜR UI ---
@@ -1019,11 +1081,16 @@ with tab_upload:
             if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
                 alle_daten = []
                 with st.spinner("Lese Dateien und speichere in Datenbank..."):
-                    for datei in uploaded_files:
+                    file_progress = st.progress(0)
+                    file_status = st.empty()
+
+                    for idx, datei in enumerate(uploaded_files, start=1):
+                        file_status.caption(f"📄 Lese Datei {idx}/{len(uploaded_files)}: {datei.name}")
                         try:
                             datei_bytes = datei.getvalue()
                             if len(datei_bytes) > MAX_UPLOAD_SIZE_BYTES:
                                 st.error(f"Datei {datei.name} ist größer als {MAX_UPLOAD_SIZE_MB} MB und wurde übersprungen.")
+                                file_progress.progress(min(idx / len(uploaded_files), 1.0))
                                 continue
 
                             df_teil, format_name = lade_und_uebersetze_cached(
@@ -1035,17 +1102,25 @@ with tab_upload:
                                 alle_daten.append(df_teil)
                         except Exception as e:
                             st.error(f"Fehler bei {datei.name}: {e}")
+
+                        file_progress.progress(min(idx / len(uploaded_files), 1.0))
+
+                    file_progress.empty()
+                    file_status.empty()
                 
                     if alle_daten:
-                        df_upload = pd.concat(alle_daten, ignore_index=True)
-                        df_upload['createdAt'] = datetime.now(timezone.utc)
-                        records = df_upload.to_dict('records')
-                        
-                        if records:
-                            collection.insert_many(records)
-                            lade_raten_aus_db.clear()
-                            st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
-                            st.balloons()
+                        try:
+                            df_upload = pd.concat(alle_daten, ignore_index=True)
+                            df_upload = normalisiere_upload_dataframe(df_upload)
+                            df_upload['createdAt'] = datetime.now(timezone.utc)
+
+                            gespeichert = speichere_dataframe_batchweise(df_upload)
+                            if gespeichert > 0:
+                                lade_raten_aus_db.clear()
+                                st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                                st.balloons()
+                        except Exception as e:
+                            st.error(f"Fehler beim Speichern in MongoDB: {e}")
         
         # --- GEFAHRENZONE (DATENBANK LEEREN) ---
         st.markdown("---")
