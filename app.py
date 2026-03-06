@@ -4,6 +4,8 @@ import re
 import PyPDF2
 import warnings
 import io
+import os
+import hmac
 import requests
 import pymongo
 from datetime import datetime, timezone
@@ -33,16 +35,40 @@ except FileNotFoundError:
 # --- HAUPT-ÜBERSCHRIFT ---
 st.title("🚢 Speditions-Raten-Finder (Cloud-Datenbank)")
 
+MAX_UPLOAD_SIZE_MB = 15
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_ADMIN_LOGIN_ATTEMPTS = 5
+ADMIN_LOCK_SECONDS = 300
+
+
+def hole_konfiguration(key, default=None):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
 # --- MONGODB ANBINDUNG ---
-MONGO_URI = "mongodb+srv://blindner984_db_user:GtCR5qnPJeGKGpbe@cluster0.yc0llqz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = hole_konfiguration("MONGO_URI")
+ADMIN_PASSWORD = hole_konfiguration("ADMIN_PASSWORD")
+
+if not MONGO_URI:
+    st.error("Sicherheits-Konfiguration fehlt: Bitte MONGO_URI als Secret oder Umgebungsvariable setzen.")
+    st.stop()
 
 @st.cache_resource
 def init_db():
-    client = pymongo.MongoClient(MONGO_URI)
-    db = client["SpeditionsDB"]
-    collection = db["Raten"]
-    collection.create_index("createdAt", expireAfterSeconds=15552000)
-    return collection
+    try:
+        client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        db = client["SpeditionsDB"]
+        collection = db["Raten"]
+        collection.create_index("createdAt", expireAfterSeconds=15552000)
+        return collection
+    except Exception:
+        st.error("Datenbankverbindung fehlgeschlagen. Bitte MONGO_URI und Netzfreigaben prüfen.")
+        st.stop()
 
 collection = init_db()
 
@@ -51,15 +77,122 @@ collection = init_db()
 def hole_live_wechselkurs():
     try:
         response = requests.get("https://api.frankfurter.app/latest?from=USD&to=EUR", timeout=5)
-        return round(response.json()['rates']['EUR'], 3)
+        response.raise_for_status()
+        eur_rate = response.json().get("rates", {}).get("EUR")
+        if isinstance(eur_rate, (int, float)):
+            return round(float(eur_rate), 3)
     except Exception:
-        return 0.92
+        pass
+    return 0.92
 
 aktueller_kurs = hole_live_wechselkurs()
 
 st.sidebar.header("💱 Einstellungen")
 st.sidebar.write("*(Kurs wird stündlich live von der EZB aktualisiert)*")
 usd_to_eur = st.sidebar.number_input("Wechselkurs: 1 USD in EUR", value=aktueller_kurs, step=0.01)
+
+
+def parse_decimal_wert(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+
+    text = text.replace(" ", "")
+    sign = -1 if text.startswith("-") else 1
+    text = text.lstrip("+-")
+    cleaned = re.sub(r"[^0-9,\.]", "", text)
+    if not cleaned:
+        return None
+
+    if "." in cleaned and "," in cleaned:
+        decimal_sep = "." if cleaned.rfind(".") > cleaned.rfind(",") else ","
+        thousands_sep = "," if decimal_sep == "." else "."
+        normalized = cleaned.replace(thousands_sep, "")
+        if decimal_sep == ",":
+            normalized = normalized.replace(",", ".")
+    elif "." in cleaned or "," in cleaned:
+        sep = "." if "." in cleaned else ","
+        parts = cleaned.split(sep)
+
+        if len(parts) == 2:
+            whole, fractional = parts
+            if len(fractional) == 3 and len(whole) <= 3:
+                normalized = whole + fractional
+            else:
+                normalized = whole + "." + fractional
+        else:
+            last = parts[-1]
+            if len(last) == 3:
+                normalized = "".join(parts)
+            else:
+                normalized = "".join(parts[:-1]) + "." + last
+    else:
+        normalized = cleaned
+
+    try:
+        return sign * float(normalized)
+    except ValueError:
+        return None
+
+
+def extrahiere_waehrung_und_betrag(text, default_currency="USD"):
+    text_str = str(text)
+    waehrung_match = re.search(r"\b(USD|EUR)\b", text_str, re.IGNORECASE)
+    betrag_match = re.search(r"(\d[\d\.,]*)", text_str)
+    betrag = parse_decimal_wert(betrag_match.group(1)) if betrag_match else None
+    waehrung = waehrung_match.group(1).upper() if waehrung_match else default_currency
+    return waehrung, betrag
+
+
+def admin_login_bereich():
+    st.write("### 🔐 Admin-Zugang")
+    if not ADMIN_PASSWORD:
+        st.error("ADMIN_PASSWORD ist nicht gesetzt. Admin-Funktionen sind aus Sicherheitsgründen deaktiviert.")
+        return False
+
+    expected_password = str(ADMIN_PASSWORD)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    locked_until = float(st.session_state.get("admin_locked_until", 0))
+
+    if locked_until > now_ts:
+        wait_seconds = int(locked_until - now_ts)
+        st.error(f"Zu viele Fehlversuche. Bitte in {wait_seconds} Sekunden erneut versuchen.")
+        return False
+
+    if st.session_state.get("admin_authenticated", False):
+        st.success("Admin-Zugang aktiv.")
+        if st.button("🔓 Admin abmelden", key="admin_logout"):
+            st.session_state["admin_authenticated"] = False
+            st.rerun()
+        return True
+
+    input_password = st.text_input("Admin-Passwort", type="password", key="admin_password_input")
+    if st.button("🔐 Admin anmelden", key="admin_login"):
+        if hmac.compare_digest(str(input_password), expected_password):
+            st.session_state["admin_authenticated"] = True
+            st.session_state["admin_failed_attempts"] = 0
+            st.session_state["admin_locked_until"] = 0
+            st.success("Anmeldung erfolgreich.")
+            st.rerun()
+        else:
+            failed_attempts = int(st.session_state.get("admin_failed_attempts", 0)) + 1
+            st.session_state["admin_failed_attempts"] = failed_attempts
+
+            if failed_attempts >= MAX_ADMIN_LOGIN_ATTEMPTS:
+                st.session_state["admin_locked_until"] = now_ts + ADMIN_LOCK_SECONDS
+                st.session_state["admin_failed_attempts"] = 0
+                st.error(f"Zu viele Fehlversuche. Login ist für {ADMIN_LOCK_SECONDS} Sekunden gesperrt.")
+            else:
+                remaining = MAX_ADMIN_LOGIN_ATTEMPTS - failed_attempts
+                st.error(f"Falsches Passwort. Verbleibende Versuche: {remaining}")
+    return False
 
 # --- DOKUMENTEN-FILTER ---
 def ist_doc_gebuehr(name):
@@ -74,13 +207,18 @@ def berechne_gebuehren(zuschlaege_str):
     treffer = re.findall(r'([A-Za-z0-9\s\(\)\-]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})', zuschlaege_str)
     liste = []
     for t in treffer:
-        try: liste.append({"name": t[0].strip().lstrip(','), "betrag": float(t[1].replace('.', '').replace(',', '.')), "waehrung": t[2].upper()})
-        except (ValueError, IndexError): pass
+        try:
+            betrag = parse_decimal_wert(t[1])
+            if betrag is None:
+                continue
+            liste.append({"name": t[0].strip().lstrip(','), "betrag": betrag, "waehrung": t[2].upper()})
+        except (ValueError, IndexError):
+            pass
     return liste
 
 def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
-    basis = pd.to_numeric(row.get(price_col), errors='coerce')
-    if pd.isna(basis) or basis <= 0: return 99999999 
+    basis = parse_decimal_wert(row.get(price_col))
+    if basis is None or basis <= 0: return 99999999 
     
     basis_eur = basis * usd_to_eur if str(row.get('Currency', 'USD')).upper() == 'USD' else basis
     summe_gebuehren_eur = 0
@@ -97,7 +235,11 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     return basis_eur + summe_gebuehren_eur
 
 def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
-    basis = pd.to_numeric(row.get(price_col), errors='coerce')
+    basis = parse_decimal_wert(row.get(price_col))
+    if basis is None or basis <= 0:
+        st.warning("Basispreis konnte nicht eindeutig gelesen werden.")
+        return
+
     curr_basis = str(row.get('Currency', 'USD')).upper()
     basis_eur = basis * usd_to_eur if curr_basis == 'USD' else basis
     
@@ -166,7 +308,9 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     if datei.name.lower().endswith('.pdf'):
         try:
             reader = PyPDF2.PdfReader(datei)
-            text = " ".join([page.extract_text() for page in reader.pages])
+            text = " ".join([(page.extract_text() or "") for page in reader.pages])
+            if not text.strip():
+                return pd.DataFrame(), "Fehler: PDF enthält keinen auslesbaren Text."
             
             date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
             v_from = date_matches[0] if len(date_matches) > 0 else "Unbekannt"
@@ -178,8 +322,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
             contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
             
-            rate_match = re.search(r'(\d{3,4})\s*(USD|EUR)', text)
-            erc_match = re.search(r'Logistic Fee.*?(\d+)\s*(EUR|USD)', text)
+            rate_match = re.search(r'(\d[\d\.,]*)\s*(USD|EUR)\b', text)
+            rate_value = parse_decimal_wert(rate_match.group(1)) if rate_match else None
+            rate_currency = rate_match.group(2).upper() if rate_match else "USD"
+            erc_match = re.search(r'Logistic Fee.*?(\d[\d\.,]*)\s*(EUR|USD)', text, re.IGNORECASE | re.DOTALL)
             
             df_pdf = pd.DataFrame([{
                 'Carrier': 'MSC (aus PDF)',
@@ -188,8 +334,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 'Port of Destination': pod_match.group(1).strip() if pod_match else "Unbekannt",
                 'Valid from': v_from,
                 'Valid to': v_to,
-                '40HC': float(rate_match.group(1)) if rate_match else 0,
-                'Currency': rate_match.group(2) if rate_match else "USD",
+                '40HC': rate_value if rate_value is not None else 0,
+                'Currency': rate_currency,
                 'Included Prepaid Surcharges 40HC': f"ERC = {erc_match.group(1)} {erc_match.group(2)}" if erc_match else "",
                 'Included Collect Surcharges 40HC': "",
                 'Remark': 'Automatisch aus PDF importiert'
@@ -266,8 +412,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
             for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
                 bas_row = group[group['Charge'] == 'BAS']
                 if bas_row.empty: continue
-                val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
-                if len(val_raw) < 2: continue
+                bas_text = str(bas_row['40HDRY'].values[0]).strip()
+                waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
+                if basis_betrag is None or basis_betrag <= 0:
+                    continue
                 
                 # Wir priorisieren die gefundene globale Contract Number
                 row_contract = global_contract
@@ -275,7 +423,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
                 standard_rows.append({
                     'Carrier': 'Maersk', 'Contract Number': row_contract, 
                     'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
-                    '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
+                    '40HC': basis_betrag, 'Currency': waehrung,
                     'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
                     'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
                 })
@@ -325,7 +473,7 @@ with tab_suche:
         
         treffer = df[mask].copy()
         if '40HC' in treffer.columns:
-            treffer['40HC_Check'] = pd.to_numeric(treffer['40HC'], errors='coerce')
+            treffer['40HC_Check'] = treffer['40HC'].apply(parse_decimal_wert)
             treffer = treffer[treffer['40HC_Check'] > 0].reset_index(drop=True)
             
             if not treffer.empty:
@@ -346,36 +494,51 @@ with tab_suche:
 
 # === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
 with tab_upload:
-    st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
-    uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
-    
-    if uploaded_files:
-        if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
-            alle_daten = []
-            with st.spinner("Lese Dateien und speichere in Datenbank..."):
-                for datei in uploaded_files:
-                    try:
-                        df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei.getvalue())
-                        if not df_teil.empty:
-                            alle_daten.append(df_teil)
-                    except Exception as e: st.error(f"Fehler bei {datei.name}: {e}")
-            
-                if alle_daten:
-                    df_upload = pd.concat(alle_daten, ignore_index=True)
-                    df_upload['createdAt'] = datetime.now(timezone.utc)
-                    records = df_upload.to_dict('records')
-                    
-                    if records:
-                        collection.insert_many(records) 
-                        st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
-                        st.balloons()
-    
-    # --- GEFAHRENZONE (DATENBANK LEEREN) ---
-    st.markdown("---")
-    st.write("### 🚨 Gefahrenzone")
-    st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank. Nutze dies nur, wenn du komplett neu anfangen möchtest!")
-    
-    if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
-        ergebnis_all = collection.delete_many({})
-        st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+    is_admin = admin_login_bereich()
 
+    if is_admin:
+        st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
+        st.caption(f"Maximale Dateigröße pro Datei: {MAX_UPLOAD_SIZE_MB} MB")
+        uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
+        
+        if uploaded_files:
+            if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
+                alle_daten = []
+                with st.spinner("Lese Dateien und speichere in Datenbank..."):
+                    for datei in uploaded_files:
+                        try:
+                            datei_bytes = datei.getvalue()
+                            if len(datei_bytes) > MAX_UPLOAD_SIZE_BYTES:
+                                st.error(f"Datei {datei.name} ist größer als {MAX_UPLOAD_SIZE_MB} MB und wurde übersprungen.")
+                                continue
+
+                            df_teil, format_name = lade_und_uebersetze_cached(datei.name, datei_bytes)
+                            if not df_teil.empty:
+                                alle_daten.append(df_teil)
+                        except Exception as e:
+                            st.error(f"Fehler bei {datei.name}: {e}")
+                
+                    if alle_daten:
+                        df_upload = pd.concat(alle_daten, ignore_index=True)
+                        df_upload['createdAt'] = datetime.now(timezone.utc)
+                        records = df_upload.to_dict('records')
+                        
+                        if records:
+                            collection.insert_many(records)
+                            st.success(f"✅ Super! {len(records)} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                            st.balloons()
+        
+        # --- GEFAHRENZONE (DATENBANK LEEREN) ---
+        st.markdown("---")
+        st.write("### 🚨 Gefahrenzone")
+        st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank.")
+
+        delete_confirm = st.checkbox("Ich bestätige, dass ich alle Raten endgültig löschen will.", key="delete_confirm_checkbox")
+        delete_text = st.text_input("Zur Bestätigung exakt `DELETE ALL` eingeben:", key="delete_confirm_text")
+        delete_allowed = delete_confirm and delete_text.strip() == "DELETE ALL"
+        
+        if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)", disabled=not delete_allowed):
+            ergebnis_all = collection.delete_many({})
+            st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
+    else:
+        st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
