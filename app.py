@@ -704,9 +704,9 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 msc_rows = msc_quote_data if isinstance(msc_quote_data, list) else [msc_quote_data]
                 df_pdf = pd.DataFrame(msc_rows)
                 if 'Valid from' in df_pdf.columns:
-                    df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
+                    df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce')
                 if 'Valid to' in df_pdf.columns:
-                    df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+                    df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce')
                 return df_pdf, "PDF (MSC Quote)"
             
             date_matches = re.findall(r'(\d{2,4}[.\-/]\d{2}[.\-/]\d{2,4})', text)
@@ -739,15 +739,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             }])
 
             if 'Valid from' in df_pdf.columns:
-                df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce').astype(str)
+                df_pdf['Valid from dt'] = pd.to_datetime(df_pdf['Valid from'], dayfirst=True, errors='coerce')
             if 'Valid to' in df_pdf.columns:
-                df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce').astype(str)
+                df_pdf['Valid to dt'] = pd.to_datetime(df_pdf['Valid to'], dayfirst=True, errors='coerce')
 
             return df_pdf, "PDF"
         except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
     else:
-        if datei.name.endswith('.xlsx'):
+        if datei.name.lower().endswith('.xlsx'):
+            # Schneller Pfad fuer tabellarische Exporte (Header in Zeile 1).
+            datei.seek(0)
+            try:
+                df_fast = pd.read_excel(datei, sheet_name=0)
+                fast_cols = {str(c).strip().lower() for c in df_fast.columns}
+                hat_ziel = any(c in fast_cols for c in ['port of destination', 'pod'])
+                hat_40hc = any(c in fast_cols for c in ['40hc', '40hc all in', '40hdry'])
+                if hat_ziel and hat_40hc:
+                    return df_fast, "Excel/CSV"
+            except Exception:
+                pass
+
+            datei.seek(0)
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
             ziel_sheet, header_idx = None, 0
             for sheet_name, df_preview in excel_preview.items():
@@ -756,8 +769,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         ziel_sheet, header_idx = sheet_name, i
                         break
                 if ziel_sheet: break
+            datei.seek(0)
             df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
         else:
+            datei.seek(0)
             df_raw = pd.read_csv(datei, header=None, low_memory=False)
             header_idx = 0
             for i in range(min(20, len(df_raw))):
@@ -806,9 +821,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         df_raw.columns = neue_spalten
         df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
         contract_col = next((c for c in df_raw.columns if any(x in c.lower() for x in ['contract', 'quote', 'reference'])), None)
-        
-        if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
-        if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
         if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
             standard_rows = []
@@ -832,11 +844,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 })
             df_return = pd.DataFrame(standard_rows)
         else:
-            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
+            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].fillna("Unbekannt").astype(str) if contract_col else "Unbekannt")
             df_return = df_raw
-            
-        if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
-        if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
         
         return df_return, "Excel/CSV"
 
@@ -861,7 +870,7 @@ RATEN_PROJECTION = {
 MAX_DB_FETCH = 1200
 MAX_RESULT_ANZEIGE = 50
 RESULTS_PRO_SEITE = 50
-DB_INSERT_BATCH_SIZE = 1000
+DB_INSERT_BATCH_SIZE = 2500
 
 
 @st.cache_data(ttl=120)
@@ -910,21 +919,35 @@ def ermittle_erste_spalte(df, kandidaten):
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
-    if 'Contract Number' not in out.columns:
-        contract_col = ermittle_erste_spalte(out, ['Contract number', 'Contract No', 'Contract Nr', 'Contract'])
-        if contract_col is not None:
-            out['Contract Number'] = out[contract_col]
+    def stelle_spalte_sicher(ziel, kandidaten, default=""):
+        if ziel in out.columns:
+            return
+        quelle = ermittle_erste_spalte(out, kandidaten)
+        if quelle is not None:
+            out[ziel] = out[quelle]
+        else:
+            out[ziel] = default
+
+    stelle_spalte_sicher('Carrier', ['Carrier'], default='Unbekannt')
+    stelle_spalte_sicher('Contract Number', ['Contract Number', 'Contract number', 'Contract No', 'Contract Nr', 'Contract'], default='Unbekannt')
+    stelle_spalte_sicher('Port of Loading', ['Port of Loading', 'POL', 'Port of Load', 'Origin'], default='Unbekannt')
+    stelle_spalte_sicher('Port of Destination', ['Port of Destination', 'POD', 'Destination'], default='Unbekannt')
+    stelle_spalte_sicher('Valid from', ['Valid from', 'Effective Date', 'Start Date'], default=None)
+    stelle_spalte_sicher('Valid to', ['Valid to', 'Expiry Date', 'Expiration Date', 'End Date'], default=None)
+
+    if '40HC' not in out.columns:
+        preis_col = ermittle_erste_spalte(out, ['40HC', '40HC All In', '40HC All In.1', '40HDRY'])
+        out['40HC'] = out[preis_col] if preis_col is not None else None
 
     if 'Currency' not in out.columns:
-        waehrung_col = ermittle_erste_spalte(out, ['Currency.4', 'Currency.3', 'Currency.2', 'Currency.1', 'Currency'])
-        if waehrung_col is not None:
-            out['Currency'] = out[waehrung_col]
+        waehrung_col = ermittle_erste_spalte(out, ['Currency.4', 'Currency.3', 'Currency.2', 'Currency.1', 'Currency', 'Currency.5'])
+        out['Currency'] = out[waehrung_col] if waehrung_col is not None else 'USD'
     elif '40HC' in out.columns and 'Currency.4' in out.columns:
         # Bei breiten Excel-Exports beschreibt Currency.4 i.d.R. die 40HC-Waehrung.
         out['Currency'] = out['Currency.4']
 
     if 'Remark' not in out.columns:
-        remark_col = ermittle_erste_spalte(out, ['Remarks', 'Remark / Notes', 'Notes'])
+        remark_col = ermittle_erste_spalte(out, ['Remark', 'Remarks', 'Remark / Notes', 'Notes'])
         out['Remark'] = out[remark_col] if remark_col is not None else ""
 
     if 'Included Prepaid Surcharges 40HC' not in out.columns:
@@ -932,7 +955,44 @@ def normalisiere_upload_dataframe(df_upload):
     if 'Included Collect Surcharges 40HC' not in out.columns:
         out['Included Collect Surcharges 40HC'] = ""
 
-    return out
+    out['40HC'] = out['40HC'].apply(parse_decimal_wert)
+    out = out[out['40HC'].notna()].copy()
+
+    if 'Valid from dt' in out.columns:
+        out['Valid from dt'] = pd.to_datetime(out['Valid from dt'], dayfirst=True, errors='coerce')
+    else:
+        out['Valid from dt'] = pd.to_datetime(out['Valid from'], dayfirst=True, errors='coerce')
+    if 'Valid to dt' in out.columns:
+        out['Valid to dt'] = pd.to_datetime(out['Valid to dt'], dayfirst=True, errors='coerce')
+    else:
+        out['Valid to dt'] = pd.to_datetime(out['Valid to'], dayfirst=True, errors='coerce')
+
+    out['Carrier'] = out['Carrier'].fillna('Unbekannt').astype(str).str.strip()
+    out['Contract Number'] = out['Contract Number'].fillna('Unbekannt').astype(str).str.strip()
+    out['Port of Loading'] = out['Port of Loading'].fillna('Unbekannt').astype(str).str.strip()
+    out['Port of Destination'] = out['Port of Destination'].fillna('Unbekannt').astype(str).str.strip()
+    out['Currency'] = out['Currency'].fillna('USD').astype(str).str.upper().str.strip()
+    out['Remark'] = out['Remark'].fillna('').astype(str)
+    out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].fillna('').astype(str)
+    out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].fillna('').astype(str)
+
+    ziel_spalten = [
+        'Carrier',
+        'Contract Number',
+        'Port of Loading',
+        'Port of Destination',
+        'Valid from',
+        'Valid to',
+        'Valid from dt',
+        'Valid to dt',
+        '40HC',
+        'Currency',
+        'Included Prepaid Surcharges 40HC',
+        'Included Collect Surcharges 40HC',
+        'Remark',
+    ]
+
+    return out[ziel_spalten]
 
 
 def speichere_dataframe_batchweise(df_upload):
@@ -940,13 +1000,15 @@ def speichere_dataframe_batchweise(df_upload):
     if total == 0:
         return 0
 
+    records = df_upload.to_dict('records')
+
     fortschritt = st.progress(0)
     status = st.empty()
     gespeichert = 0
 
     for start_idx in range(0, total, DB_INSERT_BATCH_SIZE):
         end_idx = min(start_idx + DB_INSERT_BATCH_SIZE, total)
-        batch_records = df_upload.iloc[start_idx:end_idx].to_dict('records')
+        batch_records = records[start_idx:end_idx]
         if not batch_records:
             continue
         collection.insert_many(batch_records, ordered=False)
