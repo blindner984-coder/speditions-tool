@@ -298,98 +298,115 @@ def lade_und_uebersetze_cached(file_name, file_bytes):
     # 2. EXCEL / CSV VERARBEITUNG (MAERSK & CO)
     # ==========================================
     else:
-        if datei.name.endswith('.xlsx'):
-            excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
-            ziel_sheet, header_idx = None, 0
-            for sheet_name, df_preview in excel_preview.items():
-                for i in range(len(df_preview)):
-                    if any(x in " ".join(df_preview.iloc[i].dropna().astype(str)) for x in ['40HDRY', 'Port of Destination', '40HC All In']):
-                        ziel_sheet, header_idx = sheet_name, i
-                        break
-                if ziel_sheet: break
-            df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
-        else:
-            df_raw = pd.read_csv(datei, header=None, low_memory=False)
-            header_idx = 0
+        try:
+            # FIX 1: Ignoriert Groß-/Kleinschreibung bei Endungen (.XLSX)
+            if datei.name.lower().endswith('.xlsx') or datei.name.lower().endswith('.xls'):
+                try:
+                    excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
+                except ImportError:
+                    return pd.DataFrame(), "FEHLENDES PAKET: 'openpyxl' fehlt. Bitte in die requirements.txt auf GitHub eintragen!"
+                except Exception as e:
+                    return pd.DataFrame(), f"Fehler beim Öffnen der Excel: {e}"
+                
+                ziel_sheet, header_idx = None, 0
+                for sheet_name, df_preview in excel_preview.items():
+                    for i in range(len(df_preview)):
+                        # Sicherstellen, dass alles Strings sind, bevor gesucht wird
+                        row_str = " ".join([str(x) for x in df_preview.iloc[i].dropna()])
+                        if any(x in row_str for x in ['40HDRY', 'Port of Destination', '40HC All In', '40HC']):
+                            ziel_sheet, header_idx = sheet_name, i
+                            break
+                    if ziel_sheet: break
+                df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
+            
+            # Falls es eine .csv ist
+            else:
+                df_raw = pd.read_csv(datei, header=None, low_memory=False)
+                header_idx = 0
+                for i in range(min(20, len(df_raw))):
+                    row_str = " ".join([str(x) for x in df_raw.iloc[i].dropna()])
+                    if any(x in row_str for x in ['40HDRY', '40HC All In', 'Port of Destination', '40HC']):
+                        header_idx = i; break
+
+            global_contract = "Unbekannt"
             for i in range(min(20, len(df_raw))):
-                if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
-                    header_idx = i; break
-
-        global_contract = "Unbekannt"
-        for i in range(min(20, len(df_raw))):
-            row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
-            for j, val in enumerate(row_vals):
-                v_low = val.lower()
-                if 'contract' in v_low:
-                    nums = re.findall(r'\b\d{6,10}\b', val)
-                    if nums:
-                        global_contract = nums[0]
-                        break
-                    for k in range(1, 4):
-                        if j + k < len(row_vals):
-                            next_val = row_vals[j+k].upper()
-                            next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
-                            if next_tokens:
-                                global_contract = next_tokens[0]
-                                break
+                row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
+                for j, val in enumerate(row_vals):
+                    v_low = val.lower()
+                    if 'contract' in v_low:
+                        nums = re.findall(r'\b\d{6,10}\b', val)
+                        if nums:
+                            global_contract = nums[0]
+                            break
+                        for k in range(1, 4):
+                            if j + k < len(row_vals):
+                                next_val = row_vals[j+k].upper()
+                                next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
+                                if next_tokens:
+                                    global_contract = next_tokens[0]
+                                    break
+                    if global_contract != "Unbekannt": break
                 if global_contract != "Unbekannt": break
-            if global_contract != "Unbekannt": break
 
-        if global_contract == "Unbekannt":
-            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
-                global_contract = fn_match.group(1)
+            if global_contract == "Unbekannt":
+                if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
+                    global_contract = fn_match.group(1)
 
-        rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
-        neue_spalten, gesehen = [], {}
-        for s in rohe_spalten:
-            if s in gesehen: 
-                gesehen[s] += 1
-                neue_spalten.append(f"{s}.{gesehen[s]}")
-            else: 
-                gesehen[s] = 0
-                neue_spalten.append(s)
-                
-        df_raw.columns = neue_spalten
-        df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
-        contract_col = next((c for c in df_raw.columns if any(x in c.lower() for x in ['contract', 'quote', 'reference'])), None)
-        
-        if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
-        if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
-
-        # 2A. MAERSK TENDER FORMAT (BAS / DDF / EBS)
-        if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
-            standard_rows = []
-            for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
-                bas_row = group[group['Charge'] == 'BAS']
-                if bas_row.empty: continue
-                val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
-                if len(val_raw) < 2: continue
-                
-                standard_rows.append({
-                    'Carrier': 'Maersk', 'Contract Number': global_contract, 
-                    'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
-                    '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
-                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
-                    'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
-                })
-            df_return = pd.DataFrame(standard_rows)
-            
-        # 2B. STANDARD EXPORT FORMAT (inkl. korrektem Currency-Match)
-        else:
-            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
-            
-            if '40HC' in neue_spalten:
-                idx_40hc = neue_spalten.index('40HC')
-                if idx_40hc + 1 < len(neue_spalten) and 'currency' in rohe_spalten[idx_40hc + 1].lower():
-                    df_raw['Currency'] = df_raw[neue_spalten[idx_40hc + 1]]
+            rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
+            neue_spalten, gesehen = [], {}
+            for s in rohe_spalten:
+                if s in gesehen: 
+                    gesehen[s] += 1
+                    neue_spalten.append(f"{s}.{gesehen[s]}")
+                else: 
+                    gesehen[s] = 0
+                    neue_spalten.append(s)
                     
-            df_return = df_raw
+            df_raw.columns = neue_spalten
+            df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
             
-        if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
-        if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
-        
-        return df_return, "Excel/CSV"
+            # Sicheres Auffinden der Contract-Spalte
+            contract_col = next((str(c) for c in df_raw.columns if any(x in str(c).lower() for x in ['contract', 'quote', 'reference'])), None)
+            
+            if 'Valid from' in df_raw.columns: df_raw['Valid from dt'] = pd.to_datetime(df_raw['Valid from'], dayfirst=True, errors='coerce').astype(str)
+            if 'Valid to' in df_raw.columns: df_raw['Valid to dt'] = pd.to_datetime(df_raw['Valid to'], dayfirst=True, errors='coerce').astype(str)
 
+            # 2A. MAERSK TENDER FORMAT (BAS / DDF / EBS)
+            if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
+                standard_rows = []
+                for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
+                    bas_row = group[group['Charge'] == 'BAS']
+                    if bas_row.empty: continue
+                    val_raw = str(bas_row['40HDRY'].values[0]).strip().split()
+                    if len(val_raw) < 2: continue
+                    
+                    standard_rows.append({
+                        'Carrier': 'Maersk', 'Contract Number': global_contract, 
+                        'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
+                        '40HC': float(val_raw[1].replace(',', '')), 'Currency': val_raw[0],
+                        'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
+                        'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
+                    })
+                df_return = pd.DataFrame(standard_rows)
+                
+            # 2B. STANDARD EXPORT FORMAT (inkl. korrektem Currency-Match)
+            else:
+                df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].astype(str).fillna("Unbekannt") if contract_col else "Unbekannt")
+                
+                if '40HC' in neue_spalten:
+                    idx_40hc = neue_spalten.index('40HC')
+                    if idx_40hc + 1 < len(neue_spalten) and 'currency' in rohe_spalten[idx_40hc + 1].lower():
+                        df_raw['Currency'] = df_raw[neue_spalten[idx_40hc + 1]]
+                        
+                df_return = df_raw
+                
+            if 'Valid from' in df_return.columns: df_return['Valid from dt'] = pd.to_datetime(df_return['Valid from'], dayfirst=True, errors='coerce').astype(str)
+            if 'Valid to' in df_return.columns: df_return['Valid to dt'] = pd.to_datetime(df_return['Valid to'], dayfirst=True, errors='coerce').astype(str)
+            
+            return df_return, "Excel/CSV"
+            
+        except Exception as e:
+            return pd.DataFrame(), f"Systemfehler beim Verarbeiten der Excel/CSV: {str(e)}"
 
 # === TAB 1 & 2 UI LOGIK ===
 tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
@@ -461,7 +478,7 @@ with tab_upload:
                         else:
                             st.error(f"❌ Keine Raten in '{datei.name}' gefunden. Grund: {format_name}")
                     except Exception as e: 
-                        st.error(f"❌ Schwerer Fehler bei '{datei.name}': {e}")
+                        st.error(f"❌ Unerwarteter Fehler bei '{datei.name}': {e}")
             
                 if alle_daten:
                     df_upload = pd.concat(alle_daten, ignore_index=True)
