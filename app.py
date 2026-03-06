@@ -474,19 +474,25 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
             via_pol = normalisiere_pol_text(via_pol_raw)
             via_hinweis = f"via POL {via_pol_raw}" if via_match else ""
 
-            route_rows.append({
-                'Carrier': 'MSC (aus PDF)',
-                'Contract Number': contract_no,
-                'Port of Loading': via_pol,
-                'Port of Destination': current_pod,
-                'Valid from': v_from,
-                'Valid to': v_to,
-                '40HC': rate_value,
-                'Currency': rate_currency,
-                'Included Prepaid Surcharges 40HC': baue_prepaid_string(via_pol_raw),
-                'Included Collect Surcharges 40HC': collect_str,
-                'Remark': f"Automatisch aus MSC Quote PDF importiert ({via_hinweis})".strip(),
-            })
+            # Multi-POL Zeilen (z.B. ANR/RTM) werden aufgeteilt, damit THC pro Hafen korrekt ist.
+            via_pol_einzeln = [p.strip() for p in via_pol.split('/') if p.strip()]
+            if not via_pol_einzeln:
+                via_pol_einzeln = [via_pol]
+
+            for einzel_pol in via_pol_einzeln:
+                route_rows.append({
+                    'Carrier': 'MSC (aus PDF)',
+                    'Contract Number': contract_no,
+                    'Port of Loading': einzel_pol,
+                    'Port of Destination': current_pod,
+                    'Valid from': v_from,
+                    'Valid to': v_to,
+                    '40HC': rate_value,
+                    'Currency': rate_currency,
+                    'Included Prepaid Surcharges 40HC': baue_prepaid_string(einzel_pol),
+                    'Included Collect Surcharges 40HC': collect_str,
+                    'Remark': f"Automatisch aus MSC Quote PDF importiert ({via_hinweis})".strip(),
+                })
 
     if route_rows:
         return route_rows
