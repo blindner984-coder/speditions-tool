@@ -9,6 +9,35 @@ import hmac
 import requests
 import pymongo
 from datetime import datetime, timezone
+from typing import List
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+
+# --- PYDANTIC-MODELLE FÜR STRUKTURIERTE EXTRAKTION ---
+class Surcharge(BaseModel):
+    code: str = Field(description="Abkürzung des Zuschlags (z.B. THC, BAF, PSS, ETS)")
+    amount: float = Field(description="Betrag des Zuschlags als Zahl")
+    currency: str = Field(description="Währung (USD oder EUR)")
+
+
+class FreightRate(BaseModel):
+    carrier: str = Field(description="Name der Reederei, die das Angebot erstellt hat (z.B. MSC, Hapag-Lloyd, Maersk, etc.)")
+    contract_number: str = Field(description="Vertragsnummer, z.B. R45925010000228")
+    port_of_loading: str = Field(description="Ladehafen (POL). Darf nur EIN Hafen sein.")
+    port_of_destination: str = Field(description="Zielhafen (POD). Darf nur EIN Hafen sein.")
+    valid_from: str = Field(description="Gültig ab, Format DD.MM.YYYY")
+    valid_to: str = Field(description="Gültig bis, Format DD.MM.YYYY")
+    rate_40hc: float = Field(description="Basisfrachtrate für 40'DV/HC")
+    currency: str = Field(description="Währung der Basisrate, meist USD")
+    prepaid_surcharges: List[Surcharge] = Field(description="Zuschläge am Origin und Seefracht-Zuschläge (Prepaid)")
+    collect_surcharges: List[Surcharge] = Field(description="Zuschläge am Zielort (Destination / Collect)")
+    remark: str = Field(description="Bemerkungen oder Besonderheiten")
+
+
+class ExtractionResponse(BaseModel):
+    rates: List[FreightRate]
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -52,6 +81,7 @@ def hole_konfiguration(key, default=None):
 # --- MONGODB ANBINDUNG ---
 MONGO_URI = hole_konfiguration("MONGO_URI")
 ADMIN_PASSWORD = hole_konfiguration("ADMIN_PASSWORD")
+GEMINI_API_KEY = hole_konfiguration("GEMINI_API_KEY")
 
 if not MONGO_URI:
     st.error("Sicherheits-Konfiguration fehlt: Bitte MONGO_URI als Secret oder Umgebungsvariable setzen.")
@@ -194,7 +224,85 @@ def extrahiere_pol_tokens(pol_text):
     return set(teile)
 
 
+_SYSTEM_PROMPT = """
+Du bist ein Experte für die Analyse von Seefrachtdokumenten.
+Extrahiere alle Frachtraten aus dem folgenden Reederei-Angebot (z.B. MSC, Hapag-Lloyd, Maersk etc.) strukturiert.
+
+Regeln:
+1. Ein FreightRate-Objekt pro POL-POD-Kombination: Jede einzigartige Kombination aus
+   Port of Loading (POL) und Port of Discharge (POD) ergibt ein EIGENES FreightRate-Objekt.
+   Beispiel: 4 POLs × 2 PODs = 8 FreightRate-Objekte.
+   WICHTIG: Wenn das Dokument mehrere PODs auflistet (z.B. Jeddah und Aqaba), müssen für
+   JEDEN POD separate FreightRate-Objekte erstellt werden – auch wenn der POL derselbe ist.
+2. Surcharges filtern: Priorisiere Zuschläge für 40' Container. Ignoriere Zuschläge nur für 20'.
+3. Monatswerte: Wenn es für einen Zuschlag (z. B. ETS, BAF) mehrere Beträge für verschiedene
+   Monate gibt, nimm immer den neuesten/aktuellsten Wert.
+4. Collect vs. Prepaid: Destination Charges und als 'Collect' markierte Gebühren kommen in
+   collect_surcharges. Origin- und Seefracht-Zuschläge kommen in prepaid_surcharges.
+5. Datumsformat: Immer DD.MM.YYYY.
+6. Gib ausschließlich valides JSON zurück, das dem vorgegebenen Schema entspricht.
+"""
+
+
 def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
+    """Extrahiert MSC-Quote-Daten per Google Gemini Structured Outputs (Pydantic).
+    Fällt auf None zurück, wenn kein API-Key gesetzt ist oder die Extraktion fehlschlägt.
+    """
+    print(f"[GEMINI] Funktion aufgerufen. Key gesetzt: {bool(GEMINI_API_KEY)}", flush=True)
+    st.info(f"🔑 Gemini-Key gesetzt: {bool(GEMINI_API_KEY)}")
+    if not GEMINI_API_KEY:
+        st.warning("GEMINI_API_KEY ist nicht gesetzt – PDF-Extraktion via LLM nicht verfügbar.")
+        return None
+
+    if not str(text).strip():
+        return None
+
+    try:
+        print("[GEMINI] Starte API-Aufruf...", flush=True)
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=_SYSTEM_PROMPT + "\n\nPDF TEXT:\n" + str(text),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ExtractionResponse,
+                temperature=0.1,
+            ),
+        )
+        result = ExtractionResponse.model_validate_json(response.text)
+        print(f"[GEMINI DEBUG] {len(result.rates)} Raten extrahiert: {[(r.port_of_loading, r.port_of_destination) for r in result.rates]}", flush=True)
+        st.info(f"🤖 Gemini: {len(result.rates)} Rate(n) → {[r.port_of_destination for r in result.rates]}")
+        if not result.rates:
+            return None
+
+        return [
+            {
+                "Carrier": rate.carrier,
+                "Contract Number": rate.contract_number,
+                "Port of Loading": rate.port_of_loading,
+                "Port of Destination": rate.port_of_destination,
+                "Valid from": rate.valid_from,
+                "Valid to": rate.valid_to,
+                "40HC": rate.rate_40hc,
+                "Currency": rate.currency,
+                "Included Prepaid Surcharges 40HC": ", ".join(
+                    [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.prepaid_surcharges]
+                ),
+                "Included Collect Surcharges 40HC": ", ".join(
+                    [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.collect_surcharges]
+                ),
+                "Remark": rate.remark,
+            }
+            for rate in result.rates
+        ]
+    except Exception as e:
+        print(f"[GEMINI ERROR] {e}", flush=True)
+        st.error(f"Gemini-Extraktion fehlgeschlagen: {e}")
+        return None
+
+
+def _UNUSED_extrahiere_msc_quote_pdf_daten_legacy(text, monatswert_modus="neu"):
+    """Alte Regex-basierte Implementierung – nur als Fallback-Referenz behalten."""
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in str(text).splitlines() if ln and ln.strip()]
     if not lines:
         return None
@@ -999,6 +1107,14 @@ def speichere_dataframe_batchweise(df_upload):
     total = len(df_upload)
     if total == 0:
         return 0
+
+    for col in df_upload.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_upload[col]):
+            df_upload[col] = [
+                v.to_pydatetime().replace(tzinfo=timezone.utc) if pd.notna(v) else None
+                for v in df_upload[col]
+            ]
+    df_upload = df_upload.astype(object).where(pd.notna(df_upload), None)
 
     records = df_upload.to_dict('records')
 
