@@ -5,3 +5,5 @@ pymongo
 requests
 openpyxl
 dnspython
+google-genai
+pydantic
