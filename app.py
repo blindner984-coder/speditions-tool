@@ -932,12 +932,12 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             except Exception:
                 pass
 
-            # --- Tiefen-Scan: Kopfzeile in den ersten 20 Zeilen suchen ---
+            # --- Tiefen-Scan: Kopfzeile in den ersten 60 Zeilen suchen ---
             datei.seek(0)
-            excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
+            excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=60)
             ziel_sheet, header_idx = None, 0
             for sheet_name, df_preview in excel_preview.items():
-                for i in range(len(df_preview)):
+                for i in range(min(60, len(df_preview))):
                     zeile_werte = df_preview.iloc[i].dropna().astype(str).tolist()
                     # Fuzzy-Erkennung: Zeile muss mind. 2 bekannte Spaltenbezeichnungen enthalten
                     if zeile_hat_bekannte_spalten(zeile_werte, min_treffer=2):
@@ -955,7 +955,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             datei.seek(0)
             df_raw = pd.read_csv(datei, header=None, low_memory=False)
             header_idx = 0
-            for i in range(min(20, len(df_raw))):
+            for i in range(min(60, len(df_raw))):
                 zeile_werte = df_raw.iloc[i].dropna().astype(str).tolist()
                 if zeile_hat_bekannte_spalten(zeile_werte, min_treffer=2):
                     header_idx = i
@@ -965,7 +965,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         global_contract = "Unbekannt"
 
         # 1. Gezielt nach "Contract" in den Vorkopf-Zeilen suchen
-        for i in range(min(20, len(df_raw))):
+        for i in range(min(60, len(df_raw))):
             row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
             for j, val in enumerate(row_vals):
                 v_low = val.lower()
@@ -992,6 +992,14 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 global_contract = fn_match.group(1)
 
         # --- Header setzen und doppelte Spaltennamen auflösen ---
+        # df_raw vollständig neu einlesen, damit alle Zeilen nach dem Header verfügbar sind
+        if datei.name.lower().endswith('.xlsx'):
+            datei.seek(0)
+            df_raw = pd.read_excel(
+                datei,
+                sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0],
+                header=None,
+            )
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
         for s in rohe_spalten:
