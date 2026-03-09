@@ -1587,12 +1587,24 @@ with tab_upload:
                 if alle_daten:
                     try:
                         df_upload = pd.concat(alle_daten, ignore_index=True)
+
+                        # === DIAGNOSE: Zeige Spalten und erste Zeilen VOR Normalisierung ===
+                        with st.expander("🔍 Debug: Rohdaten vor Normalisierung", expanded=False):
+                            st.write(f"Zeilen gesamt: {len(df_upload)} | Spalten: {list(df_upload.columns)}")
+                            st.dataframe(df_upload.head(10))
+
                         df_upload = normalisiere_upload_dataframe(df_upload)
+
+                        # === DIAGNOSE: Zeige was nach Normalisierung übrig bleibt ===
+                        with st.expander("🔍 Debug: Daten nach Normalisierung", expanded=False):
+                            st.write(f"Zeilen nach Normalisierung: {len(df_upload)}")
+                            if not df_upload.empty:
+                                st.dataframe(df_upload.head(10))
+
                         df_upload['createdAt'] = datetime.now(timezone.utc)
 
                         gespeichert = speichere_dataframe_batchweise(df_upload)
 
-                        # HIER IST DER ZWEITE FIX: Fehlermeldung bei 0 Zeilen!
                         if gespeichert > 0:
                             lade_raten_aus_db.clear()
                             st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
