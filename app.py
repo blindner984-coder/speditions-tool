@@ -77,13 +77,14 @@ COLUMN_ALIASES: dict = {
     "Valid to": [
         "Valid to", "Valid To", "Expiry Date", "Expiration Date",
         "End Date", "Validity To", "Rate Valid To", "To Date", "Date To",
-        "Not Beyond", "Expiry", "End",
+        "Not Beyond", "Expiry", "End", "Valid until", "Valid Until",
     ],
     "40HC": [
         "40HC", "40HC All In", "40HC All In.1", "40HDRY",
         "40' HC", "40'HC", "40HC Rate", "40 HC", "40DV/HC",
         "40HQ", "40' HQ", "Rate 40HC", "Rate 40HQ", "40H",
-        "40 DRY", "40DRY",
+        "40 DRY", "40DRY", "O/F", "OF", "Ocean Freight", "Base Rate",
+        "40'rates", "40'rate", "current rate", "new rate", "Rate",
     ],
     "Currency": [
         "Currency", "Currency.1", "Currency.2", "Currency.3",
@@ -1572,8 +1573,13 @@ with tab_upload:
                                 datei_bytes,
                                 monatswert_modus=monatswert_modus,
                             )
+
+                            # HIER IST DER FIX: Zeige Fehler an, wenn das DF leer ist!
                             if not df_teil.empty:
                                 alle_daten.append(df_teil)
+                            else:
+                                st.warning(f"⚠️ {datei.name} übersprungen: {format_name}")
+
                         except Exception as e:
                             st.error(f"Fehler bei {datei.name}: {e}")
 
@@ -1581,20 +1587,26 @@ with tab_upload:
 
                     file_progress.empty()
                     file_status.empty()
-                
-                    if alle_daten:
-                        try:
-                            df_upload = pd.concat(alle_daten, ignore_index=True)
-                            df_upload = normalisiere_upload_dataframe(df_upload)
-                            df_upload['createdAt'] = datetime.now(timezone.utc)
 
-                            gespeichert = speichere_dataframe_batchweise(df_upload)
-                            if gespeichert > 0:
-                                lade_raten_aus_db.clear()
-                                st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
-                                st.balloons()
-                        except Exception as e:
-                            st.error(f"Fehler beim Speichern in MongoDB: {e}")
+                if alle_daten:
+                    try:
+                        df_upload = pd.concat(alle_daten, ignore_index=True)
+                        df_upload = normalisiere_upload_dataframe(df_upload)
+                        df_upload['createdAt'] = datetime.now(timezone.utc)
+
+                        gespeichert = speichere_dataframe_batchweise(df_upload)
+
+                        # HIER IST DER ZWEITE FIX: Fehlermeldung bei 0 Zeilen!
+                        if gespeichert > 0:
+                            lade_raten_aus_db.clear()
+                            st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
+                            st.balloons()
+                        else:
+                            st.error("❌ Keine Raten gespeichert! Die Dateien wurden zwar gelesen, enthielten aber keine gültigen Raten (es fehlt POL, POD oder ein Preis).")
+                    except Exception as e:
+                        st.error(f"Fehler beim Speichern in MongoDB: {e}")
+                else:
+                    st.error("❌ Keine der hochgeladenen Dateien enthielt verwertbare Daten.")
         
         # --- GEFAHRENZONE (DATENBANK LEEREN) ---
         st.markdown("---")
