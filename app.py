@@ -248,8 +248,6 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
     """Extrahiert MSC-Quote-Daten per Google Gemini Structured Outputs (Pydantic).
     Fällt auf None zurück, wenn kein API-Key gesetzt ist oder die Extraktion fehlschlägt.
     """
-    print(f"[GEMINI] Funktion aufgerufen. Key gesetzt: {bool(GEMINI_API_KEY)}", flush=True)
-    st.info(f"🔑 Gemini-Key gesetzt: {bool(GEMINI_API_KEY)}")
     if not GEMINI_API_KEY:
         st.warning("GEMINI_API_KEY ist nicht gesetzt – PDF-Extraktion via LLM nicht verfügbar.")
         return None
@@ -258,7 +256,6 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
         return None
 
     try:
-        print("[GEMINI] Starte API-Aufruf...", flush=True)
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
@@ -270,8 +267,6 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
             ),
         )
         result = ExtractionResponse.model_validate_json(response.text)
-        print(f"[GEMINI DEBUG] {len(result.rates)} Raten extrahiert: {[(r.port_of_loading, r.port_of_destination) for r in result.rates]}", flush=True)
-        st.info(f"🤖 Gemini: {len(result.rates)} Rate(n) → {[r.port_of_destination for r in result.rates]}")
         if not result.rates:
             return None
 
@@ -296,7 +291,6 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
             for rate in result.rates
         ]
     except Exception as e:
-        print(f"[GEMINI ERROR] {e}", flush=True)
         st.error(f"Gemini-Extraktion fehlgeschlagen: {e}")
         return None
 
