@@ -261,7 +261,7 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
         print("[GEMINI] Starte API-Aufruf...", flush=True)
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model="gemini-2.0-flash-001",
             contents=_SYSTEM_PROMPT + "\n\nPDF TEXT:\n" + str(text),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
