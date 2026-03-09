@@ -1314,12 +1314,15 @@ def normalisiere_upload_dataframe(df_upload):
         preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
         out['40HC'] = out[preis_col] if preis_col is not None else None
 
+    # FMS Fallback für Währung: Wenn keine Currency Spalte da ist, aber ein Preis da ist, nimm USD an
     if 'Currency' not in out.columns:
         waehrung_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Currency'])
         out['Currency'] = out[waehrung_col] if waehrung_col is not None else 'USD'
     elif '40HC' in out.columns and 'Currency.4' in out.columns:
-        # Bei breiten Excel-Exports beschreibt Currency.4 i.d.R. die 40HC-Währung.
         out['Currency'] = out['Currency.4']
+    else:
+        # Manchmal ist die Währung leer, dann Standard auf USD
+        out['Currency'] = out['Currency'].fillna('USD')
 
     if 'Remark' not in out.columns:
         remark_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Remark'])
@@ -1330,10 +1333,11 @@ def normalisiere_upload_dataframe(df_upload):
     if 'Included Collect Surcharges 40HC' not in out.columns:
         out['Included Collect Surcharges 40HC'] = ""
 
+    # === ROBUSTE PREIS-UMWANDLUNG ===
+    # Fehlerhafte Werte werden zu NaN, aber wir werfen die Zeilen erst ganz am Schluss weg
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
-    # Zeilen ohne gültige Basisfracht entfernen
-    out = out[out['40HC'].notna()].copy()
 
+    # Datums-Konvertierung (Robuster gemacht)
     if 'Valid from dt' in out.columns:
         out['Valid from dt'] = pd.to_datetime(out['Valid from dt'], dayfirst=True, errors='coerce')
     else:
@@ -1343,6 +1347,7 @@ def normalisiere_upload_dataframe(df_upload):
     else:
         out['Valid to dt'] = pd.to_datetime(out['Valid to'], dayfirst=True, errors='coerce')
 
+    # Bereinigung der Strings
     out['Carrier'] = out['Carrier'].fillna('Unbekannt').astype(str).str.strip()
     out['Contract Number'] = out['Contract Number'].fillna('Unbekannt').astype(str).str.strip()
     out['Port of Loading'] = out['Port of Loading'].fillna('Unbekannt').astype(str).str.strip()
@@ -1352,30 +1357,22 @@ def normalisiere_upload_dataframe(df_upload):
     out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].fillna('').astype(str)
     out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].fillna('').astype(str)
 
-    # --- Zeilen-Validierung: Pflichtfelder POL und POD müssen befüllt sein ---
-    # Zeilen, bei denen Ladehafen ODER Zielhafen fehlen, werden verworfen.
+    # --- HÄRTERE ZEILEN-VALIDIERUNG ---
+    # Wir löschen erst GANZ ZUM SCHLUSS die Zeilen, die wirklich unbrauchbar sind.
     ungueltige_werte = {'UNBEKANNT', 'NAN', 'NONE', ''}
-    out = out[
-        ~(
-            out['Port of Loading'].str.strip().str.upper().isin(ungueltige_werte)
-            | out['Port of Destination'].str.strip().str.upper().isin(ungueltige_werte)
-        )
-    ].copy()
+
+    # Behalte nur Zeilen, die einen validen Preis (notna) UND einen POL UND einen POD haben
+    mask_preis_ok = out['40HC'].notna()
+    mask_pol_ok = ~out['Port of Loading'].str.strip().str.upper().isin(ungueltige_werte)
+    mask_pod_ok = ~out['Port of Destination'].str.strip().str.upper().isin(ungueltige_werte)
+
+    out = out[mask_preis_ok & mask_pol_ok & mask_pod_ok].copy()
 
     ziel_spalten = [
-        'Carrier',
-        'Contract Number',
-        'Port of Loading',
-        'Port of Destination',
-        'Valid from',
-        'Valid to',
-        'Valid from dt',
-        'Valid to dt',
-        '40HC',
-        'Currency',
-        'Included Prepaid Surcharges 40HC',
-        'Included Collect Surcharges 40HC',
-        'Remark',
+        'Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination',
+        'Valid from', 'Valid to', 'Valid from dt', 'Valid to dt',
+        '40HC', 'Currency', 'Included Prepaid Surcharges 40HC',
+        'Included Collect Surcharges 40HC', 'Remark'
     ]
 
     return out[ziel_spalten]
