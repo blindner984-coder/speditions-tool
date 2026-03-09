@@ -864,7 +864,8 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
 def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
-    
+
+    # === PDF VERARBEITUNG ===
     if datei.name.lower().endswith('.pdf'):
         try:
             reader = PyPDF2.PdfReader(datei)
@@ -919,37 +920,44 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             return df_pdf, "PDF"
         except Exception as e: return pd.DataFrame(), f"Fehler: {e}"
 
+    # === EXCEL / CSV VERARBEITUNG ===
     else:
-        # xlsx_preprocessed = True bedeutet: df_raw hat bereits standardisierte Spalten
-        # und global_contract ist gesetzt. Der nachgelagerte Header-/Standardisierungs-Code
-        # wird dann übersprungen.
-        xlsx_preprocessed = False
+        df_raw = pd.DataFrame()
+        global_contract = "Unbekannt"
 
         if datei.name.lower().endswith('.xlsx'):
-            # --- Schneller Pfad: Header direkt in Zeile 1, erstes Sheet ---
+            # --- 1. Schneller Pfad versuchen ---
             datei.seek(0)
             try:
                 df_fast = pd.read_excel(datei, sheet_name=0)
                 df_fast_std = standardisiere_spalten(df_fast)
                 if 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
-                    return df_fast_std, "Excel/CSV"
+                    if 'Contract Number' not in df_fast_std.columns:
+                        if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
+                            df_fast_std['Contract Number'] = fn_match.group(1)
+                    return df_fast_std, "Excel (Schnell)"
             except Exception:
                 pass
 
-            # --- Multi-Sheet-Verarbeitung: Alle Tabs komplett einlesen ---
+            # --- 2. Multi-Sheet Verarbeitung (Tiefen-Scan) ---
             datei.seek(0)
-            excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
+            try:
+                excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
+            except Exception as e:
+                return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
+
             alle_sheets_dfs = []
-            global_contract = "Unbekannt"
 
             for sheet_name, df_sheet in excel_dict.items():
-                # Contract Number aus den Metadaten-Zeilen dieses Sheets suchen
-                # (wird nur überschrieben, solange noch nicht gefunden)
+                if df_sheet.empty:
+                    continue
+
+                # A. Contract Number in den ersten 60 Zeilen suchen (nur wenn noch nicht gefunden)
                 if global_contract == "Unbekannt":
                     for i in range(min(60, len(df_sheet))):
                         row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
                         for j, val in enumerate(row_vals):
-                            if 'contract' in val.lower():
+                            if 'contract' in val.lower() or 'quote' in val.lower():
                                 nums = re.findall(r'\b\d{6,10}\b', val)
                                 if nums:
                                     global_contract = nums[0]
@@ -965,20 +973,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if global_contract != "Unbekannt":
                             break
 
-                # Header-Zeile im aktuellen Sheet in den ersten 60 Zeilen suchen
+                # B. Header-Zeile suchen
                 sheet_header_idx = None
                 for i in range(min(60, len(df_sheet))):
-                    if zeile_hat_bekannte_spalten(
-                        df_sheet.iloc[i].dropna().astype(str).tolist(), min_treffer=2
-                    ):
+                    if zeile_hat_bekannte_spalten(df_sheet.iloc[i].dropna().astype(str).tolist(), min_treffer=2):
                         sheet_header_idx = i
                         break
 
-                # Sheet ohne erkennbaren Header → überspringen (kein Silent Failure)
+                # Wenn kein Header gefunden wurde, ignoriere dieses Sheet
                 if sheet_header_idx is None:
                     continue
 
-                # Spaltennamen setzen und Duplikate auflösen
+                # C. Spaltennamen setzen und bereinigen
                 rohe = df_sheet.iloc[sheet_header_idx].astype(str).str.strip().tolist()
                 neu, gesehen = [], {}
                 for s in rohe:
@@ -989,43 +995,42 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         gesehen[s] = 0
                         neu.append(s)
 
-                df_sheet = df_sheet.copy()
-                df_sheet.columns = neu
-                df_sheet = df_sheet.iloc[sheet_header_idx + 1:].reset_index(drop=True)
+                df_clean = df_sheet.copy()
+                df_clean.columns = neu
+                df_clean = df_clean.iloc[sheet_header_idx + 1:].reset_index(drop=True)
 
-                # Spalten per Fuzzy-Matching einheitlich umbenennen
-                df_sheet = standardisiere_spalten(df_sheet)
-                alle_sheets_dfs.append(df_sheet)
+                # D. Spalten umbenennen
+                df_clean = standardisiere_spalten(df_clean)
 
-            # Fallback: Contract Number aus Dateinamen
-            if global_contract == "Unbekannt":
-                if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
-                    global_contract = fn_match.group(1)
+                # E. Nur anhängen, wenn 40HC-Spalte vorhanden
+                if '40HC' in df_clean.columns:
+                    alle_sheets_dfs.append(df_clean)
 
-            # Kein einziger Tab mit verwertbarem Header → leeren DataFrame zurückgeben
             if not alle_sheets_dfs:
-                return pd.DataFrame(), "Keine verwertbaren Tabs gefunden"
+                return pd.DataFrame(), "Keine verwertbaren Raten (40HC) in den Tabs gefunden."
 
-            # Alle gültigen Sheets zusammenführen
             df_raw = pd.concat(alle_sheets_dfs, ignore_index=True)
-            xlsx_preprocessed = True
 
-        else:
-            # --- CSV-Pfad: einzelne Datei, Header in den ersten 60 Zeilen suchen ---
+        elif datei.name.lower().endswith('.csv'):
+            # --- CSV Verarbeitung ---
             datei.seek(0)
-            df_raw = pd.read_csv(datei, header=None, low_memory=False)
-            header_idx = 0
-            for i in range(min(60, len(df_raw))):
-                zeile_werte = df_raw.iloc[i].dropna().astype(str).tolist()
-                if zeile_hat_bekannte_spalten(zeile_werte, min_treffer=2):
+            try:
+                df_csv = pd.read_csv(datei, header=None, low_memory=False)
+            except Exception as e:
+                return pd.DataFrame(), f"Fehler beim Lesen der CSV: {e}"
+
+            header_idx = None
+            for i in range(min(60, len(df_csv))):
+                if zeile_hat_bekannte_spalten(df_csv.iloc[i].dropna().astype(str).tolist(), min_treffer=2):
                     header_idx = i
                     break
 
-        if not xlsx_preprocessed:
-            # --- Contract Number aus Metadaten-Zeilen extrahieren (CSV) ---
-            global_contract = "Unbekannt"
-            for i in range(min(60, len(df_raw))):
-                row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
+            if header_idx is None:
+                return pd.DataFrame(), "Kein gültiger Header in CSV gefunden."
+
+            # Contract Number suchen
+            for i in range(min(60, len(df_csv))):
+                row_vals = df_csv.iloc[i].dropna().astype(str).tolist()
                 for j, val in enumerate(row_vals):
                     if 'contract' in val.lower():
                         nums = re.findall(r'\b\d{6,10}\b', val)
@@ -1043,12 +1048,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if global_contract != "Unbekannt":
                     break
 
-            if global_contract == "Unbekannt":
-                if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
-                    global_contract = fn_match.group(1)
-
-            # --- Header setzen und doppelte Spaltennamen auflösen ---
-            rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
+            rohe_spalten = df_csv.iloc[header_idx].astype(str).str.strip().tolist()
             neue_spalten, gesehen = [], {}
             for s in rohe_spalten:
                 if s in gesehen:
@@ -1058,14 +1058,21 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     gesehen[s] = 0
                     neue_spalten.append(s)
 
-            df_raw.columns = neue_spalten
-            df_raw = df_raw.iloc[header_idx + 1:].reset_index(drop=True)
-
-            # --- Spalten per Fuzzy-Matching einheitlich umbenennen ---
+            df_csv.columns = neue_spalten
+            df_raw = df_csv.iloc[header_idx + 1:].reset_index(drop=True)
             df_raw = standardisiere_spalten(df_raw)
 
-        # --- Maersk-Gruppenformat erkennen: Charge-Zeilen mit Basisfrachtzeile (BAS) ---
-        # Erkennungsmerkmal: eine 'Charge'-Spalte plus die Standardpreis-Spalte '40HC'
+        # === NACHBEREITUNG FÜR BEIDE (EXCEL & CSV) ===
+
+        if df_raw.empty:
+            return pd.DataFrame(), "Datei ist leer nach der Verarbeitung."
+
+        # Fallback auf Dateinamen für Contract
+        if global_contract == "Unbekannt":
+            if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
+                global_contract = fn_match.group(1)
+
+        # --- Maersk-Format Check ---
         charge_col = ermittle_erste_spalte(df_raw, ['Charge', 'Charge Code', 'Charge Type', 'Chrg'])
         ist_maersk_format = (
             charge_col is not None
@@ -1075,21 +1082,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         )
 
         if ist_maersk_format:
-            # Datums-Spalten nach Standardisierung ermitteln
             eff_col = 'Valid from' if 'Valid from' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid from'])
             exp_col = 'Valid to' if 'Valid to' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid to'])
             tt_col = ermittle_erste_spalte(df_raw, ['Transit Time', 'Transit Days', 'TT'])
 
-            group_cols = [
-                c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col]
-                if c and c in df_raw.columns
-            ]
+            group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
 
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
                 bas_row = group[group[charge_col] == 'BAS']
                 if bas_row.empty:
                     continue
+
                 bas_text = str(bas_row['40HC'].values[0]).strip()
                 waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
                 if basis_betrag is None or basis_betrag <= 0:
@@ -1116,22 +1120,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if ' ' in str(r['40HC'])
                     ]),
                     'Included Collect Surcharges 40HC': "",
-                    'Remark': (
-                        f"Transit Time: {bas_row[tt_col].values[0]}"
-                        if tt_col and tt_col in bas_row.columns
-                        else ""
-                    ),
+                    'Remark': f"Transit Time: {bas_row[tt_col].values[0]}" if tt_col and tt_col in bas_row.columns else "",
                 })
             df_return = pd.DataFrame(standard_rows)
         else:
-            # Allgemeiner Pfad: Contract Number setzen
+            # Setze Contract Number für alle anderen Carrier
             if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
                 df_raw['Contract Number'] = global_contract
             elif global_contract != "Unbekannt":
                 df_raw['Contract Number'] = global_contract
             df_return = df_raw
 
-        return df_return, "Excel/CSV"
+        return df_return, "Excel/CSV (Multi-Sheet)"
 
 
 RATEN_PROJECTION = {
