@@ -1003,8 +1003,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 # D. Spalten umbenennen
                 df_clean = standardisiere_spalten(df_clean)
 
-                # E. An Liste anhängen (die Preis-Prüfung machen wir später)
-                alle_sheets_dfs.append(df_clean)
+                # E. Nur anhängen wenn Preis-Spalte UND mindestens eine Port-Spalte vorhanden
+                # (filtert Analytics-Sheets raus, die z.B. "40HC" als Zellen-Wert haben aber keine POL/POD)
+                hat_preis = '40HC' in df_clean.columns
+                hat_port  = ('Port of Loading' in df_clean.columns
+                             or 'Port of Destination' in df_clean.columns)
+                if hat_preis and hat_port:
+                    alle_sheets_dfs.append(df_clean)
 
             if not alle_sheets_dfs:
                 return pd.DataFrame(), "Keine verwertbaren Raten (40HC) in den Tabs gefunden."
