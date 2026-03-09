@@ -1132,7 +1132,7 @@ def speichere_dataframe_batchweise(df_upload):
 
 
 # --- TABS FÜR UI ---
-tab_suche, tab_upload = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)"])
+tab_suche, tab_upload, tab_analytics = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)", "📈 Analytics"])
 
 # === TAB 1: SUCHEN ===
 with tab_suche:
@@ -1328,3 +1328,35 @@ with tab_upload:
             st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
     else:
         st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
+
+# === TAB 3: ANALYTICS ===
+with tab_analytics:
+    st.write("### 📈 Preisentwicklung einer Route")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        analytics_pol = st.text_input("Port of Loading (POL)", placeholder="z.B. Hamburg", key="analytics_pol")
+    with col_b:
+        analytics_pod = st.text_input("Port of Destination (POD)", placeholder="z.B. Jeddah", key="analytics_pod")
+
+    if st.button("📊 Trend analysieren", type="primary"):
+        if not analytics_pol.strip() or not analytics_pod.strip():
+            st.warning("Bitte POL und POD eingeben.")
+        else:
+            df_trend = lade_raten_aus_db(such_pol=analytics_pol.strip(), such_pod=analytics_pod.strip())
+            if df_trend.empty:
+                st.warning(f"Keine Daten gefunden für {analytics_pol} → {analytics_pod}.")
+            else:
+                df_trend['Valid from dt'] = pd.to_datetime(df_trend.get('Valid from dt', df_trend.get('Valid from')), dayfirst=True, errors='coerce')
+                df_trend = df_trend.dropna(subset=['Valid from dt', '40HC'])
+                if df_trend.empty:
+                    st.warning("Keine verwertbaren Datensätze (fehlende Datum- oder Preisangaben).")
+                else:
+                    df_trend['All-In EUR'] = df_trend.apply(
+                        lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name),
+                        axis=1
+                    )
+                    df_trend = df_trend.sort_values('Valid from dt')
+                    df_chart = df_trend.set_index('Valid from dt')[['All-In EUR']]
+                    st.line_chart(df_chart)
+                    durchschnitt = df_trend['All-In EUR'].mean()
+                    st.caption(f"Durchschnittlicher All-In Preis ({analytics_pol} → {analytics_pod}): **{durchschnitt:.2f} EUR** über {len(df_trend)} Einträge")
