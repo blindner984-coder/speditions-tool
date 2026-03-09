@@ -1588,18 +1588,42 @@ with tab_upload:
                     try:
                         df_upload = pd.concat(alle_daten, ignore_index=True)
 
-                        # === DIAGNOSE: Zeige Spalten und erste Zeilen VOR Normalisierung ===
-                        with st.expander("🔍 Debug: Rohdaten vor Normalisierung", expanded=False):
-                            st.write(f"Zeilen gesamt: {len(df_upload)} | Spalten: {list(df_upload.columns)}")
-                            st.dataframe(df_upload.head(10))
+                        # === DIAGNOSE VOR NORMALISIERUNG ===
+                        with st.expander("🔍 Debug: Rohdaten vor Normalisierung", expanded=True):
+                            st.write(f"**Zeilen gesamt:** {len(df_upload)}")
+                            # Zeige welche Standard-Spalten schon vorhanden sind
+                            ziel_cols = ['Port of Loading', 'Port of Destination', '40HC', 'Valid from', 'Valid to', 'Carrier', 'Contract Number', 'Currency']
+                            gefunden = [c for c in ziel_cols if c in df_upload.columns]
+                            fehlend  = [c for c in ziel_cols if c not in df_upload.columns]
+                            st.write(f"**Standard-Spalten gefunden:** {gefunden}")
+                            st.write(f"**Standard-Spalten FEHLEN (werden per Fuzzy gesucht):** {fehlend}")
+                            st.write(f"**Alle Spalten in der Datei:** {list(df_upload.columns)}")
+                            st.dataframe(df_upload.head(5))
+
+                        df_norm = df_upload.copy()
+                        # Zeige was Fuzzy-Matching für POL/POD/40HC findet
+                        with st.expander("🔍 Debug: Fuzzy-Matching Ergebnis", expanded=True):
+                            for key in ['Port of Loading', 'Port of Destination', '40HC']:
+                                if key not in df_norm.columns:
+                                    treffer = ermittle_erste_spalte(df_norm, COLUMN_ALIASES[key])
+                                    st.write(f"**{key}** → Fuzzy-Treffer: `{treffer}` | Werte: {list(df_norm[treffer].dropna().head(5)) if treffer else 'NICHT GEFUNDEN'}")
+                                else:
+                                    st.write(f"**{key}** → bereits als Spalte vorhanden | Werte: {list(df_norm[key].dropna().head(5))}")
 
                         df_upload = normalisiere_upload_dataframe(df_upload)
 
-                        # === DIAGNOSE: Zeige was nach Normalisierung übrig bleibt ===
-                        with st.expander("🔍 Debug: Daten nach Normalisierung", expanded=False):
-                            st.write(f"Zeilen nach Normalisierung: {len(df_upload)}")
+                        # === DIAGNOSE NACH NORMALISIERUNG ===
+                        with st.expander("🔍 Debug: Nach Normalisierung", expanded=True):
+                            st.write(f"**Zeilen nach Normalisierung:** {len(df_upload)}")
                             if not df_upload.empty:
-                                st.dataframe(df_upload.head(10))
+                                st.dataframe(df_upload[['Port of Loading','Port of Destination','40HC','Currency','Carrier']].head(10))
+                            else:
+                                # Zeige warum alles weggefiltert wurde
+                                tmp = normalisiere_upload_dataframe.__wrapped__(df_upload) if hasattr(normalisiere_upload_dataframe, '__wrapped__') else None
+                                ungueltige = {'UNBEKANNT', 'NAN', 'NONE', ''}
+                                df_check = pd.concat(alle_daten, ignore_index=True)
+                                df_check = normalisiere_upload_dataframe(df_check)
+                                st.write("Alle Zeilen wurden weggefiltert.")
 
                         df_upload['createdAt'] = datetime.now(timezone.utc)
 
