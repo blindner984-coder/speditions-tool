@@ -974,12 +974,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if global_contract != "Unbekannt":
                             break
 
-                # B. Header-Zeile suchen
-                sheet_header_idx = None
+                # B. Header-Zeile suchen – nimm die Zeile mit den MEISTEN bekannten Spalten
+                # (verhindert, dass eine Daten-Zeile mit wenigen Kürzeln fälschlich als Header gilt)
+                best_idx = None
+                best_score = 0
                 for i in range(min(60, len(df_sheet))):
-                    if zeile_hat_bekannte_spalten(df_sheet.iloc[i].dropna().astype(str).tolist(), min_treffer=2):
-                        sheet_header_idx = i
-                        break
+                    score = zaehle_spalten_treffer(
+                        df_sheet.iloc[i].dropna().astype(str).tolist()
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+                sheet_header_idx = best_idx if best_score >= 2 else None
 
                 # Wenn kein Header gefunden wurde, ignoriere dieses Sheet
                 if sheet_header_idx is None:
@@ -1223,10 +1229,12 @@ def ermittle_erste_spalte(df, kandidaten):
 
 
 def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 1) -> bool:
-    """Prüft, ob eine Zeile mindestens min_treffer bekannte Spaltenbezeichnungen enthält.
+    """Prüft, ob eine Zeile mindestens min_treffer bekannte Spaltenbezeichnungen enthält."""
+    return zaehle_spalten_treffer(zeile_werte) >= min_treffer
 
-    Wird genutzt, um die Header-Zeile in Excel/CSV-Dateien automatisch zu finden.
-    """
+
+def zaehle_spalten_treffer(zeile_werte: list) -> int:
+    """Zählt, wie viele Werte in der Zeile bekannte Spaltenbezeichnungen sind."""
     alle_aliases = [
         alias.lower()
         for aliases in COLUMN_ALIASES.values()
@@ -1237,7 +1245,6 @@ def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 1) -> bool:
         val_str = str(val).strip().lower()
         if not val_str or val_str in {"nan", "none"}:
             continue
-        # Exakter Treffer ist ausreichend und schneller
         if val_str in alle_aliases:
             treffer += 1
         else:
@@ -1246,9 +1253,7 @@ def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 1) -> bool:
             )
             if match is not None:
                 treffer += 1
-        if treffer >= min_treffer:
-            return True
-    return False
+    return treffer
 
 
 def standardisiere_spalten(df):
