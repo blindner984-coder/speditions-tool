@@ -1342,7 +1342,7 @@ with tab_analytics:
         if not analytics_pol.strip() or not analytics_pod.strip():
             st.warning("Bitte POL und POD eingeben.")
         else:
-            df_trend = lade_raten_aus_db(such_pol=analytics_pol.strip(), such_pod=analytics_pod.strip())
+            df_trend, _ = lade_raten_aus_db(such_pol=analytics_pol.strip(), such_pod=analytics_pod.strip())
             if df_trend.empty:
                 st.warning(f"Keine Daten gefunden für {analytics_pol} → {analytics_pod}.")
             else:
