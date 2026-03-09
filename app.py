@@ -1356,7 +1356,16 @@ with tab_analytics:
                         axis=1
                     )
                     df_trend = df_trend.sort_values('Valid from dt')
-                    df_chart = df_trend.set_index('Valid from dt')[['All-In EUR']]
-                    st.line_chart(df_chart)
-                    durchschnitt = df_trend['All-In EUR'].mean()
-                    st.caption(f"Durchschnittlicher All-In Preis ({analytics_pol} → {analytics_pod}): **{durchschnitt:.2f} EUR** über {len(df_trend)} Einträge")
+
+                    # Günstigster Preis pro Datum
+                    df_min = df_trend.groupby('Valid from dt')['All-In EUR'].min().rename('Günstigster Preis (EUR)')
+                    # Teuerster Preis pro Datum
+                    df_max = df_trend.groupby('Valid from dt')['All-In EUR'].max().rename('Teuerster Preis (EUR)')
+
+                    st.write(f"#### 💚 Günstigste Rate: {analytics_pol} → {analytics_pod}")
+                    st.line_chart(df_min)
+                    st.caption(f"Ø günstigster Preis: **{df_min.mean():.2f} EUR**")
+
+                    st.write(f"#### 🔴 Teuerste Rate: {analytics_pol} → {analytics_pod}")
+                    st.line_chart(df_max)
+                    st.caption(f"Ø teuerster Preis: **{df_max.mean():.2f} EUR**")
