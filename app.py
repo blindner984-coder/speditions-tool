@@ -108,7 +108,7 @@ COLUMN_ALIASES: dict = {
 }
 
 # Mindest-Score (0-100) für Fuzzy-Treffer – Werte unter diesem Schwellwert werden ignoriert
-FUZZY_SCORE_THRESHOLD = 80
+FUZZY_SCORE_THRESHOLD = 70
 
 
 # 1. Warnungen unterdrücken
@@ -1003,9 +1003,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 # D. Spalten umbenennen
                 df_clean = standardisiere_spalten(df_clean)
 
-                # E. Nur anhängen, wenn 40HC-Spalte vorhanden
-                if '40HC' in df_clean.columns:
-                    alle_sheets_dfs.append(df_clean)
+                # E. An Liste anhängen (die Preis-Prüfung machen wir später)
+                alle_sheets_dfs.append(df_clean)
 
             if not alle_sheets_dfs:
                 return pd.DataFrame(), "Keine verwertbaren Raten (40HC) in den Tabs gefunden."
@@ -1218,7 +1217,7 @@ def ermittle_erste_spalte(df, kandidaten):
     return None
 
 
-def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 2) -> bool:
+def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 1) -> bool:
     """Prüft, ob eine Zeile mindestens min_treffer bekannte Spaltenbezeichnungen enthält.
 
     Wird genutzt, um die Header-Zeile in Excel/CSV-Dateien automatisch zu finden.
