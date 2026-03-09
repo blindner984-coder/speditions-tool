@@ -7,3 +7,4 @@ openpyxl
 dnspython
 google-genai
 pydantic
+rapidfuzz

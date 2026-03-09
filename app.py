@@ -13,6 +13,7 @@ from typing import List
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from rapidfuzz import process as fuzz_process
 
 
 # --- PYDANTIC-MODELLE FÜR STRUKTURIERTE EXTRAKTION ---
@@ -38,6 +39,76 @@ class FreightRate(BaseModel):
 
 class ExtractionResponse(BaseModel):
     rates: List[FreightRate]
+
+
+# ---------------------------------------------------------------------------
+# ZENTRALES ALIAS-DICTIONARY
+# ---------------------------------------------------------------------------
+# Hier alle bekannten Spaltennamen der Reedereien hinterlegen.
+# Key   = interner Standardname  |  Value = Liste aller bekannten Variationen
+# Um neue Reederei-Spalten zu unterstützen, einfach den passenden Key erweitern.
+# ---------------------------------------------------------------------------
+COLUMN_ALIASES: dict = {
+    "Carrier": [
+        "Carrier", "Reederei", "Shipping Line", "Vessel Operator",
+        "Line", "Shipping Company",
+    ],
+    "Contract Number": [
+        "Contract Number", "Contract number", "Contract No", "Contract Nr",
+        "Contract", "Contract Reference", "Contract Filing Reference",
+        "Quote Number", "Quote No", "Reference Number", "Ref No",
+        "Agreement Number", "Rate Agreement",
+    ],
+    "Port of Loading": [
+        "Port of Loading", "POL", "Port of Load", "Origin Port",
+        "Origin", "Load Port", "Loading Port", "POL Name",
+        "Departure Port", "From Port", "Pol",
+    ],
+    "Port of Destination": [
+        "Port of Destination", "POD", "Destination Port", "Destination",
+        "Discharge Port", "Port of Discharge", "Dest Port", "POD Name",
+        "Arrival Port", "To Port", "Delivery Port", "Pod",
+    ],
+    "Valid from": [
+        "Valid from", "Valid From", "Effective Date", "Start Date",
+        "Validity From", "Rate Valid From", "From Date", "Date From",
+        "Commencement Date", "Start",
+    ],
+    "Valid to": [
+        "Valid to", "Valid To", "Expiry Date", "Expiration Date",
+        "End Date", "Validity To", "Rate Valid To", "To Date", "Date To",
+        "Not Beyond", "Expiry", "End",
+    ],
+    "40HC": [
+        "40HC", "40HC All In", "40HC All In.1", "40HDRY",
+        "40' HC", "40'HC", "40HC Rate", "40 HC", "40DV/HC",
+        "40HQ", "40' HQ", "Rate 40HC", "Rate 40HQ", "40H",
+        "40 DRY", "40DRY",
+    ],
+    "Currency": [
+        "Currency", "Currency.1", "Currency.2", "Currency.3",
+        "Currency.4", "Currency.5", "Cur", "Curr", "Rate Currency",
+        "CCY", "Ccy",
+    ],
+    "Included Prepaid Surcharges 40HC": [
+        "Included Prepaid Surcharges 40HC", "Prepaid Surcharges",
+        "Origin Surcharges", "Prepaid Charges", "Origin Charges",
+        "Surcharges Prepaid", "Prepaid",
+    ],
+    "Included Collect Surcharges 40HC": [
+        "Included Collect Surcharges 40HC", "Collect Surcharges",
+        "Destination Surcharges", "Collect Charges", "Destination Charges",
+        "Surcharges Collect", "Collect",
+    ],
+    "Remark": [
+        "Remark", "Remarks", "Remark / Notes", "Notes", "Note",
+        "Comments", "Comment", "Additional Info", "Bemerkung",
+    ],
+}
+
+# Mindest-Score (0-100) für Fuzzy-Treffer – Werte unter diesem Schwellwert werden ignoriert
+FUZZY_SCORE_THRESHOLD = 80
+
 
 # 1. Warnungen unterdrücken
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
@@ -850,56 +921,62 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
     else:
         if datei.name.lower().endswith('.xlsx'):
-            # Schneller Pfad fuer tabellarische Exporte (Header in Zeile 1).
+            # --- Schneller Pfad: Header direkt in Zeile 1 ---
             datei.seek(0)
             try:
                 df_fast = pd.read_excel(datei, sheet_name=0)
-                fast_cols = {str(c).strip().lower() for c in df_fast.columns}
-                hat_ziel = any(c in fast_cols for c in ['port of destination', 'pod'])
-                hat_40hc = any(c in fast_cols for c in ['40hc', '40hc all in', '40hdry'])
-                if hat_ziel and hat_40hc:
-                    return df_fast, "Excel/CSV"
+                # Spalten per Fuzzy-Matching sofort in Standardnamen umbenennen
+                df_fast_std = standardisiere_spalten(df_fast)
+                if 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
+                    return df_fast_std, "Excel/CSV"
             except Exception:
                 pass
 
+            # --- Tiefen-Scan: Kopfzeile in den ersten 20 Zeilen suchen ---
             datei.seek(0)
             excel_preview = pd.read_excel(datei, sheet_name=None, header=None, nrows=20)
             ziel_sheet, header_idx = None, 0
             for sheet_name, df_preview in excel_preview.items():
                 for i in range(len(df_preview)):
-                    if any(x in " ".join(df_preview.iloc[i].dropna().astype(str)) for x in ['40HDRY', 'Port of Destination', '40HC All In']):
+                    zeile_werte = df_preview.iloc[i].dropna().astype(str).tolist()
+                    # Fuzzy-Erkennung: Zeile muss mind. 2 bekannte Spaltenbezeichnungen enthalten
+                    if zeile_hat_bekannte_spalten(zeile_werte, min_treffer=2):
                         ziel_sheet, header_idx = sheet_name, i
                         break
-                if ziel_sheet: break
+                if ziel_sheet:
+                    break
             datei.seek(0)
-            df_raw = pd.read_excel(datei, sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0], header=None)
+            df_raw = pd.read_excel(
+                datei,
+                sheet_name=ziel_sheet if ziel_sheet else list(excel_preview.keys())[0],
+                header=None,
+            )
         else:
             datei.seek(0)
             df_raw = pd.read_csv(datei, header=None, low_memory=False)
             header_idx = 0
             for i in range(min(20, len(df_raw))):
-                if any(x in " ".join(df_raw.iloc[i].dropna().astype(str)) for x in ['40HDRY', '40HC All In', 'Port of Destination']):
-                    header_idx = i; break
+                zeile_werte = df_raw.iloc[i].dropna().astype(str).tolist()
+                if zeile_hat_bekannte_spalten(zeile_werte, min_treffer=2):
+                    header_idx = i
+                    break
 
-        # --- 🚨 FIX FÜR DIE PRÄZISE CONTRACT NUMBER (Ignoriert Quote Number) ---
+        # --- Contract Number aus Metadaten-Zeilen extrahieren ---
         global_contract = "Unbekannt"
-        
-        # 1. Zuerst gezielt nach dem Wort "Contract" in den Excel-Kopfzeilen suchen
+
+        # 1. Gezielt nach "Contract" in den Vorkopf-Zeilen suchen
         for i in range(min(20, len(df_raw))):
             row_vals = df_raw.iloc[i].dropna().astype(str).tolist()
             for j, val in enumerate(row_vals):
                 v_low = val.lower()
-                # Wir suchen explizit nach "Contract", um nicht die darüber stehende Quote zu nehmen
                 if 'contract' in v_low:
-                    # Suche nach einer Nummer direkt in dieser Zelle (z.B. "Contract Number 299424203")
                     nums = re.findall(r'\b\d{6,10}\b', val)
                     if nums:
                         global_contract = nums[0]
                         break
-                    # Falls nicht in derselben Zelle, schaue in die nächsten 3 Zellen rechts daneben
                     for k in range(1, 4):
                         if j + k < len(row_vals):
-                            next_val = row_vals[j+k].upper()
+                            next_val = row_vals[j + k].upper()
                             next_tokens = re.findall(r'\b\d{6,10}\b', next_val)
                             if next_tokens:
                                 global_contract = next_tokens[0]
@@ -909,46 +986,96 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if global_contract != "Unbekannt":
                 break
 
-        # 2. Nur wenn oben nichts gefunden wurde, Fallback auf den Dateinamen
+        # 2. Fallback auf Dateinamen
         if global_contract == "Unbekannt":
-            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE): 
+            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                 global_contract = fn_match.group(1)
 
+        # --- Header setzen und doppelte Spaltennamen auflösen ---
         rohe_spalten = df_raw.iloc[header_idx].astype(str).str.strip().tolist()
         neue_spalten, gesehen = [], {}
         for s in rohe_spalten:
-            if s in gesehen: gesehen[s] += 1; neue_spalten.append(f"{s}.{gesehen[s]}")
-            else: gesehen[s] = 0; neue_spalten.append(s)
-                
-        df_raw.columns = neue_spalten
-        df_raw = df_raw.iloc[header_idx+1:].reset_index(drop=True)
-        contract_col = next((c for c in df_raw.columns if any(x in c.lower() for x in ['contract', 'quote', 'reference'])), None)
+            if s in gesehen:
+                gesehen[s] += 1
+                neue_spalten.append(f"{s}.{gesehen[s]}")
+            else:
+                gesehen[s] = 0
+                neue_spalten.append(s)
 
-        if '40HDRY' in df_raw.columns and 'Charge' in df_raw.columns:
+        df_raw.columns = neue_spalten
+        df_raw = df_raw.iloc[header_idx + 1:].reset_index(drop=True)
+
+        # --- Spalten per Fuzzy-Matching einheitlich umbenennen ---
+        # Nach diesem Schritt gilt z.B.: 40HDRY → 40HC, POL → Port of Loading, etc.
+        df_raw = standardisiere_spalten(df_raw)
+
+        # --- Maersk-Gruppenformat erkennen: Charge-Zeilen mit Basisfrachtzeile (BAS) ---
+        # Erkennungsmerkmal: eine 'Charge'-Spalte plus die Standardpreis-Spalte '40HC'
+        charge_col = ermittle_erste_spalte(df_raw, ['Charge', 'Charge Code', 'Charge Type', 'Chrg'])
+        ist_maersk_format = (
+            charge_col is not None
+            and '40HC' in df_raw.columns
+            and 'Port of Loading' in df_raw.columns
+            and 'Port of Destination' in df_raw.columns
+        )
+
+        if ist_maersk_format:
+            # Datums-Spalten nach Standardisierung ermitteln
+            eff_col = 'Valid from' if 'Valid from' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid from'])
+            exp_col = 'Valid to' if 'Valid to' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid to'])
+            tt_col = ermittle_erste_spalte(df_raw, ['Transit Time', 'Transit Days', 'TT'])
+
+            group_cols = [
+                c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col]
+                if c and c in df_raw.columns
+            ]
+
             standard_rows = []
-            for name, group in df_raw.dropna(subset=['40HDRY']).groupby(['POL', 'POD', 'Effective Date', 'Expiry Date']):
-                bas_row = group[group['Charge'] == 'BAS']
-                if bas_row.empty: continue
-                bas_text = str(bas_row['40HDRY'].values[0]).strip()
+            for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
+                bas_row = group[group[charge_col] == 'BAS']
+                if bas_row.empty:
+                    continue
+                bas_text = str(bas_row['40HC'].values[0]).strip()
                 waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
                 if basis_betrag is None or basis_betrag <= 0:
                     continue
-                
-                # Wir priorisieren die gefundene globale Contract Number
-                row_contract = global_contract
-                
+
+                group_name = name if isinstance(name, tuple) else (name,)
+                pol_val = group_name[0] if len(group_name) > 0 else "Unbekannt"
+                pod_val = group_name[1] if len(group_name) > 1 else "Unbekannt"
+                eff_val = group_name[2] if len(group_name) > 2 else ""
+                exp_val = group_name[3] if len(group_name) > 3 else ""
+
                 standard_rows.append({
-                    'Carrier': 'Maersk', 'Contract Number': row_contract, 
-                    'Port of Loading': name[0], 'Port of Destination': name[1], 'Valid from': name[2], 'Valid to': name[3], 
-                    '40HC': basis_betrag, 'Currency': waehrung,
-                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r['Charge']} = {r['40HDRY']}" for _, r in group[group['Charge'] != 'BAS'].iterrows() if ' ' in str(r['40HDRY'])]),
-                    'Included Collect Surcharges 40HC': "", 'Remark': f"Transit Time: {bas_row['Transit Time'].values[0]}" if 'Transit Time' in bas_row.columns else ""
+                    'Carrier': 'Maersk',
+                    'Contract Number': global_contract,
+                    'Port of Loading': pol_val,
+                    'Port of Destination': pod_val,
+                    'Valid from': eff_val,
+                    'Valid to': exp_val,
+                    '40HC': basis_betrag,
+                    'Currency': waehrung,
+                    'Included Prepaid Surcharges 40HC': ", ".join([
+                        f"{r[charge_col]} = {r['40HC']}"
+                        for _, r in group[group[charge_col] != 'BAS'].iterrows()
+                        if ' ' in str(r['40HC'])
+                    ]),
+                    'Included Collect Surcharges 40HC': "",
+                    'Remark': (
+                        f"Transit Time: {bas_row[tt_col].values[0]}"
+                        if tt_col and tt_col in bas_row.columns
+                        else ""
+                    ),
                 })
             df_return = pd.DataFrame(standard_rows)
         else:
-            df_raw['Contract Number'] = global_contract if global_contract != "Unbekannt" else (df_raw[contract_col].fillna("Unbekannt").astype(str) if contract_col else "Unbekannt")
+            # Allgemeiner Pfad: Contract Number setzen
+            if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
+                df_raw['Contract Number'] = global_contract
+            elif global_contract != "Unbekannt":
+                df_raw['Contract Number'] = global_contract
             df_return = df_raw
-        
+
         return df_return, "Excel/CSV"
 
 
@@ -1010,12 +1137,101 @@ def formatiere_datum_fuer_header(value):
 
 
 def ermittle_erste_spalte(df, kandidaten):
+    """Findet die erste passende Spalte im DataFrame per exakter oder Fuzzy-Suche.
+
+    Prüft zuerst exakt (case-insensitive). Schlägt das fehl, kommt rapidfuzz
+    zum Einsatz. Rückgabe: Originalspaltennamen oder None.
+    """
     spalten_map = {str(c).strip().lower(): c for c in df.columns}
+    df_cols_lower = list(spalten_map.keys())
+
     for kandidat in kandidaten:
-        hit = spalten_map.get(str(kandidat).strip().lower())
-        if hit is not None:
-            return hit
+        k_low = str(kandidat).strip().lower()
+
+        # 1. Schneller exakter Treffer (case-insensitive)
+        if k_low in spalten_map:
+            return spalten_map[k_low]
+
+        # 2. Fuzzy-Suche via rapidfuzz
+        result = fuzz_process.extractOne(
+            k_low, df_cols_lower, score_cutoff=FUZZY_SCORE_THRESHOLD
+        )
+        if result is not None:
+            return spalten_map[result[0]]
+
     return None
+
+
+def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 2) -> bool:
+    """Prüft, ob eine Zeile mindestens min_treffer bekannte Spaltenbezeichnungen enthält.
+
+    Wird genutzt, um die Header-Zeile in Excel/CSV-Dateien automatisch zu finden.
+    """
+    alle_aliases = [
+        alias.lower()
+        for aliases in COLUMN_ALIASES.values()
+        for alias in aliases
+    ]
+    treffer = 0
+    for val in zeile_werte:
+        val_str = str(val).strip().lower()
+        if not val_str or val_str in {"nan", "none"}:
+            continue
+        # Exakter Treffer ist ausreichend und schneller
+        if val_str in alle_aliases:
+            treffer += 1
+        else:
+            match = fuzz_process.extractOne(
+                val_str, alle_aliases, score_cutoff=FUZZY_SCORE_THRESHOLD
+            )
+            if match is not None:
+                treffer += 1
+        if treffer >= min_treffer:
+            return True
+    return False
+
+
+def standardisiere_spalten(df):
+    """Benennt Spalten anhand von COLUMN_ALIASES (exakt + Fuzzy) in Standardnamen um.
+
+    Jede Zielspalte wird nur einmal gemappt. Bereits vorhandene Standardspalten
+    bleiben unberührt. So können neue Reederei-Varianten einfach ins Dictionary
+    eingetragen werden, ohne den restlichen Code anfassen zu müssen.
+    """
+    rename_map = {}
+    bereits_gemappt: set = set()  # verhindert Doppel-Mapping
+
+    for ziel, kandidaten in COLUMN_ALIASES.items():
+        # Standardspalte bereits unter diesem Namen vorhanden → überspringen
+        if ziel in df.columns:
+            continue
+
+        # Nur noch nicht gemappte Spalten berücksichtigen
+        verfuegbare_cols = [c for c in df.columns if c not in bereits_gemappt]
+        spalten_map = {str(c).strip().lower(): c for c in verfuegbare_cols}
+        df_cols_lower = list(spalten_map.keys())
+
+        for kandidat in kandidaten:
+            k_low = str(kandidat).strip().lower()
+
+            # Exakter Treffer
+            if k_low in spalten_map:
+                original = spalten_map[k_low]
+                rename_map[original] = ziel
+                bereits_gemappt.add(original)
+                break
+
+            # Fuzzy-Treffer
+            result = fuzz_process.extractOne(
+                k_low, df_cols_lower, score_cutoff=FUZZY_SCORE_THRESHOLD
+            )
+            if result is not None:
+                original = spalten_map[result[0]]
+                rename_map[original] = ziel
+                bereits_gemappt.add(original)
+                break
+
+    return df.rename(columns=rename_map)
 
 
 def normalisiere_upload_dataframe(df_upload):
@@ -1030,26 +1246,27 @@ def normalisiere_upload_dataframe(df_upload):
         else:
             out[ziel] = default
 
-    stelle_spalte_sicher('Carrier', ['Carrier'], default='Unbekannt')
-    stelle_spalte_sicher('Contract Number', ['Contract Number', 'Contract number', 'Contract No', 'Contract Nr', 'Contract'], default='Unbekannt')
-    stelle_spalte_sicher('Port of Loading', ['Port of Loading', 'POL', 'Port of Load', 'Origin'], default='Unbekannt')
-    stelle_spalte_sicher('Port of Destination', ['Port of Destination', 'POD', 'Destination'], default='Unbekannt')
-    stelle_spalte_sicher('Valid from', ['Valid from', 'Effective Date', 'Start Date'], default=None)
-    stelle_spalte_sicher('Valid to', ['Valid to', 'Expiry Date', 'Expiration Date', 'End Date'], default=None)
+    # Pflichtfelder per Fuzzy-Matching aus COLUMN_ALIASES befüllen
+    stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='Unbekannt')
+    stelle_spalte_sicher('Contract Number', COLUMN_ALIASES['Contract Number'], default='Unbekannt')
+    stelle_spalte_sicher('Port of Loading', COLUMN_ALIASES['Port of Loading'], default='Unbekannt')
+    stelle_spalte_sicher('Port of Destination', COLUMN_ALIASES['Port of Destination'], default='Unbekannt')
+    stelle_spalte_sicher('Valid from', COLUMN_ALIASES['Valid from'], default=None)
+    stelle_spalte_sicher('Valid to', COLUMN_ALIASES['Valid to'], default=None)
 
     if '40HC' not in out.columns:
-        preis_col = ermittle_erste_spalte(out, ['40HC', '40HC All In', '40HC All In.1', '40HDRY'])
+        preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
         out['40HC'] = out[preis_col] if preis_col is not None else None
 
     if 'Currency' not in out.columns:
-        waehrung_col = ermittle_erste_spalte(out, ['Currency.4', 'Currency.3', 'Currency.2', 'Currency.1', 'Currency', 'Currency.5'])
+        waehrung_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Currency'])
         out['Currency'] = out[waehrung_col] if waehrung_col is not None else 'USD'
     elif '40HC' in out.columns and 'Currency.4' in out.columns:
-        # Bei breiten Excel-Exports beschreibt Currency.4 i.d.R. die 40HC-Waehrung.
+        # Bei breiten Excel-Exports beschreibt Currency.4 i.d.R. die 40HC-Währung.
         out['Currency'] = out['Currency.4']
 
     if 'Remark' not in out.columns:
-        remark_col = ermittle_erste_spalte(out, ['Remark', 'Remarks', 'Remark / Notes', 'Notes'])
+        remark_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Remark'])
         out['Remark'] = out[remark_col] if remark_col is not None else ""
 
     if 'Included Prepaid Surcharges 40HC' not in out.columns:
@@ -1058,6 +1275,7 @@ def normalisiere_upload_dataframe(df_upload):
         out['Included Collect Surcharges 40HC'] = ""
 
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
+    # Zeilen ohne gültige Basisfracht entfernen
     out = out[out['40HC'].notna()].copy()
 
     if 'Valid from dt' in out.columns:
@@ -1077,6 +1295,16 @@ def normalisiere_upload_dataframe(df_upload):
     out['Remark'] = out['Remark'].fillna('').astype(str)
     out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].fillna('').astype(str)
     out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].fillna('').astype(str)
+
+    # --- Zeilen-Validierung: Pflichtfelder POL und POD müssen befüllt sein ---
+    # Zeilen, bei denen Ladehafen ODER Zielhafen fehlen, werden verworfen.
+    ungueltige_werte = {'UNBEKANNT', 'NAN', 'NONE', ''}
+    out = out[
+        ~(
+            out['Port of Loading'].str.strip().str.upper().isin(ungueltige_werte)
+            | out['Port of Destination'].str.strip().str.upper().isin(ungueltige_werte)
+        )
+    ].copy()
 
     ziel_spalten = [
         'Carrier',
