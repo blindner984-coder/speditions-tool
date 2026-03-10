@@ -670,7 +670,7 @@ def standardisiere_spalten(df):
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
-    # FILTER: Wirf alle 20-Fuß Container raus (EXAKTE Suche, kein Fuzzy für kurze Wörter wie CTR!)
+    # 1. FILTER: Wirf alle 20-Fuß Container raus (Strenge Suche)
     size_col = None
     for col in out.columns:
         if str(col).strip().lower() in ['ctr', 'size', 'equipment', 'container', 'type']:
@@ -678,7 +678,6 @@ def normalisiere_upload_dataframe(df_upload):
             break
             
     if size_col is not None:
-        # Behalte nur Zeilen, in denen die Size-Spalte "40", "40HC", "HQ" enthält oder leer ist
         mask_40 = out[size_col].astype(str).str.contains('40|hc|hq|nan', na=True, case=False)
         out = out[mask_40].copy()
 
@@ -691,8 +690,8 @@ def normalisiere_upload_dataframe(df_upload):
         else:
             out[ziel] = default
 
-    # Pflichtfelder per Fuzzy-Matching aus COLUMN_ALIASES befüllen
-    stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='Unbekannt')
+    # Pflichtfelder befüllen
+    stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='FMS') # Standard auf FMS statt Unbekannt
     stelle_spalte_sicher('Contract Number', COLUMN_ALIASES['Contract Number'], default='Unbekannt')
     stelle_spalte_sicher('Port of Loading', COLUMN_ALIASES['Port of Loading'], default='Unbekannt')
     stelle_spalte_sicher('Port of Destination', COLUMN_ALIASES['Port of Destination'], default='Unbekannt')
@@ -703,51 +702,44 @@ def normalisiere_upload_dataframe(df_upload):
         preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
         out['40HC'] = out[preis_col] if preis_col is not None else None
 
-    # FMS Fallback für Währung
+    # Währungs-Check
     if 'Currency' not in out.columns:
         waehrung_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Currency'])
         out['Currency'] = out[waehrung_col] if waehrung_col is not None else 'USD'
-    elif '40HC' in out.columns and 'Currency.4' in out.columns:
-        out['Currency'] = out['Currency.4']
     else:
         out['Currency'] = out['Currency'].fillna('USD')
 
-    if 'Remark' not in out.columns:
-        remark_col = ermittle_erste_spalte(out, COLUMN_ALIASES['Remark'])
-        out['Remark'] = out[remark_col] if remark_col is not None else ""
-
-    if 'Included Prepaid Surcharges 40HC' not in out.columns:
-        out['Included Prepaid Surcharges 40HC'] = ""
-    if 'Included Collect Surcharges 40HC' not in out.columns:
-        out['Included Collect Surcharges 40HC'] = ""
-
+    # Preis-Konvertierung
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
 
-    if 'Valid from dt' in out.columns:
-        out['Valid from dt'] = pd.to_datetime(out['Valid from dt'], dayfirst=True, errors='coerce')
-    else:
-        out['Valid from dt'] = pd.to_datetime(out['Valid from'], dayfirst=True, errors='coerce')
-    if 'Valid to dt' in out.columns:
-        out['Valid to dt'] = pd.to_datetime(out['Valid to dt'], dayfirst=True, errors='coerce')
-    else:
-        out['Valid to dt'] = pd.to_datetime(out['Valid to'], dayfirst=True, errors='coerce')
+    # --- RADIKALE VALIDIERUNG (TRASH-FILTER) ---
+    ungueltige = {'UNBEKANNT', 'NAN', 'NONE', '', 'NIL', 'NULL'}
+    
+    # Regel A: Preis muss vorhanden und größer als 50 sein (entfernt 0$ Raten und Trash)
+    mask_preis = out['40HC'].notna() & (out['40HC'] > 50)
+    
+    # Regel B: Häfen müssen existieren und dürfen keine wirren Texte/Zahlen sein
+    def ist_gueltiger_hafen(val):
+        s = str(val).strip()
+        if s.upper() in ungueltige or len(s) < 3 or len(s) > 40: return False
+        if re.match(r'^-?\d+(?:[.,]\d+)?$', s): return False # Nur Zahlen sind kein Hafen
+        if 'potential' in s.lower() or 'average' in s.lower(): return False # Statistik-Müll
+        return True
 
-    out['Carrier'] = out['Carrier'].fillna('Unbekannt').astype(str).str.strip()
-    out['Contract Number'] = out['Contract Number'].fillna('Unbekannt').astype(str).str.strip()
-    out['Port of Loading'] = out['Port of Loading'].fillna('Unbekannt').astype(str).str.strip()
-    out['Port of Destination'] = out['Port of Destination'].fillna('Unbekannt').astype(str).str.strip()
-    out['Currency'] = out['Currency'].fillna('USD').astype(str).str.upper().str.strip()
-    out['Remark'] = out['Remark'].fillna('').astype(str)
-    out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].fillna('').astype(str)
-    out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].fillna('').astype(str)
+    mask_pol = out['Port of Loading'].apply(ist_gueltiger_hafen)
+    mask_pod = out['Port of Destination'].apply(ist_gueltiger_hafen)
+    
+    out = out[mask_preis & mask_pol & mask_pod].copy()
 
-    # --- HÄRTERE ZEILEN-VALIDIERUNG ---
-    ungueltige_werte = {'UNBEKANNT', 'NAN', 'NONE', ''}
-    mask_preis_ok = out['40HC'].notna()
-    mask_pol_ok = ~out['Port of Loading'].str.strip().str.upper().isin(ungueltige_werte)
-    mask_pod_ok = ~out['Port of Destination'].str.strip().str.upper().isin(ungueltige_werte)
+    # Datums-Konvertierung
+    for col in ['Valid from', 'Valid to']:
+        target = col + " dt"
+        out[target] = pd.to_datetime(out[col], dayfirst=True, errors='coerce')
 
-    out = out[mask_preis_ok & mask_pol_ok & mask_pod_ok].copy()
+    # Bereinigung Strings
+    out['Carrier'] = out['Carrier'].replace('Unbekannt', 'FMS').astype(str).str.strip()
+    out['Port of Loading'] = out['Port of Loading'].astype(str).str.strip()
+    out['Port of Destination'] = out['Port of Destination'].astype(str).str.strip()
 
     ziel_spalten = [
         'Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination',
@@ -755,7 +747,6 @@ def normalisiere_upload_dataframe(df_upload):
         '40HC', 'Currency', 'Included Prepaid Surcharges 40HC',
         'Included Collect Surcharges 40HC', 'Remark'
     ]
-
     return out[ziel_spalten]
 
 
