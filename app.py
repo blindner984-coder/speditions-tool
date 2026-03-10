@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import re
 import PyPDF2
 import warnings
@@ -857,7 +856,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
                     if zaehle_bekannte_spalten(row_vals) >= 3:
                         sheet_header_idx = i
-                        break # SOFORT aufhören, nicht weiter in die Datenzeilen gehen!
+                        break 
                 
                 # 2. Versuch: Wenn 3 zu streng war, versuche 2 Treffer
                 if sheet_header_idx is None:
@@ -865,7 +864,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
                         if zaehle_bekannte_spalten(row_vals) >= 2:
                             sheet_header_idx = i
-                            break # SOFORT aufhören!
+                            break 
 
                 if sheet_header_idx is None:
                     continue 
@@ -923,9 +922,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if 'Valid to' not in df_clean.columns and sheet_valid_to:
                     df_clean['Valid to'] = sheet_valid_to
 
-                # E. Nur anhängen wenn Preis-Spalte vorhanden
-                if '40HC' in df_clean.columns:
-                    alle_sheets_dfs.append(df_clean)
+                # E. Einfach ALLES anhängen was einen Header hat, Normalisierung filtert später!
+                alle_sheets_dfs.append(df_clean)
 
             if not alle_sheets_dfs:
                 return pd.DataFrame(), "Keine verwertbaren Raten (40HC) in den Tabs gefunden."
@@ -1016,19 +1014,20 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                 global_contract = fn_match.group(1)
 
-        # --- Maersk-Format Check (STRENGE SUCHE, kein Fuzzy!) ---
+        # --- Maersk-Format Check ---
+        # WICHTIG: STRENGE SUCHE nach "Charge", damit FMS "Surcharges" nicht aus Versehen triggert!
         charge_col = None
         for col in df_raw.columns:
             if str(col).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']:
                 charge_col = col
                 break
 
-        ist_maersk_format = (
-            charge_col is not None
-            and '40HC' in df_raw.columns
-            and 'Port of Loading' in df_raw.columns
-            and 'Port of Destination' in df_raw.columns
-        )
+        ist_maersk_format = False
+        if charge_col is not None and '40HC' in df_raw.columns and 'Port of Loading' in df_raw.columns and 'Port of Destination' in df_raw.columns:
+            # EINZIG GÜLTIGER BEWEIS FÜR MAERSK: Die Spalte muss das Wort "BAS" oder "BASIC" (Basisrate) enthalten!
+            # Wir suchen nicht mehr nach BAF oder PSS, das haben andere auch.
+            if df_raw[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC']).any():
+                ist_maersk_format = True
 
         if ist_maersk_format:
             eff_col = 'Valid from' if 'Valid from' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid from'])
@@ -1039,7 +1038,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
-                bas_row = group[group[charge_col] == 'BAS']
+                # Finde die Zeile mit der Basisrate
+                bas_row = group[group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
                 if bas_row.empty: continue
                 
                 bas_text = str(bas_row['40HC'].values[0]).strip()
@@ -1061,11 +1061,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     'Valid to': exp_val,
                     '40HC': basis_betrag,
                     'Currency': waehrung,
-                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r[charge_col]} = {r['40HC']}" for _, r in group[group[charge_col] != 'BAS'].iterrows() if ' ' in str(r['40HC'])]),
+                    # Alle anderen Gebühren außer BAS/BASIC kommen in die Surcharges
+                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r[charge_col]} = {r['40HC']}" for _, r in group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])].iterrows() if ' ' in str(r['40HC'])]),
                     'Included Collect Surcharges 40HC': "",
                     'Remark': f"Transit Time: {bas_row[tt_col].values[0]}" if tt_col and tt_col in bas_row.columns else "",
                 })
-            df_return = pd.DataFrame(standard_rows)
+            
+            # WICHTIG: Wenn er im Maersk Modus lief, aber keine einzige Ratenzeile bauen konnte,
+            # falle auf den Standard-Export zurück!
+            if standard_rows:
+                df_return = pd.DataFrame(standard_rows)
+            else:
+                if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
+                    df_raw['Contract Number'] = global_contract
+                elif global_contract != "Unbekannt":
+                    df_raw['Contract Number'] = global_contract
+                df_return = df_raw
+                
         else:
             if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
                 df_raw['Contract Number'] = global_contract
@@ -1384,23 +1396,7 @@ with tab_analytics:
                     kpi2.metric("🟡 Durchschnittspreis", f"{avg_preis:.2f} €")
                     kpi3.metric("📋 Analysierte Raten", f"{len(df_trend)}")
 
-                    st.write(f"#### 📊 Carrier-Vergleich: {analytics_pol} ➡️ {analytics_pod}")
-                    fig = px.line(
-                        df_trend,
-                        x='Valid from dt',
-                        y='All-In EUR',
-                        color='Carrier',
-                        markers=True,
-                        hover_data=['Contract Number', '40HC', 'Currency'],
-                        labels={
-                            "Valid from dt": "Gültig ab (Datum)",
-                            "All-In EUR": "All-In Preis (EUR)",
-                            "Carrier": "Reederei"
-                        }
-                    )
-                    fig.update_layout(hovermode="x unified")
-                    st.plotly_chart(fig, use_container_width=True)
-
+                    # --- TOP 3 RATEN TABELLE ---
                     st.write("#### 🏆 Die 3 historisch günstigsten Raten")
                     top_3 = df_trend.sort_values('All-In EUR').head(3)
 
