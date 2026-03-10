@@ -736,6 +736,14 @@ def normalisiere_upload_dataframe(df_upload):
         target = col + " dt"
         out[target] = pd.to_datetime(out[col], dayfirst=True, errors='coerce')
 
+    # Fehlende Spalten sicherstellen
+    if 'Remark' not in out.columns:
+        out['Remark'] = ""
+    if 'Included Prepaid Surcharges 40HC' not in out.columns:
+        out['Included Prepaid Surcharges 40HC'] = ""
+    if 'Included Collect Surcharges 40HC' not in out.columns:
+        out['Included Collect Surcharges 40HC'] = ""
+
     # Bereinigung Strings
     out['Carrier'] = out['Carrier'].replace('Unbekannt', 'FMS').astype(str).str.strip()
     out['Port of Loading'] = out['Port of Loading'].astype(str).str.strip()
