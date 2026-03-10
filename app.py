@@ -737,6 +737,12 @@ def standardisiere_spalten(df):
     bereits_gemappt = set() 
     spalten_map = {str(c).strip().lower(): c for c in df.columns}
 
+    # Strukturelle Spalten, die NIEMALS umbenannt werden dürfen (Maersk-Format braucht diese)
+    geschuetzte_namen = {'charge', 'charge code', 'charge type', 'chrg'}
+    for c in df.columns:
+        if str(c).strip().lower() in geschuetzte_namen:
+            bereits_gemappt.add(c)
+
     # --- PASS 1: Nur EXAKTE Treffer ---
     for ziel, kandidaten in COLUMN_ALIASES.items():
         if ziel in df.columns:
