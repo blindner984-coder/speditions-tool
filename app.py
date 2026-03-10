@@ -611,7 +611,7 @@ def zaehle_bekannte_spalten(zeile_werte: list) -> int:
     treffer = 0
     for val in zeile_werte:
         val_str = str(val).strip().lower()
-        if not val_str or val_str in {"nan", "none"}:
+        if not val_str or len(val_str) < 2 or val_str in {"nan", "none"}:
             continue
         if val_str in alle_aliases:
             treffer += 1
@@ -622,14 +622,15 @@ def zaehle_bekannte_spalten(zeile_werte: list) -> int:
     return treffer
 
 
-def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 1) -> bool:
+def zeile_hat_bekannte_spalten(zeile_werte: list, min_treffer: int = 3) -> bool:
+    # Wir verlangen jetzt MINDESTENS 3 Treffer, damit keine Datenzeilen aus Versehen als Header gelten!
     return zaehle_bekannte_spalten(zeile_werte) >= min_treffer
 
 
 def standardisiere_spalten(df):
     """Benennt Spalten im 2-Pass-Verfahren um, damit Fuzzy-Matches keine echten Treffer klauen."""
     rename_map = {}
-    bereits_gemappt = set()
+    bereits_gemappt = set() 
     spalten_map = {str(c).strip().lower(): c for c in df.columns}
 
     # --- PASS 1: Nur EXAKTE Treffer ---
@@ -669,6 +670,13 @@ def standardisiere_spalten(df):
 
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
+
+    # FILTER: Wirf alle 20-Fuß Container raus, falls es eine Spalte "CTR" oder "Size" gibt (WICHTIG FÜR FMS!)
+    size_col = ermittle_erste_spalte(out, ['CTR', 'Size', 'Equipment', 'Container', 'Type'])
+    if size_col is not None:
+        # Behalte nur Zeilen, in denen die Size-Spalte "40", "40HC" enthält oder leer ist
+        mask_40 = out[size_col].astype(str).str.contains('40|hc|hq|nan', na=True, case=False)
+        out = out[mask_40].copy()
 
     def stelle_spalte_sicher(ziel, kandidaten, default=""):
         if ziel in out.columns:
