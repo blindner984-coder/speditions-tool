@@ -848,7 +848,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if df_sheet.empty:
                     continue
 
-                # A. Bestimme Header-Zeile durch First-Match! (Abbruch sobald gefunden!)
+                # A. Bestimme Header-Zeile durch SCORING
                 sheet_header_idx = None
                 
                 # 1. Versuch: Strenge Suche (Mindestens 3 Treffer)
@@ -858,7 +858,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         sheet_header_idx = i
                         break 
                 
-                # 2. Versuch: Wenn 3 zu streng war, versuche 2 Treffer
+                # 2. Versuch: Lockere Suche (2 Treffer)
                 if sheet_header_idx is None:
                     for i in range(min(60, len(df_sheet))):
                         row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
@@ -922,11 +922,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if 'Valid to' not in df_clean.columns and sheet_valid_to:
                     df_clean['Valid to'] = sheet_valid_to
 
-                # E. Einfach ALLES anhängen was einen Header hat, Normalisierung filtert später!
+                # E. Einfach ALLES anhängen, was einen Header hat! (Vorherige Bremse entfernt)
                 alle_sheets_dfs.append(df_clean)
 
             if not alle_sheets_dfs:
-                return pd.DataFrame(), "Keine verwertbaren Raten (40HC) in den Tabs gefunden."
+                return pd.DataFrame(), "Keine verwertbaren Header-Zeilen in den Tabs gefunden."
 
             df_raw = pd.concat(alle_sheets_dfs, ignore_index=True)
 
@@ -1015,7 +1015,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 global_contract = fn_match.group(1)
 
         # --- Maersk-Format Check ---
-        # WICHTIG: STRENGE SUCHE nach "Charge", damit FMS "Surcharges" nicht aus Versehen triggert!
         charge_col = None
         for col in df_raw.columns:
             if str(col).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']:
@@ -1024,8 +1023,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
         ist_maersk_format = False
         if charge_col is not None and '40HC' in df_raw.columns and 'Port of Loading' in df_raw.columns and 'Port of Destination' in df_raw.columns:
-            # EINZIG GÜLTIGER BEWEIS FÜR MAERSK: Die Spalte muss das Wort "BAS" oder "BASIC" (Basisrate) enthalten!
-            # Wir suchen nicht mehr nach BAF oder PSS, das haben andere auch.
             if df_raw[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC']).any():
                 ist_maersk_format = True
 
@@ -1038,7 +1035,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
-                # Finde die Zeile mit der Basisrate
                 bas_row = group[group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
                 if bas_row.empty: continue
                 
@@ -1061,14 +1057,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     'Valid to': exp_val,
                     '40HC': basis_betrag,
                     'Currency': waehrung,
-                    # Alle anderen Gebühren außer BAS/BASIC kommen in die Surcharges
                     'Included Prepaid Surcharges 40HC': ", ".join([f"{r[charge_col]} = {r['40HC']}" for _, r in group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])].iterrows() if ' ' in str(r['40HC'])]),
                     'Included Collect Surcharges 40HC': "",
                     'Remark': f"Transit Time: {bas_row[tt_col].values[0]}" if tt_col and tt_col in bas_row.columns else "",
                 })
             
-            # WICHTIG: Wenn er im Maersk Modus lief, aber keine einzige Ratenzeile bauen konnte,
-            # falle auf den Standard-Export zurück!
             if standard_rows:
                 df_return = pd.DataFrame(standard_rows)
             else:
