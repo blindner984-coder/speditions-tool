@@ -59,11 +59,13 @@ COLUMN_ALIASES: dict = {
         "Port of Loading", "POL", "Port of Load", "Origin Port",
         "Origin", "Load Port", "Loading Port", "POL Name",
         "Departure Port", "From Port", "Pol",
+        "Receipt", "Place of Receipt",
     ],
     "Port of Destination": [
         "Port of Destination", "POD", "Destination Port", "Destination",
         "Discharge Port", "Port of Discharge", "Dest Port", "POD Name",
         "Arrival Port", "To Port", "Delivery Port", "Pod",
+        "Delivery", "Place of Delivery",
     ],
     "Valid from": [
         "Valid from", "Valid From", "Effective Date", "Start Date",
@@ -1212,7 +1214,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 # =================================================================
                 prepaid_surcharges = []
                 collect_surcharges = []
-                collect_codes = {'CP1', 'CP2', 'THD', 'DTHC', 'DDF', 'DDC'}
+                collect_codes = {'CP1', 'CP2', 'VP1', 'THD', 'DTHC', 'DDF', 'DDC'}
                 surcharge_rows = group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
                 
                 for _, r in surcharge_rows.iterrows():
