@@ -671,10 +671,15 @@ def standardisiere_spalten(df):
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
-    # FILTER: Wirf alle 20-Fuß Container raus, falls es eine Spalte "CTR" oder "Size" gibt (WICHTIG FÜR FMS!)
-    size_col = ermittle_erste_spalte(out, ['CTR', 'Size', 'Equipment', 'Container', 'Type'])
+    # FILTER: Wirf alle 20-Fuß Container raus (EXAKTE Suche, kein Fuzzy für kurze Wörter wie CTR!)
+    size_col = None
+    for col in out.columns:
+        if str(col).strip().lower() in ['ctr', 'size', 'equipment', 'container', 'type']:
+            size_col = col
+            break
+            
     if size_col is not None:
-        # Behalte nur Zeilen, in denen die Size-Spalte "40", "40HC" enthält oder leer ist
+        # Behalte nur Zeilen, in denen die Size-Spalte "40", "40HC", "HQ" enthält oder leer ist
         mask_40 = out[size_col].astype(str).str.contains('40|hc|hq|nan', na=True, case=False)
         out = out[mask_40].copy()
 
@@ -844,18 +849,26 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if df_sheet.empty:
                     continue
 
-                # A. Bestimme Header-Zeile durch SCORING
+                # A. Bestimme Header-Zeile durch First-Match! (Abbruch sobald gefunden!)
                 sheet_header_idx = None
-                max_treffer = 0
+                
+                # 1. Versuch: Strenge Suche (Mindestens 3 Treffer)
                 for i in range(min(60, len(df_sheet))):
                     row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
-                    treffer = zaehle_bekannte_spalten(row_vals)
-                    if treffer > max_treffer:
-                        max_treffer = treffer
+                    if zaehle_bekannte_spalten(row_vals) >= 3:
                         sheet_header_idx = i
+                        break # SOFORT aufhören, nicht weiter in die Datenzeilen gehen!
+                
+                # 2. Versuch: Wenn 3 zu streng war, versuche 2 Treffer
+                if sheet_header_idx is None:
+                    for i in range(min(60, len(df_sheet))):
+                        row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
+                        if zaehle_bekannte_spalten(row_vals) >= 2:
+                            sheet_header_idx = i
+                            break # SOFORT aufhören!
 
-                if sheet_header_idx is None or max_treffer < 2:
-                    continue
+                if sheet_header_idx is None:
+                    continue 
 
                 # B. Metadaten VOR dem Header aus dem Freitext "scrapen"
                 df_top = df_sheet.iloc[:sheet_header_idx]
@@ -927,15 +940,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 return pd.DataFrame(), f"Fehler beim Lesen der CSV: {e}"
 
             header_idx = None
-            max_treffer = 0
+            
+            # 1. Versuch: Strenge Suche
             for i in range(min(60, len(df_csv))):
                 row_vals = df_csv.iloc[i].dropna().astype(str).tolist()
-                treffer = zaehle_bekannte_spalten(row_vals)
-                if treffer > max_treffer:
-                    max_treffer = treffer
+                if zaehle_bekannte_spalten(row_vals) >= 3:
                     header_idx = i
+                    break
+                    
+            # 2. Versuch: Lockere Suche
+            if header_idx is None:
+                for i in range(min(60, len(df_csv))):
+                    row_vals = df_csv.iloc[i].dropna().astype(str).tolist()
+                    if zaehle_bekannte_spalten(row_vals) >= 2:
+                        header_idx = i
+                        break
 
-            if header_idx is None or max_treffer < 2:
+            if header_idx is None:
                 return pd.DataFrame(), "Kein gültiger Header in CSV gefunden."
 
             # Metadaten scrapen
@@ -987,6 +1008,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if 'Valid to' not in df_raw.columns and csv_valid_to:
                 df_raw['Valid to'] = csv_valid_to
 
+        # === NACHBEREITUNG FÜR BEIDE (EXCEL & CSV) ===
         if df_raw.empty:
             return pd.DataFrame(), "Datei ist leer nach der Verarbeitung."
 
@@ -994,7 +1016,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                 global_contract = fn_match.group(1)
 
-        charge_col = ermittle_erste_spalte(df_raw, ['Charge', 'Charge Code', 'Charge Type', 'Chrg'])
+        # --- Maersk-Format Check (STRENGE SUCHE, kein Fuzzy!) ---
+        charge_col = None
+        for col in df_raw.columns:
+            if str(col).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']:
+                charge_col = col
+                break
+
         ist_maersk_format = (
             charge_col is not None
             and '40HC' in df_raw.columns
@@ -1012,13 +1040,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
                 bas_row = group[group[charge_col] == 'BAS']
-                if bas_row.empty:
-                    continue
-
+                if bas_row.empty: continue
+                
                 bas_text = str(bas_row['40HC'].values[0]).strip()
                 waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
-                if basis_betrag is None or basis_betrag <= 0:
-                    continue
+                if basis_betrag is None or basis_betrag <= 0: continue
 
                 group_name = name if isinstance(name, tuple) else (name,)
                 pol_val = group_name[0] if len(group_name) > 0 else "Unbekannt"
