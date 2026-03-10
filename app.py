@@ -363,6 +363,111 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
         return None
 
 
+def extrahiere_excel_mit_gemini(file_bytes, file_name):
+    """Liest eine Excel/CSV-Datei ein, chunked die Daten und extrahiert
+    Frachtraten per Gemini Structured Outputs."""
+    if not GEMINI_API_KEY:
+        return pd.DataFrame(), "GEMINI_API_KEY nicht gesetzt."
+
+    # 1. Einlesen
+    try:
+        buf = io.BytesIO(file_bytes)
+        if file_name.lower().endswith(".csv"):
+            df_raw = pd.read_csv(buf, header=None, low_memory=False)
+        else:
+            df_raw = pd.read_excel(buf, header=None)
+    except Exception as e:
+        return pd.DataFrame(), f"Fehler beim Einlesen: {e}"
+
+    if df_raw.empty:
+        return pd.DataFrame(), "Datei ist leer."
+
+    # 2. Leere Zeilen/Spalten entfernen (Token sparen)
+    df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+
+    # 3. In CSV-String umwandeln
+    csv_text = df_raw.to_csv(index=False, header=False)
+    zeilen = csv_text.split("\n")
+
+    # 4. Metadaten-Kontext (erste 15 Zeilen) + Rest
+    META_ZEILEN = 15
+    CHUNK_SIZE = 50
+    meta_kontext = "\n".join(zeilen[:META_ZEILEN])
+    daten_zeilen = zeilen[META_ZEILEN:]
+
+    # 5. Chunks bilden
+    chunks = []
+    for start in range(0, len(daten_zeilen), CHUNK_SIZE):
+        chunk = "\n".join(daten_zeilen[start : start + CHUNK_SIZE])
+        if chunk.strip():
+            chunks.append(chunk)
+
+    # Falls die Datei kleiner als 15 Zeilen ist, alles als einen Chunk senden
+    if not chunks:
+        chunks = [meta_kontext]
+        meta_kontext = ""
+
+    # 6. Gemini-Client vorbereiten
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    alle_raten = []
+    fortschritt = st.progress(0)
+    status = st.empty()
+
+    for idx, chunk in enumerate(chunks):
+        status.caption(f"🤖 Gemini analysiert Chunk {idx + 1}/{len(chunks)} …")
+        prompt = (
+            _SYSTEM_PROMPT
+            + "\n\n--- METADATEN / KOPFZEILEN DER DATEI ---\n"
+            + meta_kontext
+            + "\n\n--- DATENZEILEN (CHUNK) ---\n"
+            + chunk
+        )
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ExtractionResponse,
+                    temperature=0.1,
+                ),
+            )
+            result = ExtractionResponse.model_validate_json(response.text)
+            for rate in result.rates:
+                alle_raten.append({
+                    "Carrier": rate.carrier,
+                    "Contract Number": rate.contract_number,
+                    "Port of Loading": rate.port_of_loading,
+                    "Port of Destination": rate.port_of_destination,
+                    "Valid from": rate.valid_from,
+                    "Valid to": rate.valid_to,
+                    "40HC": rate.rate_40hc,
+                    "Currency": rate.currency,
+                    "Included Prepaid Surcharges 40HC": ", ".join(
+                        [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.prepaid_surcharges]
+                    ),
+                    "Included Collect Surcharges 40HC": ", ".join(
+                        [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.collect_surcharges]
+                    ),
+                    "Remark": rate.remark,
+                })
+        except Exception as e:
+            st.warning(f"Chunk {idx + 1}/{len(chunks)} fehlgeschlagen: {e}")
+
+        fortschritt.progress(min((idx + 1) / len(chunks), 1.0))
+
+    fortschritt.empty()
+    status.empty()
+
+    if not alle_raten:
+        return pd.DataFrame(), "Gemini konnte keine Raten extrahieren."
+
+    df = pd.DataFrame(alle_raten)
+    df["Valid from dt"] = pd.to_datetime(df["Valid from"], dayfirst=True, errors="coerce")
+    df["Valid to dt"] = pd.to_datetime(df["Valid to"], dayfirst=True, errors="coerce")
+    return df, "Excel/CSV (Gemini-Extraktion)"
+
+
 def admin_login_bereich():
     st.write("### 🔐 Admin-Zugang")
     if not ADMIN_PASSWORD:
@@ -691,12 +796,24 @@ def normalisiere_upload_dataframe(df_upload):
             out[ziel] = default
 
     # Pflichtfelder befüllen
-    stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='FMS') # Standard auf FMS statt Unbekannt
+    stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='FMS')
     stelle_spalte_sicher('Contract Number', COLUMN_ALIASES['Contract Number'], default='Unbekannt')
     stelle_spalte_sicher('Port of Loading', COLUMN_ALIASES['Port of Loading'], default='Unbekannt')
     stelle_spalte_sicher('Port of Destination', COLUMN_ALIASES['Port of Destination'], default='Unbekannt')
     stelle_spalte_sicher('Valid from', COLUMN_ALIASES['Valid from'], default=None)
     stelle_spalte_sicher('Valid to', COLUMN_ALIASES['Valid to'], default=None)
+
+    # --- FIX: FALLBACK FÜR LEERE POL/POD SPALTEN (MAERSK TENDER FORMAT) ---
+    for ziel, fallbacks in [('Port of Loading', ['Receipt', 'Place of Receipt', 'Origin']), 
+                            ('Port of Destination', ['Delivery', 'Place of Delivery', 'Dest'])]:
+        if ziel in out.columns:
+            # Prüfen, ob die Spalte komplett leer ist
+            ist_leer = out[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
+            if ist_leer:
+                fallback_col = ermittle_erste_spalte(out, fallbacks)
+                if fallback_col:
+                    out[ziel] = out[fallback_col]
+    # ------------------------------------------------------------------------
 
     if '40HC' not in out.columns:
         preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
@@ -715,15 +832,15 @@ def normalisiere_upload_dataframe(df_upload):
     # --- RADIKALE VALIDIERUNG (TRASH-FILTER) ---
     ungueltige = {'UNBEKANNT', 'NAN', 'NONE', '', 'NIL', 'NULL'}
     
-    # Regel A: Preis muss vorhanden und größer als 50 sein (entfernt 0$ Raten und Trash)
+    # Regel A: Preis muss vorhanden und größer als 50 sein
     mask_preis = out['40HC'].notna() & (out['40HC'] > 50)
     
-    # Regel B: Häfen müssen existieren und dürfen keine wirren Texte/Zahlen sein
+    # Regel B: Häfen toleranter prüfen (ab 2 Buchstaben erlaubt für "US", "DE")
     def ist_gueltiger_hafen(val):
         s = str(val).strip()
-        if s.upper() in ungueltige or len(s) < 3 or len(s) > 40: return False
-        if re.match(r'^-?\d+(?:[.,]\d+)?$', s): return False # Nur Zahlen sind kein Hafen
-        if 'potential' in s.lower() or 'average' in s.lower(): return False # Statistik-Müll
+        if s.upper() in ungueltige or len(s) < 2 or len(s) > 50: return False
+        if re.match(r'^-?\d+(?:[.,]\d+)?$', s): return False # Nur Zahlen = kein Hafen
+        if 'potential' in s.lower() or 'average' in s.lower(): return False
         return True
 
     mask_pol = out['Port of Loading'].apply(ist_gueltiger_hafen)
@@ -826,7 +943,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             try:
                 df_fast = pd.read_excel(datei, sheet_name=0)
                 df_fast_std = standardisiere_spalten(df_fast)
-                if 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
+                # Maersk-Tender haben eine 'Charge'-Spalte → NICHT den Schnellpfad nehmen,
+                # sonst werden Surcharges nicht gruppiert und BAS/Surcharges als separate Raten importiert.
+                hat_charge_spalte = any(
+                    str(c).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']
+                    for c in df_fast_std.columns
+                )
+                if not hat_charge_spalte and 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
                     if 'Contract Number' not in df_fast_std.columns:
                         if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                             df_fast_std['Contract Number'] = fn_match.group(1)
@@ -847,20 +970,26 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if df_sheet.empty:
                     continue
 
-                # A. Bestimme Header-Zeile durch SCORING
+                # A. Bestimme Header-Zeile durch SCORING (Deep-Scan)
                 sheet_header_idx = None
                 
-                # 1. Versuch: Strenge Suche (Mindestens 3 Treffer)
-                for i in range(min(60, len(df_sheet))):
+                # Gehe alle Zeilen durch (auch tausende), aber überspringe leere Zeilen sofort
+                for i in range(len(df_sheet)):
                     row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
+                    if len(row_vals) < 3: 
+                        continue # Überspringt Zeilen mit weniger als 3 Werten (spart enorm Zeit)
+                        
+                    # Strenge Suche (3 Treffer)
                     if zaehle_bekannte_spalten(row_vals) >= 3:
                         sheet_header_idx = i
                         break 
                 
-                # 2. Versuch: Lockere Suche (2 Treffer)
+                # 2. Versuch: Lockere Suche (2 Treffer), falls nichts gefunden wurde
                 if sheet_header_idx is None:
-                    for i in range(min(60, len(df_sheet))):
+                    for i in range(len(df_sheet)):
                         row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
+                        if len(row_vals) < 2:
+                            continue
                         if zaehle_bekannte_spalten(row_vals) >= 2:
                             sheet_header_idx = i
                             break 
@@ -938,17 +1067,21 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
             header_idx = None
             
-            # 1. Versuch: Strenge Suche
-            for i in range(min(60, len(df_csv))):
+            # 1. Versuch: Strenge Suche (Deep-Scan)
+            for i in range(len(df_csv)):
                 row_vals = df_csv.iloc[i].dropna().astype(str).tolist()
+                if len(row_vals) < 3:
+                    continue
                 if zaehle_bekannte_spalten(row_vals) >= 3:
                     header_idx = i
                     break
                     
             # 2. Versuch: Lockere Suche
             if header_idx is None:
-                for i in range(min(60, len(df_csv))):
+                for i in range(len(df_csv)):
                     row_vals = df_csv.iloc[i].dropna().astype(str).tolist()
+                    if len(row_vals) < 2:
+                        continue
                     if zaehle_bekannte_spalten(row_vals) >= 2:
                         header_idx = i
                         break
@@ -1007,7 +1140,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
         # === NACHBEREITUNG FÜR BEIDE (EXCEL & CSV) ===
         if df_raw.empty:
+            # === GEMINI FALLBACK #1: Heuristik hat keinen Header gefunden ===
+            if GEMINI_API_KEY:
+                st.info("📡 Heuristik konnte keine Daten extrahieren – versuche Gemini-Extraktion…")
+                return extrahiere_excel_mit_gemini(file_bytes, file_name)
             return pd.DataFrame(), "Datei ist leer nach der Verarbeitung."
+
+        # =================================================================
+        # FIX 1: FALLBACK FÜR LEERE POL/POD SPALTEN (MAERSK TENDER)
+        # Muss VOR dem Grouping passieren, damit die Häfen bekannt sind!
+        # =================================================================
+        for ziel, fallbacks in [('Port of Loading', ['Receipt', 'Place of Receipt', 'Origin']), 
+                                ('Port of Destination', ['Delivery', 'Place of Delivery', 'Dest'])]:
+            if ziel in df_raw.columns:
+                ist_leer = df_raw[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
+                if ist_leer:
+                    fallback_col = ermittle_erste_spalte(df_raw, fallbacks)
+                    if fallback_col:
+                        df_raw[ziel] = df_raw[fallback_col]
+            else:
+                fallback_col = ermittle_erste_spalte(df_raw, fallbacks)
+                if fallback_col:
+                    df_raw[ziel] = df_raw[fallback_col]
 
         if global_contract == "Unbekannt":
             if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
@@ -1047,6 +1201,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 eff_val = group_name[2] if len(group_name) > 2 else ""
                 exp_val = group_name[3] if len(group_name) > 3 else ""
 
+                # =================================================================
+                # FIX 2: ZUSCHLÄGE SAUBER EXTRAHIEREN (Ignoriert 0 USD & Inclusive)
+                # =================================================================
+                prepaid_surcharges = []
+                collect_surcharges = []
+                collect_codes = {'CP1', 'CP2', 'THD', 'DTHC', 'DDF', 'DDC'}
+                surcharge_rows = group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
+                
+                for _, r in surcharge_rows.iterrows():
+                    code = str(r[charge_col]).strip()
+                    val_text = str(r['40HC']).strip()
+                    
+                    s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=waehrung)
+                    
+                    # Nur Beträge > 0 übernehmen 
+                    if s_amt is not None and s_amt > 0:
+                        eintrag = f"{code} = {s_amt:.2f} {s_curr}"
+                        if code.upper() in collect_codes:
+                            collect_surcharges.append(eintrag)
+                        else:
+                            prepaid_surcharges.append(eintrag)
+
                 standard_rows.append({
                     'Carrier': 'Maersk',
                     'Contract Number': global_contract,
@@ -1056,8 +1232,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     'Valid to': exp_val,
                     '40HC': basis_betrag,
                     'Currency': waehrung,
-                    'Included Prepaid Surcharges 40HC': ", ".join([f"{r[charge_col]} = {r['40HC']}" for _, r in group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])].iterrows() if ' ' in str(r['40HC'])]),
-                    'Included Collect Surcharges 40HC': "",
+                    'Included Prepaid Surcharges 40HC': ", ".join(prepaid_surcharges),
+                    'Included Collect Surcharges 40HC': ", ".join(collect_surcharges),
                     'Remark': f"Transit Time: {bas_row[tt_col].values[0]}" if tt_col and tt_col in bas_row.columns else "",
                 })
             
@@ -1076,6 +1252,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             elif global_contract != "Unbekannt":
                 df_raw['Contract Number'] = global_contract
             df_return = df_raw
+
+        # === GEMINI FALLBACK #2: Heuristik hat Daten, aber alles Trash ===
+        if df_return.empty and GEMINI_API_KEY:
+            st.info("📡 Heuristische Verarbeitung ergab keine verwertbaren Zeilen – versuche Gemini-Extraktion…")
+            return extrahiere_excel_mit_gemini(file_bytes, file_name)
 
         return df_return, "Excel/CSV (Multi-Sheet)"
 
