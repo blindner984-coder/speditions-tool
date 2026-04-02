@@ -775,6 +775,13 @@ def standardisiere_spalten(df):
         if str(c).strip().lower() in geschuetzte_namen:
             bereits_gemappt.add(c)
 
+    # Spalten, die bereits den korrekten Zielnamen tragen, vor Umbenennungen schützen.
+    # Ohne diesen Schutz könnte z.B. '40HC' durch den Alias-Token '40hc' in
+    # 'Included Prepaid Surcharges 40HC' per Fuzzy-Match (token_set_ratio=100%) überschrieben werden.
+    for ziel in COLUMN_ALIASES.keys():
+        if ziel in df.columns:
+            bereits_gemappt.add(ziel)
+
     # --- PASS 1: Nur EXAKTE Treffer ---
     for ziel, kandidaten in COLUMN_ALIASES.items():
         if ziel in df.columns:
@@ -979,6 +986,16 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     for c in df_fast_std.columns
                 )
                 if not hat_charge_spalte and 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
+                    # FIX: Receipt/Delivery haben Vorrang vor leeren POL/POD-Spalten
+                    for _ziel, _vorrang in [('Port of Loading', ['Receipt', 'Place of Receipt']),
+                                            ('Port of Destination', ['Delivery', 'Place of Delivery'])]:
+                        _vorrang_col = ermittle_erste_spalte(df_fast_std, _vorrang)
+                        if _vorrang_col:
+                            _hat_daten = not df_fast_std[_vorrang_col].astype(str).str.strip().replace(
+                                {'nan': '', 'None': '', 'NaN': ''}
+                            ).eq('').all()
+                            if _hat_daten:
+                                df_fast_std[_ziel] = df_fast_std[_vorrang_col]
                     if 'Contract Number' not in df_fast_std.columns:
                         if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                             df_fast_std['Contract Number'] = fn_match.group(1)
