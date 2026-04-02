@@ -246,7 +246,7 @@ def parse_decimal_wert(value):
 
 def extrahiere_waehrung_und_betrag(text, default_currency="USD"):
     text_str = str(text)
-    waehrung_match = re.search(r"\b(USD|EUR)\b", text_str, re.IGNORECASE)
+    waehrung_match = re.search(r"\b([A-Z]{3})\b", text_str, re.IGNORECASE)
     betrag_match = re.search(r"(\d[\d\.,]*)", text_str)
     betrag = parse_decimal_wert(betrag_match.group(1)) if betrag_match else None
     waehrung = waehrung_match.group(1).upper() if waehrung_match else default_currency
@@ -327,9 +327,10 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
+        safe_text = str(text)[:15000]
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=_SYSTEM_PROMPT + "\n\nPDF TEXT:\n" + str(text),
+            contents=_SYSTEM_PROMPT + "\n\n<pdf_inhalt>\n" + safe_text + "\n</pdf_inhalt>",
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=ExtractionResponse,
@@ -541,7 +542,7 @@ def berechne_gebuehren(zuschlaege_str):
     return liste
 
 
-def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharge_col, row_index):
+def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharge_col, row_index, include_all_collect=False):
     basis = parse_decimal_wert(row.get(price_col))
     if basis is None:
         return 99999999
@@ -557,7 +558,7 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
         if ist_doc_gebuehr(g['name']):
             continue
-        if st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
+        if include_all_collect or st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
             summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
 
     return basis_eur + summe_gebuehren_eur
@@ -711,6 +712,35 @@ def ermittle_erste_spalte(df, kandidaten):
     return None
 
 
+def ermittle_preisspalte_40hc(df):
+    """Ermittelt robust die 40' Preis-Spalte und vermeidet Surcharge-Textspalten."""
+    sperrwoerter = {
+        "surcharge", "collect", "prepaid", "included", "remark", "comment",
+        "charge section", "charge code",
+    }
+
+    bevorzugt = [
+        "40HC", "40 HC", "40HQ", "40' HC", "40'HC", "40ST", "40DV/HC", "40DRY",
+    ]
+    spalten_map = {str(c).strip().lower(): c for c in df.columns}
+
+    for name in bevorzugt:
+        key = name.strip().lower()
+        if key in spalten_map:
+            return spalten_map[key]
+
+    muster = re.compile(r"(?:^|\b)40\s*(?:hc|hq|st|h|dry)(?:\b|$)|40'?\s*(?:hc|hq)", re.IGNORECASE)
+    for col in df.columns:
+        c = str(col).strip()
+        c_low = c.lower()
+        if any(w in c_low for w in sperrwoerter):
+            continue
+        if muster.search(c_low):
+            return col
+
+    return None
+
+
 def zaehle_bekannte_spalten(zeile_werte: list) -> int:
     """Gibt der Zeile einen Score. So finden wir die ECHTE Tabellen-Kopfzeile."""
     alle_aliases = [alias.lower() for aliases in COLUMN_ALIASES.values() for alias in aliases]
@@ -811,20 +841,10 @@ def normalisiere_upload_dataframe(df_upload):
     stelle_spalte_sicher('Valid from', COLUMN_ALIASES['Valid from'], default=None)
     stelle_spalte_sicher('Valid to', COLUMN_ALIASES['Valid to'], default=None)
 
-    # --- FIX: FALLBACK FÜR LEERE POL/POD SPALTEN (MAERSK TENDER FORMAT) ---
-    for ziel, fallbacks in [('Port of Loading', ['Receipt', 'Place of Receipt', 'Origin']), 
-                            ('Port of Destination', ['Delivery', 'Place of Delivery', 'Dest'])]:
-        if ziel in out.columns:
-            # Prüfen, ob die Spalte komplett leer ist
-            ist_leer = out[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
-            if ist_leer:
-                fallback_col = ermittle_erste_spalte(out, fallbacks)
-                if fallback_col:
-                    out[ziel] = out[fallback_col]
-    # ------------------------------------------------------------------------
-
     if '40HC' not in out.columns:
-        preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
+        preis_col = ermittle_preisspalte_40hc(out)
+        if preis_col is None:
+            preis_col = ermittle_erste_spalte(out, COLUMN_ALIASES['40HC'])
         out['40HC'] = out[preis_col] if preis_col is not None else None
 
     # Währungs-Check
@@ -840,8 +860,8 @@ def normalisiere_upload_dataframe(df_upload):
     # --- RADIKALE VALIDIERUNG (TRASH-FILTER) ---
     ungueltige = {'UNBEKANNT', 'NAN', 'NONE', '', 'NIL', 'NULL'}
     
-    # Regel A: Preis muss vorhanden und größer als 50 sein
-    mask_preis = out['40HC'].notna() & (out['40HC'] > 50)
+    # Regel A: Preis muss vorhanden und größer als 0 sein
+    mask_preis = out['40HC'].notna() & (out['40HC'] > 0)
     
     # Regel B: Häfen toleranter prüfen (ab 2 Buchstaben erlaubt für "US", "DE")
     def ist_gueltiger_hafen(val):
@@ -912,7 +932,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             pol_match = re.search(r'(?:POL|Port of Loading|From)[\s:]{1,3}([A-Za-z\s\.,]+)(?:POD|Port of Discharge|To|Vessel|Voyage|\n)', text, re.IGNORECASE)
             pod_match = re.search(r'(?:POD|Port of Discharge|Destination|To)[\s:]{1,3}([A-Za-z\s\.,]+)(?:Vessel|Voyage|Commodity|Term|\n)', text, re.IGNORECASE)
             contract_match = re.search(r'(?:Contract Filing Reference|Contract|Quote)[\s\S]{1,350}?\b([A-Z]*\d{5,}[A-Z0-9]*)\b', text, re.IGNORECASE)
-            contract_no = contract_match.group(1) if contract_match else (re.search(r'\b(R\d{12,18})\b', text).group(1) if re.search(r'\b(R\d{12,18})\b', text) else "Unbekannt")
+            _r_match = re.search(r'\b(R\d{12,18})\b', text)
+            contract_no = contract_match.group(1) if contract_match else (_r_match.group(1) if _r_match else "Unbekannt")
             rate_match = re.search(r'(\d[\d\.,]*)\s*(USD|EUR)\b', text)
             rate_value = parse_decimal_wert(rate_match.group(1)) if rate_match else None
             rate_currency = rate_match.group(2).upper() if rate_match else "USD"
@@ -1155,19 +1176,19 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             return pd.DataFrame(), "Datei ist leer nach der Verarbeitung."
 
         # =================================================================
-        # FIX 1: FALLBACK FÜR LEERE POL/POD SPALTEN (MAERSK TENDER)
+        # FIX 1: DELIVERY/RECEIPT HABEN VORRANG VOR POD/POL
+        # Delivery = tatsächliche Enddestination, Receipt = tatsächlicher Abgangsort
         # Muss VOR dem Grouping passieren, damit die Häfen bekannt sind!
         # =================================================================
-        for ziel, fallbacks in [('Port of Loading', ['Receipt', 'Place of Receipt', 'Origin']), 
-                                ('Port of Destination', ['Delivery', 'Place of Delivery', 'Dest'])]:
-            if ziel in df_raw.columns:
-                ist_leer = df_raw[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
-                if ist_leer:
-                    fallback_col = ermittle_erste_spalte(df_raw, fallbacks)
-                    if fallback_col:
-                        df_raw[ziel] = df_raw[fallback_col]
-            else:
-                fallback_col = ermittle_erste_spalte(df_raw, fallbacks)
+        for ziel, vorrang in [('Port of Loading', ['Receipt', 'Place of Receipt']), 
+                              ('Port of Destination', ['Delivery', 'Place of Delivery'])]:
+            vorrang_col = ermittle_erste_spalte(df_raw, vorrang)
+            if vorrang_col:
+                hat_daten = not df_raw[vorrang_col].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
+                if hat_daten:
+                    df_raw[ziel] = df_raw[vorrang_col]
+            elif ziel not in df_raw.columns:
+                fallback_col = ermittle_erste_spalte(df_raw, ['Origin', 'Dest'] if 'Loading' in ziel else ['Dest', 'Origin'])
                 if fallback_col:
                     df_raw[ziel] = df_raw[fallback_col]
 
@@ -1177,15 +1198,30 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
         # --- Maersk-Format Check ---
         charge_col = None
-        for col in df_raw.columns:
-            if str(col).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']:
-                charge_col = col
+        for preferred in ['charge code', 'charge type', 'chrg', 'charge']:
+            for col in df_raw.columns:
+                if str(col).strip().lower() == preferred:
+                    charge_col = col
+                    break
+            if charge_col is not None:
                 break
 
+        # Wenn 40HC nicht vorhanden ist (z.B. nur 40ST), mappen wir die passende Spalte vorab auf 40HC.
+        if '40HC' not in df_raw.columns:
+            preis_spalte = ermittle_preisspalte_40hc(df_raw)
+            if preis_spalte is not None:
+                df_raw['40HC'] = df_raw[preis_spalte]
+
         ist_maersk_format = False
+        charge_desc_col = ermittle_erste_spalte(df_raw, ['Charge description', 'Description'])
+        charge_section_col = ermittle_erste_spalte(df_raw, ['Charge section', 'Section'])
         if charge_col is not None and '40HC' in df_raw.columns and 'Port of Loading' in df_raw.columns and 'Port of Destination' in df_raw.columns:
-            if df_raw[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC']).any():
-                ist_maersk_format = True
+            codes = df_raw[charge_col].astype(str).str.strip().str.upper()
+            has_bas_code = codes.isin(['BAS', 'BASIC']).any()
+            has_freight_section = False
+            if charge_section_col in df_raw.columns:
+                has_freight_section = df_raw[charge_section_col].astype(str).str.strip().str.lower().eq('freight').any()
+            ist_maersk_format = has_bas_code or has_freight_section
 
         if ist_maersk_format:
             eff_col = 'Valid from' if 'Valid from' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid from'])
@@ -1193,43 +1229,75 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             tt_col = ermittle_erste_spalte(df_raw, ['Transit Time', 'Transit Days', 'TT'])
 
             group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
+            # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities etc. nicht überschrieben werden
+            for extra_col in ['Commodity Name', 'Service Mode', 'Equipment Type']:
+                if extra_col in df_raw.columns and extra_col not in group_cols:
+                    group_cols.append(extra_col)
 
             standard_rows = []
             for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
-                bas_row = group[group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
+                code_series = group[charge_col].astype(str).str.strip().str.upper()
+                bas_mask = code_series.isin(['BAS', 'BASIC'])
+                if charge_section_col in group.columns:
+                    bas_mask = bas_mask | group[charge_section_col].astype(str).str.strip().str.lower().eq('freight')
+                if charge_desc_col in group.columns:
+                    bas_mask = bas_mask | group[charge_desc_col].astype(str).str.contains(
+                        r'rate\s*per\s*container|ocean\s*freight|base\s*rate',
+                        flags=re.IGNORECASE,
+                        regex=True,
+                        na=False,
+                    )
+
+                bas_row = group[bas_mask]
                 if bas_row.empty: continue
                 
                 bas_text = str(bas_row['40HC'].values[0]).strip()
                 waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
                 if basis_betrag is None or basis_betrag <= 0: continue
 
-                group_name = name if isinstance(name, tuple) else (name,)
-                pol_val = group_name[0] if len(group_name) > 0 else "Unbekannt"
-                pod_val = group_name[1] if len(group_name) > 1 else "Unbekannt"
-                eff_val = group_name[2] if len(group_name) > 2 else ""
-                exp_val = group_name[3] if len(group_name) > 3 else ""
+                group_dict = dict(zip(group_cols, name if isinstance(name, tuple) else (name,)))
+                pol_val = group_dict.get('Port of Loading', 'Unbekannt')
+                pod_val = group_dict.get('Port of Destination', 'Unbekannt')
+                eff_val = group_dict.get(eff_col, '') if eff_col else ''
+                exp_val = group_dict.get(exp_col, '') if exp_col else ''
+                commodity_val = group_dict.get('Commodity Name', '')
 
                 # =================================================================
                 # FIX 2: ZUSCHLÄGE SAUBER EXTRAHIEREN (Ignoriert 0 USD & Inclusive)
                 # =================================================================
                 prepaid_surcharges = []
                 collect_surcharges = []
-                collect_codes = {'CP1', 'CP2', 'VP1', 'THD', 'DTHC', 'DDF', 'DDC'}
-                surcharge_rows = group[~group[charge_col].astype(str).str.strip().str.upper().isin(['BAS', 'BASIC'])]
+                collect_codes = {'CP1', 'CP2', 'VP1', 'THD', 'DTHC', 'DDF', 'DDC', 'THC34', 'LPC51', 'CAR45'}
+                surcharge_rows = group[~bas_mask]
                 
                 for _, r in surcharge_rows.iterrows():
                     code = str(r[charge_col]).strip()
                     val_text = str(r['40HC']).strip()
+                    beschreibung = str(r.get(charge_desc_col, '')).lower().strip() if charge_desc_col else ''
+                    section = str(r.get(charge_section_col, '')).lower().strip() if charge_section_col else ''
                     
                     s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=waehrung)
                     
                     # Nur Beträge > 0 übernehmen 
                     if s_amt is not None and s_amt > 0:
                         eintrag = f"{code} = {s_amt:.2f} {s_curr}"
-                        if code.upper() in collect_codes:
+                        ist_collect = (
+                            code.upper() in collect_codes
+                            or 'destination' in beschreibung
+                            or 'dthc' in beschreibung
+                            or 'local terminal recovery' in beschreibung
+                            or section == 'destination'
+                        )
+                        if ist_collect:
                             collect_surcharges.append(eintrag)
                         else:
                             prepaid_surcharges.append(eintrag)
+
+                remark_parts = []
+                if tt_col and tt_col in bas_row.columns:
+                    remark_parts.append(f"Transit Time: {bas_row[tt_col].values[0]}")
+                if commodity_val:
+                    remark_parts.append(f"Commodity: {commodity_val}")
 
                 standard_rows.append({
                     'Carrier': 'Maersk',
@@ -1242,7 +1310,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     'Currency': waehrung,
                     'Included Prepaid Surcharges 40HC': ", ".join(prepaid_surcharges),
                     'Included Collect Surcharges 40HC': ", ".join(collect_surcharges),
-                    'Remark': f"Transit Time: {bas_row[tt_col].values[0]}" if tt_col and tt_col in bas_row.columns else "",
+                    'Remark': " | ".join(remark_parts),
                 })
             
             if standard_rows:
@@ -1293,8 +1361,13 @@ def speichere_dataframe_batchweise(df_upload):
         batch_records = records[start_idx:end_idx]
         if not batch_records:
             continue
-        collection.insert_many(batch_records, ordered=False)
-        gespeichert += len(batch_records)
+        try:
+            collection.insert_many(batch_records, ordered=False)
+            gespeichert += len(batch_records)
+        except pymongo.errors.BulkWriteError as bwe:
+            inserted = bwe.details.get('nInserted', 0)
+            gespeichert += inserted
+            st.warning(f"Batch teilweise eingefügt: {inserted}/{len(batch_records)} Zeilen (restliche z.B. Duplikate übersprungen).")
         fortschritt.progress(min(gespeichert / total, 1.0))
         status.caption(f"💾 Speichere in Datenbank: {gespeichert}/{total} Zeilen")
 
@@ -1563,7 +1636,7 @@ with tab_analytics:
                     st.warning("Keine verwertbaren Datensätze (fehlende Datum- oder Preisangaben).")
                 else:
                     df_trend['All-In EUR'] = df_trend.apply(
-                        lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name),
+                        lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name, include_all_collect=True),
                         axis=1
                     )
                     df_trend = df_trend.sort_values('Valid from dt')
