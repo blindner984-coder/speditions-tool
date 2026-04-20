@@ -892,6 +892,431 @@ def standardisiere_spalten(df):
     return df.rename(columns=rename_map)
 
 
+def parse_datum_standard(value):
+    if isinstance(value, (pd.Timestamp, datetime)):
+        if pd.isna(value):
+            return None
+        return value.strftime("%d.%m.%Y")
+
+    if pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return None
+
+    if re.fullmatch(r"\d{8}", text):
+        parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+    elif re.match(r"^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?$", text):
+        parsed = pd.to_datetime(text, errors="coerce")
+    else:
+        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+
+    if pd.notna(parsed):
+        return parsed.strftime("%d.%m.%Y")
+    return text
+
+
+def parse_timestamp_standard(value):
+    text = parse_datum_standard(value)
+    if text is None:
+        return pd.NaT
+    return pd.to_datetime(text, format="%d.%m.%Y", errors="coerce")
+
+
+def dataframe_mit_header_aus_zeile(df_sheet, header_idx, data_start_offset=1):
+    rohe_spalten = df_sheet.iloc[header_idx].astype(str).str.strip().tolist()
+    neue_spalten = []
+    gesehen = {}
+    for spalte in rohe_spalten:
+        if spalte in gesehen:
+            gesehen[spalte] += 1
+            neue_spalten.append(f"{spalte}.{gesehen[spalte]}")
+        else:
+            gesehen[spalte] = 0
+            neue_spalten.append(spalte)
+
+    df_clean = df_sheet.iloc[header_idx + data_start_offset:].reset_index(drop=True).copy()
+    df_clean.columns = neue_spalten
+    return df_clean.dropna(how="all").reset_index(drop=True)
+
+
+def extrahiere_codes_aus_liste(text):
+    if pd.isna(text):
+        return []
+    teile = [t.strip() for t in re.split(r"[,;\n]", str(text)) if t and str(t).strip()]
+    return list(dict.fromkeys([t for t in teile if t.lower() not in {"nan", "none"}]))
+
+
+def dedupliziere_eintraege(eintraege):
+    return list(dict.fromkeys([str(e).strip() for e in eintraege if str(e).strip()]))
+
+
+def dedupliziere_surcharge_string(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    teile = [t.strip() for t in text.split(",") if t.strip()]
+    return ", ".join(dedupliziere_eintraege(teile))
+
+
+def extrahiere_mehrfach_pols(pol_text):
+    text = str(pol_text or "").strip()
+    if not text:
+        return []
+
+    if "/" in text:
+        teile = [t.strip() for t in text.split("/") if t.strip()]
+        return teile if len(teile) > 1 else [text]
+
+    if re.search(r"\band\b", text, flags=re.IGNORECASE):
+        teile = [t.strip() for t in re.split(r"\band\b", text, flags=re.IGNORECASE) if t.strip()]
+        return teile if len(teile) > 1 else [text]
+
+    komma_teile = [t.strip() for t in text.split(",") if t.strip()]
+    if len(komma_teile) >= 3:
+        return komma_teile
+
+    return [text]
+
+
+def expandiere_mehrfach_pol_zeilen(df):
+    if 'Port of Loading' not in df.columns or df.empty:
+        return df
+
+    neue_zeilen = []
+    for _, row in df.iterrows():
+        pols = extrahiere_mehrfach_pols(row.get('Port of Loading'))
+        if len(pols) <= 1:
+            neue_zeilen.append(row.to_dict())
+            continue
+
+        for pol in pols:
+            neue_row = row.to_dict()
+            neue_row['Port of Loading'] = pol
+            neue_zeilen.append(neue_row)
+
+    return pd.DataFrame(neue_zeilen)
+
+
+def extrahiere_hapag_quotation_excel(excel_dict, file_name):
+    alle_rows = []
+
+    for sheet_name, df_sheet in excel_dict.items():
+        header_idx = None
+        for i in range(min(len(df_sheet), 40)):
+            row_vals = [str(v).strip().lower() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'charge type' in row_vals and 'charge code' in row_vals and 'amount' in row_vals:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        meta_text = " ".join(df_sheet.iloc[:header_idx].fillna("").astype(str).values.flatten())
+        quote_match = re.search(r"\bQ\d{4}[A-Z]{3}\d{5,}(?:/\d+)?\b", meta_text)
+        meta_dates = re.findall(r"\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?|\d{8}|\d{2}[./-]\d{2}[./-]\d{4}", meta_text)
+        valid_from_value = meta_dates[0] if len(meta_dates) >= 1 else None
+        valid_to_value = meta_dates[1] if len(meta_dates) >= 2 else None
+
+        df_clean = dataframe_mit_header_aus_zeile(df_sheet, header_idx)
+
+        charge_type_col = ermittle_erste_spalte(df_clean, ['Charge Type'])
+        charge_code_col = ermittle_erste_spalte(df_clean, ['Charge Code'])
+        container_col = ermittle_erste_spalte(df_clean, ['Container'])
+        amount_col = ermittle_erste_spalte(df_clean, ['Amount'])
+        currency_col = ermittle_erste_spalte(df_clean, ['Curr.', 'Currency'])
+        pol_col = ermittle_erste_spalte(df_clean, ['Port of Loading'])
+        pod_col = ermittle_erste_spalte(df_clean, ['Port of Discharge', 'Port of Destination'])
+        srv_col = ermittle_erste_spalte(df_clean, ['Srv ID'])
+        tt_col = ermittle_erste_spalte(df_clean, ['T/T*'])
+        commodity_col = ermittle_erste_spalte(df_clean, ['Commodity'])
+        mfr_col = ermittle_erste_spalte(df_clean, ['Marine Fuel Recovery included in Lumpsum'])
+        uom_col = ermittle_erste_spalte(df_clean, ['Unit of Measure'])
+
+        if not all([charge_type_col, charge_code_col, container_col, amount_col, currency_col, pol_col, pod_col]):
+            continue
+
+        df_40 = df_clean[df_clean[container_col].astype(str).str.contains('40', case=False, na=False)].copy()
+        if df_40.empty:
+            continue
+
+        group_keys = [pol_col, pod_col]
+        if srv_col and srv_col in df_40.columns:
+            group_keys.insert(0, srv_col)
+
+        for _, group in df_40.groupby(group_keys, dropna=False):
+            charge_types = group[charge_type_col].astype(str).str.strip().str.lower()
+            base_rows = group[charge_types.eq('freight rate')]
+            if base_rows.empty:
+                continue
+
+            base_row = base_rows.iloc[0]
+            basis = parse_decimal_wert(base_row.get(amount_col))
+            if basis is None or basis <= 0:
+                continue
+
+            prepaid = []
+            collect = []
+
+            # MFR ist in der Lumpsum enthalten (Not Subject to Charges) → NICHT als Zuschlag
+            # stattdessen im Remark vermerken
+            mfr_text = str(base_row.get(mfr_col, '')).strip() if mfr_col else ''
+
+            surcharge_rows = group[group.index != base_row.name]
+            for _, surcharge_row in surcharge_rows.iterrows():
+                code = str(surcharge_row.get(charge_code_col, '')).strip().upper()
+                if not code:
+                    continue
+                amount = parse_decimal_wert(surcharge_row.get(amount_col))
+                if amount in (None, 0):
+                    continue
+                curr = str(surcharge_row.get(currency_col, base_row.get(currency_col, 'USD'))).strip().upper() or 'USD'
+                entry = f"{code} = {amount:.2f} {curr}"
+                charge_type = str(surcharge_row.get(charge_type_col, '')).strip().lower()
+                if 'import surcharge' in charge_type:
+                    collect.append(entry)
+                else:
+                    prepaid.append(entry)
+
+            remark_parts = []
+            if mfr_text:
+                remark_parts.append(f"MFR inkl. ({mfr_text})")
+            if tt_col and pd.notna(base_row.get(tt_col)):
+                remark_parts.append(f"Transit Time: {base_row.get(tt_col)}")
+            if commodity_col and pd.notna(base_row.get(commodity_col)):
+                remark_parts.append(f"Commodity: {base_row.get(commodity_col)}")
+            if uom_col and pd.notna(base_row.get(uom_col)) and str(base_row.get(uom_col)).strip().upper() != 'CTR':
+                remark_parts.append(f"Unit: {base_row.get(uom_col)}")
+
+            alle_rows.append({
+                'Carrier': 'Hapag-Lloyd',
+                'Contract Number': quote_match.group(0) if quote_match else 'Unbekannt',
+                'Port of Loading': str(base_row.get(pol_col, '')).strip(),
+                'Port of Destination': str(base_row.get(pod_col, '')).strip(),
+                'Valid from': parse_datum_standard(valid_from_value),
+                'Valid to': parse_datum_standard(valid_to_value),
+                '40HC': basis,
+                'Currency': str(base_row.get(currency_col, 'USD')).strip().upper() or 'USD',
+                'Included Prepaid Surcharges 40HC': ", ".join(dedupliziere_eintraege(prepaid)),
+                'Included Collect Surcharges 40HC': ", ".join(dedupliziere_eintraege(collect)),
+                'Remark': " | ".join(remark_parts),
+            })
+
+    return pd.DataFrame(alle_rows) if alle_rows else None
+
+
+def baue_ccpr_surcharge_lookup(df_sheet):
+    header_idx = None
+    for i in range(min(len(df_sheet), 20)):
+        row_vals = [str(v).strip() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+        if 'CHARGE_TYPE_CODE' in row_vals and 'GROUP_NAME_3' in row_vals:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return {}
+
+    df_lookup = dataframe_mit_header_aus_zeile(df_sheet, header_idx, data_start_offset=2)
+    lookup = {}
+    for _, row in df_lookup.iterrows():
+        code = str(row.get('CHARGE_TYPE_CODE', '')).strip().upper()
+        if not code:
+            continue
+        amount = parse_decimal_wert(row.get('GROUP_NAME_3'))
+        if amount is None:
+            continue
+        lookup.setdefault(code, []).append({
+            'amount': amount,
+            'currency': str(row.get('CURRENCY', 'USD')).strip().upper() or 'USD',
+            'valid_from': pd.to_datetime(row.get('VALID_FROM'), errors='coerce'),
+            'account': str(row.get('ACCOUNT_MC_NAME', '')).strip(),
+            'geo_from': str(row.get('INFO_GEO_FROM', '')).strip(),
+        })
+
+    for code in lookup:
+        lookup[code] = sorted(lookup[code], key=lambda item: (pd.Timestamp.min if pd.isna(item['valid_from']) else item['valid_from']))
+    return lookup
+
+
+def waehle_ccpr_surcharge(code, surcharge_lookup, account_name='', geo_from=''):
+    kandidaten = surcharge_lookup.get(code, [])
+    if not kandidaten:
+        return None
+
+    if account_name:
+        account_treffer = [k for k in kandidaten if k.get('account') == account_name]
+        if account_treffer:
+            kandidaten = account_treffer
+
+    if geo_from:
+        geo_treffer = [k for k in kandidaten if not k.get('geo_from') or k.get('geo_from') == geo_from]
+        if geo_treffer:
+            kandidaten = geo_treffer
+
+    return kandidaten[-1]
+
+
+def extrahiere_ccpr_excel(excel_dict, file_name):
+    if 'Seafreights' not in excel_dict:
+        return None
+
+    df_sheet = excel_dict['Seafreights']
+    header_idx = None
+    for i in range(min(len(df_sheet), 20)):
+        row_vals = [str(v).strip() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+        if 'BFR_DESCRIPTION' in row_vals and 'VALID_FROM' in row_vals and 'GROUP_NAME_2' in row_vals:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return None
+
+    meta_text = " ".join(df_sheet.iloc[:header_idx].fillna("").astype(str).values.flatten())
+    contract_match = re.search(r"\b\d{6,}\b", meta_text)
+    valid_from_match = re.search(r"CONTRACT VALID FROM\s*(\d{4}-\d{2}-\d{2}|\d{8}|\d{2}[./-]\d{2}[./-]\d{4})", meta_text, re.IGNORECASE)
+    valid_to_match = re.search(r"CONTRACT VALID TO\s*(\d{4}-\d{2}-\d{2}|\d{8}|\d{2}[./-]\d{2}[./-]\d{4})", meta_text, re.IGNORECASE)
+
+    df_rates = dataframe_mit_header_aus_zeile(df_sheet, header_idx, data_start_offset=2)
+    surcharge_lookup = baue_ccpr_surcharge_lookup(excel_dict.get('Surcharges', pd.DataFrame())) if 'Surcharges' in excel_dict else {}
+
+    rows = []
+    collect_codes = {'THD', 'DDF', 'EMF', 'ISF', 'LFD', 'CDC', 'SMD', 'TAD'}
+
+    for _, row in df_rates.iterrows():
+        basis = parse_decimal_wert(row.get('GROUP_NAME_2'))
+        if basis is None or basis <= 0:
+            continue
+        applicable_codes = dedupliziere_eintraege(
+            extrahiere_codes_aus_liste(row.get('CHG_SUBJECT_TO_CONTRACT'))
+            + extrahiere_codes_aus_liste(row.get('CHG_SUBJECT_TO_TARIFF'))
+        )
+        not_subject_codes = set(extrahiere_codes_aus_liste(row.get('CHG_NOT_SUBJECT_TO')))
+
+        prepaid = []
+        collect = []
+        account_name = str(row.get('ACCOUNT_MC_NAME', '')).strip()
+        geo_from = str(row.get('INFO_GEO_FROM', '')).strip()
+
+        for code in applicable_codes:
+            if code in not_subject_codes:
+                continue
+            surcharge = waehle_ccpr_surcharge(code, surcharge_lookup, account_name=account_name, geo_from=geo_from)
+            if surcharge is None or surcharge['amount'] == 0:
+                continue
+            entry = f"{code} = {surcharge['amount']:.2f} {surcharge['currency']}"
+            if code in collect_codes:
+                collect.append(entry)
+            else:
+                prepaid.append(entry)
+
+        contract_no = str(row.get('QUOTATION_NUMBER', '')).strip()
+        if not contract_no or contract_no.lower() in {'nan', 'none'}:
+            contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
+        valid_from = parse_datum_standard(row.get('VALID_FROM')) or (parse_datum_standard(valid_from_match.group(1)) if valid_from_match else None)
+        valid_to = parse_datum_standard(row.get('VALID_TO')) or (parse_datum_standard(valid_to_match.group(1)) if valid_to_match else None)
+
+        remark_parts = []
+        commodity = str(row.get('COMMODITY_DESCRIPTION', '')).strip()
+        if commodity:
+            remark_parts.append(f"Commodity: {commodity}")
+        remark_parts.append("CMA CGM Tarif-Rabattvertrag")
+
+        end_description = row.get('END_DESCRIPTION', '')
+        pod_value = str(end_description).strip() if pd.notna(end_description) else ''
+        if not pod_value or pod_value.lower() in {'nan', 'none'}:
+            pod_value = str(row.get('BTO_DESCRIPTION', '')).strip()
+
+        rows.append({
+            'Carrier': 'CMA CGM',
+            'Contract Number': contract_no,
+            'Port of Loading': str(row.get('BFR_DESCRIPTION', '')).strip(),
+            'Port of Destination': pod_value,
+            'Valid from': valid_from,
+            'Valid to': valid_to,
+            '40HC': basis,
+            'Currency': str(row.get('CURRENCY', 'USD')).strip().upper() or 'USD',
+            'Included Prepaid Surcharges 40HC': ", ".join(dedupliziere_eintraege(prepaid)),
+            'Included Collect Surcharges 40HC': ", ".join(dedupliziere_eintraege(collect)),
+            'Remark': " | ".join(remark_parts),
+        })
+
+    return pd.DataFrame(rows) if rows else None
+
+
+def extrahiere_evergreen_excel(excel_dict, file_name):
+    rows = []
+
+    for sheet_name, df_sheet in excel_dict.items():
+        if not re.match(r'^(SOC\s+)?SQ', str(sheet_name), flags=re.IGNORECASE):
+            continue
+
+        header_idx = None
+        for i in range(min(len(df_sheet), 15)):
+            row_vals = [str(v).strip() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'POL' in row_vals and 'POD' in row_vals and any(v in row_vals for v in ["40' HC", '40HC']):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        meta_text = " ".join(df_sheet.iloc[:header_idx].fillna("").astype(str).values.flatten())
+        sq_match = re.search(r"SQ NO:\s*([A-Z0-9]+)", meta_text, re.IGNORECASE)
+        ref_match = re.search(r"REFERENCE NO:\s*([A-Z0-9]+)", meta_text, re.IGNORECASE)
+        validity_match = re.search(r"VALIDITY\s*:\s*(\d{8})\s*-\s*(\d{8})", meta_text, re.IGNORECASE)
+
+        df_rates = dataframe_mit_header_aus_zeile(df_sheet, header_idx)
+        rate_col = ermittle_erste_spalte(df_rates, ["40' HC", '40HC'])
+        pol_col = ermittle_erste_spalte(df_rates, ['POL'])
+        pod_col = ermittle_erste_spalte(df_rates, ['POD'])
+        currency_col = ermittle_erste_spalte(df_rates, ['Currency'])
+        remark_col = ermittle_erste_spalte(df_rates, ['Remark'])
+        manifest_col = ermittle_erste_spalte(df_rates, ['Manifest Items'])
+        local_surcharge_col = ermittle_erste_spalte(df_rates, ['Local Surcharges'])
+
+        if not all([rate_col, pol_col, pod_col, currency_col]):
+            continue
+
+        for _, row in df_rates.iterrows():
+            price = parse_decimal_wert(row.get(rate_col))
+            if price is None:
+                continue
+
+            remark_parts = []
+            for spalte in [remark_col, manifest_col, local_surcharge_col]:
+                if spalte and pd.notna(row.get(spalte)):
+                    text = str(row.get(spalte)).strip()
+                    if text:
+                        remark_parts.append(re.sub(r'\s+', ' ', text))
+
+            # Vertragsnummer: ref_match > sq_match > Sheet-Name-Extraktion
+            _ref = ref_match.group(1) if ref_match else None
+            if _ref and _ref.upper() in ('NONE', 'N/A', ''):
+                _ref = None
+            _sq = sq_match.group(1) if sq_match else None
+            if not _ref and not _sq:
+                # Fallback: SQ-Nummer aus Sheet-Name extrahieren (z.B. 'SQK500741 fak' → 'SQK500741')
+                _sq_name_match = re.search(r'SQK?\d+', str(sheet_name), re.IGNORECASE)
+                _sq = _sq_name_match.group(0) if _sq_name_match else 'Unbekannt'
+            _contract_nr = _ref or _sq or 'Unbekannt'
+
+            rows.append({
+                'Carrier': 'Evergreen',
+                'Contract Number': _contract_nr,
+                'Port of Loading': str(row.get(pol_col, '')).strip(),
+                'Port of Destination': str(row.get(pod_col, '')).strip(),
+                'Valid from': parse_datum_standard(validity_match.group(1)) if validity_match else None,
+                'Valid to': parse_datum_standard(validity_match.group(2)) if validity_match else None,
+                '40HC': price,
+                'Currency': str(row.get(currency_col, 'USD')).strip().upper() or 'USD',
+                'Included Prepaid Surcharges 40HC': '',
+                'Included Collect Surcharges 40HC': '',
+                'Remark': ' | '.join(dedupliziere_eintraege(remark_parts)),
+            })
+
+    return pd.DataFrame(rows) if rows else None
+
+
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
@@ -943,7 +1368,7 @@ def normalisiere_upload_dataframe(df_upload):
     ungueltige = {'UNBEKANNT', 'NAN', 'NONE', '', 'NIL', 'NULL'}
     
     # Regel A: Preis muss vorhanden und größer als 0 sein
-    mask_preis = out['40HC'].notna() & (out['40HC'] > 0)
+    mask_preis = out['40HC'].notna() & (out['40HC'] != 0)
     
     # Regel B: Häfen toleranter prüfen (ab 2 Buchstaben erlaubt für "US", "DE")
     def ist_gueltiger_hafen(val):
@@ -966,7 +1391,9 @@ def normalisiere_upload_dataframe(df_upload):
     # Datums-Konvertierung
     for col in ['Valid from', 'Valid to']:
         target = col + " dt"
-        out[target] = pd.to_datetime(out[col], dayfirst=True, errors='coerce')
+        parsed_text = out[col].apply(parse_datum_standard)
+        out[col] = parsed_text
+        out[target] = parsed_text.apply(parse_timestamp_standard)
 
     # Fehlende Spalten sicherstellen
     if 'Remark' not in out.columns:
@@ -978,8 +1405,12 @@ def normalisiere_upload_dataframe(df_upload):
 
     # Bereinigung Strings
     out['Carrier'] = out['Carrier'].replace('Unbekannt', 'FMS').astype(str).str.strip()
+    out['Contract Number'] = out['Contract Number'].astype(str).str.strip().replace({'': 'Unbekannt'})
     out['Port of Loading'] = out['Port of Loading'].astype(str).str.strip()
     out['Port of Destination'] = out['Port of Destination'].astype(str).str.strip()
+    out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].apply(dedupliziere_surcharge_string)
+    out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].apply(dedupliziere_surcharge_string)
+    out = expandiere_mehrfach_pol_zeilen(out)
 
     ziel_spalten = [
         'Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination',
@@ -1092,6 +1523,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
             except Exception as e:
                 return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
+
+            for parser_funktion, parser_name in [
+                (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
+                (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
+                (extrahiere_evergreen_excel, 'Excel (Evergreen-SQ)'),
+            ]:
+                try:
+                    df_spezial = parser_funktion(excel_dict, datei.name)
+                except Exception:
+                    df_spezial = None
+                if isinstance(df_spezial, pd.DataFrame) and not df_spezial.empty:
+                    return df_spezial, parser_name
 
             alle_sheets_dfs = []
 
