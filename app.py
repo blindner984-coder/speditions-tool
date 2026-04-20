@@ -126,7 +126,7 @@ st.markdown("""
 
 # --- LOGO IN DER SIDEBAR ---
 try:
-    st.sidebar.image("logo_farbig.png", use_container_width=True)
+    st.sidebar.image("logo_farbig.png", width="stretch")
 except FileNotFoundError:
     pass
 
@@ -1552,7 +1552,7 @@ with tab_suche:
 
     action_col, info_col = st.columns([1, 2])
     with action_col:
-        suche_starten = st.button("🔎 Suche starten", type="primary", use_container_width=True)
+        suche_starten = st.button("🔎 Suche starten", type="primary", width="stretch")
     with info_col:
         st.caption("Schneller Start aktiv: Daten werden erst nach Klick auf 'Suche starten' geladen.")
 
@@ -1805,6 +1805,6 @@ with tab_analytics:
 
                     st.dataframe(
                         top_3[['Carrier', 'Contract Number', 'Valid from', 'Valid to', 'All-In EUR']],
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True
                     )
