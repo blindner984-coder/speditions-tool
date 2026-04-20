@@ -1848,7 +1848,18 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                                 {'nan': '', 'None': '', 'NaN': ''}
                             ).eq('').all()
                             if _hat_daten:
-                                df_fast_std[_ziel] = df_fast_std[_vorrang_col]
+                                if _ziel not in df_fast_std.columns:
+                                    df_fast_std[_ziel] = df_fast_std[_vorrang_col]
+                                else:
+                                    _ziel_leer = df_fast_std[_ziel].astype(str).str.strip().replace(
+                                        {'nan': '', 'None': '', 'NaN': ''}
+                                    ).eq('')
+                                    _quelle_ok = ~df_fast_std[_vorrang_col].astype(str).str.strip().replace(
+                                        {'nan': '', 'None': '', 'NaN': ''}
+                                    ).eq('')
+                                    _mask = _ziel_leer & _quelle_ok
+                                    if _mask.any():
+                                        df_fast_std.loc[_mask, _ziel] = df_fast_std.loc[_mask, _vorrang_col]
                     if 'Contract Number' not in df_fast_std.columns:
                         if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                             df_fast_std['Contract Number'] = fn_match.group(1)
@@ -2170,7 +2181,14 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if vorrang_col:
                 hat_daten = not df_raw[vorrang_col].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('').all()
                 if hat_daten:
-                    df_raw[ziel] = df_raw[vorrang_col]
+                    if ziel not in df_raw.columns:
+                        df_raw[ziel] = df_raw[vorrang_col]
+                    else:
+                        ziel_leer = df_raw[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
+                        quelle_ok = ~df_raw[vorrang_col].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
+                        mask = ziel_leer & quelle_ok
+                        if mask.any():
+                            df_raw.loc[mask, ziel] = df_raw.loc[mask, vorrang_col]
             elif ziel not in df_raw.columns:
                 fallback_col = ermittle_erste_spalte(df_raw, ['Origin', 'Dest'] if 'Loading' in ziel else ['Dest', 'Origin'])
                 if fallback_col:
