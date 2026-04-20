@@ -1440,7 +1440,7 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
     surcharge_lookup = baue_ccpr_surcharge_lookup(excel_dict.get('Surcharges', pd.DataFrame())) if 'Surcharges' in excel_dict else {}
 
     rows = []
-    collect_codes = {'THD', 'DDF', 'EMF', 'ISF', 'LFD', 'CDC', 'SMD', 'TAD'}
+    collect_codes = {'THD', 'DDF', 'EMF', 'ISF', 'LFD', 'CDC', 'SMD', 'TAD', 'CP3', 'DHC'}
 
     for _, row in df_rates.iterrows():
         basis = parse_decimal_wert(row.get('GROUP_NAME_2'))
@@ -1464,7 +1464,12 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
             if surcharge is None or surcharge['amount'] == 0:
                 continue
             entry = f"{code} = {surcharge['amount']:.2f} {surcharge['currency']}"
-            if code in collect_codes:
+            code_upper = str(code).strip().upper()
+            surcharge_curr = str(surcharge.get('currency', '')).strip().upper()
+            # Fachregel: DHC in USD ist Prepaid, auch wenn DHC sonst Collect sein kann.
+            if code_upper == 'DHC' and surcharge_curr == 'USD':
+                prepaid.append(entry)
+            elif code in collect_codes:
                 collect.append(entry)
             else:
                 prepaid.append(entry)
@@ -2236,11 +2241,12 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 # =================================================================
                 prepaid_surcharges = []
                 collect_surcharges = []
-                collect_codes = {'CP1', 'CP2', 'VP1', 'THD', 'DTHC', 'DDF', 'DDC', 'THC34', 'LPC51', 'CAR45'}
+                collect_codes = {'CP1', 'CP2', 'CP3', 'VP1', 'THD', 'DTHC', 'DHC', 'DDF', 'DDC', 'THC34', 'LPC51', 'CAR45'}
                 surcharge_rows = group[~bas_mask]
                 
                 for _, r in surcharge_rows.iterrows():
                     code = str(r[charge_col]).strip()
+                    code_upper = code.upper()
                     val_text = str(r['40HC']).strip()
                     beschreibung_raw = str(r.get(charge_desc_col, '')).strip() if charge_desc_col else ''
                     beschreibung = beschreibung_raw.lower()
@@ -2253,19 +2259,26 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if len(_rc) == 3 and _rc.isalpha():
                             row_currency = _rc
                     s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=row_currency)
+                    curr_upper = str(s_curr or row_currency or '').strip().upper()
                     
                     # Nur Beträge > 0 übernehmen 
                     if s_amt is not None and s_amt > 0:
                         # Beschreibungsname statt nur Code (z.B. "Emergency Fuel Surcharge (BAF09)")
                         label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in ('nan', 'none', '') else code
                         eintrag = f"{label} = {s_amt:.2f} {s_curr}"
-                        ist_collect = (
-                            code.upper() in collect_codes
-                            or 'destination' in beschreibung
-                            or 'dthc' in beschreibung
-                            or 'local terminal recovery' in beschreibung
-                            or section == 'destination'
-                        )
+                        # Fachregel: DHC in USD ist Prepaid, auch wenn DHC sonst Collect sein kann.
+                        if code_upper == 'DHC' and curr_upper == 'USD':
+                            ist_collect = False
+                        else:
+                            # Heuristik: Nicht-USD/EUR-Zuschlaege sind in diesen Tarifen haeufig Collect.
+                            ist_collect = (
+                                code_upper in collect_codes
+                                or 'destination' in beschreibung
+                                or 'dthc' in beschreibung
+                                or 'local terminal recovery' in beschreibung
+                                or section == 'destination'
+                                or (curr_upper and curr_upper not in {'USD', 'EUR'})
+                            )
                         if ist_collect:
                             collect_surcharges.append(eintrag)
                         else:
