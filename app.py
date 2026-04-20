@@ -1507,9 +1507,22 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
 
 def extrahiere_evergreen_excel(excel_dict, file_name):
     rows = []
+    erlaubte_reiter_tokens = (
+        'fak',
+        'logs & lumber',
+        'logs and lumber',
+        'prime paper',
+    )
 
     for sheet_name, df_sheet in excel_dict.items():
-        if not re.match(r'^(SOC\s+)?SQ', str(sheet_name), flags=re.IGNORECASE):
+        sheet_name_str = str(sheet_name)
+        sheet_name_norm = re.sub(r'\s+', ' ', sheet_name_str.strip().lower())
+
+        # Evergreen-Dateien sind für uns nur in den Reitern FAK / Logs & Lumber / Prime Paper relevant.
+        if not any(token in sheet_name_norm for token in erlaubte_reiter_tokens):
+            continue
+
+        if not re.match(r'^(SOC\s+)?SQ', sheet_name_str, flags=re.IGNORECASE):
             continue
 
         header_idx = None
