@@ -367,18 +367,29 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
 
 
 def extrahiere_excel_mit_gemini(file_bytes, file_name):
-    """Liest eine Excel/CSV-Datei ein, chunked die Daten und extrahiert
+    """Liest eine Excel/CSV-Datei ein (alle Sheets), chunked die Daten und extrahiert
     Frachtraten per Gemini Structured Outputs."""
     if not GEMINI_API_KEY:
         return pd.DataFrame(), "GEMINI_API_KEY nicht gesetzt."
 
-    # 1. Einlesen
+    # 1. Einlesen – alle Sheets zusammenführen
     try:
         buf = io.BytesIO(file_bytes)
         if file_name.lower().endswith(".csv"):
             df_raw = pd.read_csv(buf, header=None, low_memory=False)
         else:
-            df_raw = pd.read_excel(buf, header=None)
+            all_sheets = pd.read_excel(buf, sheet_name=None, header=None)
+            sheet_parts = []
+            for sheet_name, df_sheet in all_sheets.items():
+                if df_sheet.empty:
+                    continue
+                # Sheet-Trennzeile einfügen, damit Gemini den Kontext erkennt
+                separator = pd.DataFrame([[f"=== Sheet: {sheet_name} ==="]], columns=[0])
+                sheet_parts.append(separator)
+                sheet_parts.append(df_sheet)
+            if not sheet_parts:
+                return pd.DataFrame(), "Datei ist leer."
+            df_raw = pd.concat(sheet_parts, ignore_index=True)
     except Exception as e:
         return pd.DataFrame(), f"Fehler beim Einlesen: {e}"
 
@@ -420,6 +431,7 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
         status.caption(f"🤖 Gemini analysiert Chunk {idx + 1}/{len(chunks)} …")
         prompt = (
             _SYSTEM_PROMPT
+            + f"\n\n--- DATEINAME ---\n{file_name}"
             + "\n\n--- METADATEN / KOPFZEILEN DER DATEI ---\n"
             + meta_kontext
             + "\n\n--- DATENZEILEN (CHUNK) ---\n"
@@ -976,6 +988,14 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
     # === EXCEL / CSV VERARBEITUNG ===
     else:
+        # --- Primär: Gemini-Extraktion (wie bei PDF) ---
+        if GEMINI_API_KEY:
+            df_gemini, methode_gemini = extrahiere_excel_mit_gemini(file_bytes, file_name)
+            if not df_gemini.empty:
+                return df_gemini, methode_gemini
+            # Gemini hat nichts gefunden → Heuristik als Fallback
+            st.info("📡 Gemini-Extraktion ergab keine Ergebnisse – versuche heuristische Verarbeitung…")
+
         df_raw = pd.DataFrame()
         global_contract = "Unbekannt"
 
