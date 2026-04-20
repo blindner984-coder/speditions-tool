@@ -47,7 +47,7 @@ class ExtractionResponse(BaseModel):
 COLUMN_ALIASES: dict = {
     "Carrier": [
         "Carrier", "Reederei", "Shipping Line", "Vessel Operator",
-        "Line", "Shipping Company",
+        "Shipping Company",
     ],
     "Contract Number": [
         "Contract Number", "Contract number", "Contract No", "Contract Nr",
@@ -720,7 +720,7 @@ def ermittle_preisspalte_40hc(df):
     }
 
     bevorzugt = [
-        "40HC", "40 HC", "40HQ", "40' HC", "40'HC", "40ST", "40DV/HC", "40DRY",
+        "40HC", "40 HC", "40HQ", "40' HC", "40'HC", "40ST", "40DV/HC", "40DRY", "40DC",
     ]
     spalten_map = {str(c).strip().lower(): c for c in df.columns}
 
@@ -729,7 +729,7 @@ def ermittle_preisspalte_40hc(df):
         if key in spalten_map:
             return spalten_map[key]
 
-    muster = re.compile(r"(?:^|\b)40\s*(?:hc|hq|st|h|dry)(?:\b|$)|40'?\s*(?:hc|hq)", re.IGNORECASE)
+    muster = re.compile(r"(?:^|\b)40\s*(?:hc|hq|st|h|dry|dc)(?:\b|$)|40'?\s*(?:hc|hq)", re.IGNORECASE)
     for col in df.columns:
         c = str(col).strip()
         c_low = c.lower()
@@ -873,9 +873,14 @@ def normalisiere_upload_dataframe(df_upload):
     # Regel B: Häfen toleranter prüfen (ab 2 Buchstaben erlaubt für "US", "DE")
     def ist_gueltiger_hafen(val):
         s = str(val).strip()
-        if s.upper() in ungueltige or len(s) < 2 or len(s) > 50: return False
+        if s.upper() in ungueltige or len(s) < 2 or len(s) > 200: return False
         if re.match(r'^-?\d+(?:[.,]\d+)?$', s): return False # Nur Zahlen = kein Hafen
-        if 'potential' in s.lower() or 'average' in s.lower(): return False
+        _s_low = s.lower()
+        # Schlüsselwörter, die nie ein Hafenname sind (verhindert Surcharge-Zeilen als Raten)
+        _hafen_blacklist = ('potential', 'average', 'surcharge', 'fee', 'charge',
+                            'handling', 'fuel', 'security', 'logistic', 'bunker',
+                            'piracy', 'tank', 'reefer', 'hazardous', 'overweight')
+        if any(kw in _s_low for kw in _hafen_blacklist): return False
         return True
 
     mask_pol = out['Port of Loading'].apply(ist_gueltiger_hafen)
@@ -1049,9 +1054,30 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 sheet_pol = "Unbekannt"
                 sheet_valid_from = None
                 sheet_valid_to = None
+                sheet_carrier = None
+                sheet_currency = None
+
+                _BEKANNTE_CARRIER = {
+                    'msc': 'MSC', 'hapag': 'Hapag-Lloyd', 'hapag-lloyd': 'Hapag-Lloyd',
+                    'maersk': 'Maersk', 'one': 'ONE', 'ocean network express': 'ONE',
+                    'cma cgm': 'CMA CGM', 'cma-cgm': 'CMA CGM', 'cosco': 'COSCO',
+                    'evergreen': 'Evergreen', 'yang ming': 'Yang Ming', 'zim': 'ZIM',
+                    'hmm': 'HMM', 'hyundai': 'HMM', 'pil': 'PIL', 'wan hai': 'Wan Hai',
+                    'oocl': 'OOCL',
+                }
+                _DATE_PATTERN = re.compile(r'\d{4}[./-]\d{2}[./-]\d{2}|\d{2}[./-]\d{2}[./-]\d{2,4}|\d{8}')
 
                 for i in range(len(df_top)):
                     row_vals = df_top.iloc[i].dropna().astype(str).tolist()
+                    full_row_text = " ".join(row_vals).lower()
+
+                    # Carrier-Erkennung aus Metadaten
+                    if not sheet_carrier:
+                        for kw, carrier_name in _BEKANNTE_CARRIER.items():
+                            if re.search(r'\b' + re.escape(kw) + r'\b', full_row_text):
+                                sheet_carrier = carrier_name
+                                break
+
                     for j, val in enumerate(row_vals):
                         v_low = val.lower()
                         if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
@@ -1061,14 +1087,27 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
                             if j + 1 < len(row_vals):
                                 sheet_pol = row_vals[j + 1]
-                        if 'valid' in v_low and ('from' in v_low or 'to' in v_low):
+
+                        # Währungs-Erkennung
+                        if not sheet_currency and ('currency' in v_low or 'cur' == v_low.strip()):
                             if j + 1 < len(row_vals):
-                                date_str = row_vals[j + 1]
-                                dates = re.findall(r'\d{8}|\d{2}[./-]\d{2}[./-]\d{2,4}', date_str)
-                                if len(dates) >= 1:
-                                    sheet_valid_from = dates[0]
-                                if len(dates) >= 2:
-                                    sheet_valid_to = dates[1]
+                                _c = row_vals[j + 1].strip().upper()
+                                if _c in ('USD', 'EUR', 'GBP', 'CNY'):
+                                    sheet_currency = _c
+
+                        # Validity-Erkennung (erweitert)
+                        if 'valid' in v_low:
+                            # Datums-Suche: Zuerst im aktuellen Feld, dann im nächsten
+                            search_texts = [val]
+                            if j + 1 < len(row_vals):
+                                search_texts.append(row_vals[j + 1])
+                            combined = " ".join(search_texts)
+                            # Unterstützt auch '~'-getrennte Bereiche (Yang Ming: 2026/04/01~2026/04/30)
+                            dates = _DATE_PATTERN.findall(combined)
+                            if len(dates) >= 1 and not sheet_valid_from:
+                                sheet_valid_from = dates[0]
+                            if len(dates) >= 2 and not sheet_valid_to:
+                                sheet_valid_to = dates[1]
 
                 # C. Spaltennamen setzen und bereinigen
                 rohe = df_sheet.iloc[sheet_header_idx].astype(str).str.strip().tolist()
@@ -1086,6 +1125,21 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 df_clean = df_clean.iloc[sheet_header_idx + 1:].reset_index(drop=True)
                 df_clean = standardisiere_spalten(df_clean)
 
+                # C2. Fix für zusammengeführte Spalten: Wenn Port of Destination
+                #     nur 2-3 Zeichen hat (Ländercodes wie AE, BH, IQ), liegt der
+                #     echte Portname oft in der nächsten 'nan'-Spalte.
+                if 'Port of Destination' in df_clean.columns:
+                    _pod_vals = df_clean['Port of Destination'].dropna().astype(str).str.strip()
+                    _pod_lens = _pod_vals.str.len()
+                    if len(_pod_vals) > 0 and (_pod_lens <= 3).mean() > 0.7:
+                        _pod_col_idx = df_clean.columns.get_loc('Port of Destination')
+                        if _pod_col_idx + 1 < len(df_clean.columns):
+                            _next_col = df_clean.columns[_pod_col_idx + 1]
+                            _next_vals = df_clean[_next_col].dropna().astype(str).str.strip()
+                            _next_lens = _next_vals.str.len()
+                            if len(_next_vals) > 0 and (_next_lens > 3).mean() > 0.5:
+                                df_clean['Port of Destination'] = df_clean[_next_col]
+
                 # D. Gefundene Metadaten in die Tabelle injizieren
                 if 'Contract Number' not in df_clean.columns and sheet_contract != "Unbekannt":
                     df_clean['Contract Number'] = sheet_contract
@@ -1095,8 +1149,29 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     df_clean['Valid from'] = sheet_valid_from
                 if 'Valid to' not in df_clean.columns and sheet_valid_to:
                     df_clean['Valid to'] = sheet_valid_to
+                if 'Carrier' not in df_clean.columns and sheet_carrier:
+                    df_clean['Carrier'] = sheet_carrier
+                if 'Currency' not in df_clean.columns and sheet_currency:
+                    df_clean['Currency'] = sheet_currency
 
-                # E. Einfach ALLES anhängen, was einen Header hat! (Vorherige Bremse entfernt)
+                # E. Sheet-Validierung: Nur anhängen wenn es mindestens eine
+                #    Spalte mit numerischen/Preis-Daten gibt (verhindert Müll-Sheets
+                #    wie Comments/Freetimes ohne Raten)
+                _hat_numerische_daten = False
+                for _col in df_clean.columns:
+                    _c_low = str(_col).strip().lower()
+                    if any(kw in _c_low for kw in ['40', 'rate', 'price', 'amount', 'freight', 'o/f']):
+                        _parsed = df_clean[_col].apply(parse_decimal_wert)
+                        if (_parsed.notna() & (_parsed > 0)).any():
+                            _hat_numerische_daten = True
+                            break
+                if not _hat_numerische_daten and '40HC' in df_clean.columns:
+                    _parsed = df_clean['40HC'].apply(parse_decimal_wert)
+                    _hat_numerische_daten = (_parsed.notna() & (_parsed > 0)).any()
+
+                if not _hat_numerische_daten:
+                    continue
+
                 alle_sheets_dfs.append(df_clean)
 
             if not alle_sheets_dfs:
@@ -1141,9 +1216,28 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             csv_pol = "Unbekannt"
             csv_valid_from = None
             csv_valid_to = None
+            csv_carrier = None
+            csv_currency = None
+
+            _BEKANNTE_CARRIER_CSV = {
+                'msc': 'MSC', 'hapag': 'Hapag-Lloyd', 'hapag-lloyd': 'Hapag-Lloyd',
+                'maersk': 'Maersk', 'one': 'ONE', 'ocean network express': 'ONE',
+                'cma cgm': 'CMA CGM', 'cma-cgm': 'CMA CGM', 'cosco': 'COSCO',
+                'evergreen': 'Evergreen', 'yang ming': 'Yang Ming', 'zim': 'ZIM',
+                'hmm': 'HMM', 'pil': 'PIL', 'wan hai': 'Wan Hai', 'oocl': 'OOCL',
+            }
+            _DATE_PAT_CSV = re.compile(r'\d{4}[./-]\d{2}[./-]\d{2}|\d{2}[./-]\d{2}[./-]\d{2,4}|\d{8}')
 
             for i in range(len(df_top)):
                 row_vals = df_top.iloc[i].dropna().astype(str).tolist()
+                full_row_text = " ".join(row_vals).lower()
+
+                if not csv_carrier:
+                    for kw, carrier_name in _BEKANNTE_CARRIER_CSV.items():
+                        if re.search(r'\b' + re.escape(kw) + r'\b', full_row_text):
+                            csv_carrier = carrier_name
+                            break
+
                 for j, val in enumerate(row_vals):
                     v_low = val.lower()
                     if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
@@ -1152,14 +1246,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
                         if j + 1 < len(row_vals):
                             csv_pol = row_vals[j + 1]
-                    if 'valid' in v_low and ('from' in v_low or 'to' in v_low):
+
+                    if not csv_currency and ('currency' in v_low or 'cur' == v_low.strip()):
                         if j + 1 < len(row_vals):
-                            date_str = row_vals[j + 1]
-                            dates = re.findall(r'\d{8}|\d{2}[./-]\d{2}[./-]\d{2,4}', date_str)
-                            if len(dates) >= 1:
-                                csv_valid_from = dates[0]
-                            if len(dates) >= 2:
-                                csv_valid_to = dates[1]
+                            _c = row_vals[j + 1].strip().upper()
+                            if _c in ('USD', 'EUR', 'GBP', 'CNY'):
+                                csv_currency = _c
+
+                    if 'valid' in v_low:
+                        search_texts = [val]
+                        if j + 1 < len(row_vals):
+                            search_texts.append(row_vals[j + 1])
+                        combined = " ".join(search_texts)
+                        dates = _DATE_PAT_CSV.findall(combined)
+                        if len(dates) >= 1 and not csv_valid_from:
+                            csv_valid_from = dates[0]
+                        if len(dates) >= 2 and not csv_valid_to:
+                            csv_valid_to = dates[1]
 
             rohe_spalten = df_csv.iloc[header_idx].astype(str).str.strip().tolist()
             neue_spalten, gesehen = [], {}
@@ -1183,6 +1286,10 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 df_raw['Valid from'] = csv_valid_from
             if 'Valid to' not in df_raw.columns and csv_valid_to:
                 df_raw['Valid to'] = csv_valid_to
+            if 'Carrier' not in df_raw.columns and csv_carrier:
+                df_raw['Carrier'] = csv_carrier
+            if 'Currency' not in df_raw.columns and csv_currency:
+                df_raw['Currency'] = csv_currency
 
         # === NACHBEREITUNG FÜR BEIDE (EXCEL & CSV) ===
         if df_raw.empty:
@@ -1244,6 +1351,31 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             eff_col = 'Valid from' if 'Valid from' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid from'])
             exp_col = 'Valid to' if 'Valid to' in df_raw.columns else ermittle_erste_spalte(df_raw, COLUMN_ALIASES['Valid to'])
             tt_col = ermittle_erste_spalte(df_raw, ['Transit Time', 'Transit Days', 'TT'])
+
+            # Carrier-Erkennung für charge-basierte Formate (Maersk, CMA CGM, etc.)
+            _detected_carrier = 'Maersk'
+            _fn_low = datei.name.lower()
+            _carrier_hints = {
+                'cma': 'CMA CGM', 'mfr': 'CMA CGM',
+                'hapag': 'Hapag-Lloyd', 'hlcu': 'Hapag-Lloyd',
+                'msc': 'MSC', 'maersk': 'Maersk', 'one': 'ONE',
+                'evergreen': 'Evergreen', 'cosco': 'COSCO', 'zim': 'ZIM',
+            }
+            for _hint, _name in _carrier_hints.items():
+                if _hint in _fn_low:
+                    _detected_carrier = _name
+                    break
+            # Fallback: Sales-Contact-Email
+            _sales_col = ermittle_erste_spalte(df_raw, ['Sales Contact', 'Sales Rep', 'Contact'])
+            if _detected_carrier == 'Maersk' and _sales_col and _sales_col in df_raw.columns:
+                _emails = df_raw[_sales_col].dropna().astype(str).head(5)
+                for _em in _emails:
+                    if 'cma-cgm' in _em.lower() or 'cma.cgm' in _em.lower():
+                        _detected_carrier = 'CMA CGM'
+                        break
+                    elif 'hapag' in _em.lower():
+                        _detected_carrier = 'Hapag-Lloyd'
+                        break
 
             group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
             # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities etc. nicht überschrieben werden
@@ -1317,7 +1449,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     remark_parts.append(f"Commodity: {commodity_val}")
 
                 standard_rows.append({
-                    'Carrier': 'Maersk',
+                    'Carrier': _detected_carrier,
                     'Contract Number': global_contract,
                     'Port of Loading': pol_val,
                     'Port of Destination': pod_val,
@@ -1580,7 +1712,7 @@ with tab_upload:
                             st.write(f"**Standard-Spalten gefunden:** {gefunden}")
                             st.write(f"**Standard-Spalten FEHLEN (werden per Fuzzy gesucht):** {fehlend}")
                             st.write(f"**Alle Spalten in der Datei:** {list(df_upload.columns)}")
-                            st.dataframe(df_upload.head(5))
+                            st.dataframe(df_upload.head(5).astype(str))
 
                         df_norm = df_upload.copy()
                         with st.expander("🔍 Debug: Fuzzy-Matching Ergebnis", expanded=True):
