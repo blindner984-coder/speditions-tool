@@ -1506,7 +1506,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 for _, r in surcharge_rows.iterrows():
                     code = str(r[charge_col]).strip()
                     val_text = str(r['40HC']).strip()
-                    beschreibung = str(r.get(charge_desc_col, '')).lower().strip() if charge_desc_col else ''
+                    beschreibung_raw = str(r.get(charge_desc_col, '')).strip() if charge_desc_col else ''
+                    beschreibung = beschreibung_raw.lower()
                     section = str(r.get(charge_section_col, '')).lower().strip() if charge_section_col else ''
                     
                     # Zeilen-Währung bevorzugen (z.B. THC in INR statt USD)
@@ -1519,7 +1520,9 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     
                     # Nur Beträge > 0 übernehmen 
                     if s_amt is not None and s_amt > 0:
-                        eintrag = f"{code} = {s_amt:.2f} {s_curr}"
+                        # Beschreibungsname statt nur Code (z.B. "Emergency Fuel Surcharge (BAF09)")
+                        label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in ('nan', 'none', '') else code
+                        eintrag = f"{label} = {s_amt:.2f} {s_curr}"
                         ist_collect = (
                             code.upper() in collect_codes
                             or 'destination' in beschreibung
