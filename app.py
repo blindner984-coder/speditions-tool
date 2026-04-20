@@ -1617,6 +1617,9 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
+    def ist_leerwert_series(series):
+        return series.astype(str).str.strip().str.lower().isin({'', 'nan', 'none', 'null', 'nil'})
+
     # 1. FILTER: Wirf alle 20-Fuß Container raus (Strenge Suche)
     size_col = None
     for col in out.columns:
@@ -1629,13 +1632,33 @@ def normalisiere_upload_dataframe(df_upload):
         out = out[mask_40].copy()
 
     def stelle_spalte_sicher(ziel, kandidaten, default=""):
-        if ziel in out.columns:
+        if ziel not in out.columns:
+            quelle = ermittle_erste_spalte(out, kandidaten)
+            if quelle is not None:
+                out[ziel] = out[quelle]
+            else:
+                out[ziel] = default
+
+    def fuelle_leerwerte_aus_quellen(ziel, kandidaten):
+        if ziel not in out.columns:
             return
-        quelle = ermittle_erste_spalte(out, kandidaten)
-        if quelle is not None:
-            out[ziel] = out[quelle]
-        else:
-            out[ziel] = default
+
+        ziel_leer = ist_leerwert_series(out[ziel])
+        if not ziel_leer.any():
+            return
+
+        for kandidat in kandidaten:
+            quelle = ermittle_erste_spalte(out, [kandidat])
+            if quelle is None or quelle == ziel:
+                continue
+
+            quelle_gueltig = ~ist_leerwert_series(out[quelle])
+            mask = ziel_leer & quelle_gueltig
+            if mask.any():
+                out.loc[mask, ziel] = out.loc[mask, quelle]
+                ziel_leer = ist_leerwert_series(out[ziel])
+                if not ziel_leer.any():
+                    break
 
     # Pflichtfelder befüllen
     stelle_spalte_sicher('Carrier', COLUMN_ALIASES['Carrier'], default='FMS')
@@ -1644,6 +1667,16 @@ def normalisiere_upload_dataframe(df_upload):
     stelle_spalte_sicher('Port of Destination', COLUMN_ALIASES['Port of Destination'], default='Unbekannt')
     stelle_spalte_sicher('Valid from', COLUMN_ALIASES['Valid from'], default=None)
     stelle_spalte_sicher('Valid to', COLUMN_ALIASES['Valid to'], default=None)
+
+    # Bereits vorhandene, aber leere Hafen-Spalten mit besseren Quellen auffuellen.
+    fuelle_leerwerte_aus_quellen('Port of Loading', [
+        'Receipt', 'Place of Receipt', 'POL', 'Port of Load', 'Origin Port',
+        'Origin', 'Load Port', 'Loading Port', 'POL Name', 'Departure Port', 'From Port', 'Pol',
+    ])
+    fuelle_leerwerte_aus_quellen('Port of Destination', [
+        'Delivery', 'Place of Delivery', 'POD', 'Destination Port', 'Destination',
+        'Discharge Port', 'Port of Discharge', 'Dest Port', 'POD Name', 'Arrival Port', 'To Port', 'Pod',
+    ])
 
     if '40HC' not in out.columns:
         preis_col = ermittle_preisspalte_40hc(out)
