@@ -1288,7 +1288,7 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
 
     for _, row in df_rates.iterrows():
         basis = parse_decimal_wert(row.get('GROUP_NAME_2'))
-        if basis is None or basis <= 0:
+        if basis is None:
             continue
         applicable_codes = dedupliziere_eintraege(
             extrahiere_codes_aus_liste(row.get('CHG_SUBJECT_TO_CONTRACT'))
@@ -1323,6 +1323,8 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
         commodity = str(row.get('COMMODITY_DESCRIPTION', '')).strip()
         if commodity:
             remark_parts.append(f"Commodity: {commodity}")
+        if basis < 0:
+            remark_parts.append("Negative Vertragsrate")
         remark_parts.append("CMA CGM Tarif-Rabattvertrag")
 
         end_description = row.get('END_DESCRIPTION', '')
