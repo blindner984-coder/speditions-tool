@@ -1620,6 +1620,8 @@ def normalisiere_upload_dataframe(df_upload):
     def ist_leerwert_series(series):
         return series.astype(str).str.strip().str.lower().isin({'', 'nan', 'none', 'null', 'nil'})
 
+    hat_breite_40hc_spalte = ermittle_preisspalte_40hc(out) is not None
+
     # 1. FILTER: Wirf alle 20-Fuß Container raus (Strenge Suche)
     size_col = None
     for col in out.columns:
@@ -1627,7 +1629,10 @@ def normalisiere_upload_dataframe(df_upload):
             size_col = col
             break
             
-    if size_col is not None:
+    # Bei breiten Ratentabellen mit eigener 40HC-Spalte beschreibt eine Equipment-Spalte
+    # oft NICHT die Datenzeile selbst, sondern nur einen Nebenblock. Dann wuerde dieser
+    # Filter fast alle gueltigen 40HC-Raten wegwerfen.
+    if size_col is not None and not hat_breite_40hc_spalte:
         mask_40 = out[size_col].astype(str).str.contains('40|hc|hq|nan', na=True, case=False)
         out = out[mask_40].copy()
 
@@ -1690,6 +1695,9 @@ def normalisiere_upload_dataframe(df_upload):
         out['Currency'] = out[waehrung_col] if waehrung_col is not None else 'USD'
     else:
         out['Currency'] = out['Currency'].fillna('USD')
+
+    if '40HC' in out.columns and 'Currency.4' in out.columns:
+        out['Currency'] = out['Currency.4']
 
     # Preis-Konvertierung
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
