@@ -1514,6 +1514,23 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
         'prime paper',
     )
 
+    def normalisiere_evergreen_quotation(raw_value):
+        if not raw_value:
+            return None
+        text = str(raw_value).strip().upper()
+
+        # Ziel-Format fuer Evergreen: K500720 (K + Ziffern).
+        k_match = re.search(r'K\d{6,}', text)
+        if k_match:
+            return k_match.group(0)
+
+        # Fallback: reine Ziffernfolgen ebenfalls auf K-Format bringen.
+        digit_match = re.search(r'\b(\d{6,})\b', text)
+        if digit_match:
+            return f"K{digit_match.group(1)}"
+
+        return None
+
     for sheet_name, df_sheet in excel_dict.items():
         sheet_name_str = str(sheet_name)
         sheet_name_norm = re.sub(r'\s+', ' ', sheet_name_str.strip().lower())
@@ -1522,7 +1539,7 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
         if not any(token in sheet_name_norm for token in erlaubte_reiter_tokens):
             continue
 
-        if not re.match(r'^(SOC\s+)?SQ', sheet_name_str, flags=re.IGNORECASE):
+        if not re.search(r'^(SOC\s+)?SQ|K\d{6,}', sheet_name_str, flags=re.IGNORECASE):
             continue
 
         header_idx = None
@@ -1564,16 +1581,16 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
                     if text:
                         remark_parts.append(re.sub(r'\s+', ' ', text))
 
-            # Vertragsnummer: ref_match > sq_match > Sheet-Name-Extraktion
+            # Evergreen-Quotation im Format K500720 ermitteln.
             _ref = ref_match.group(1) if ref_match else None
             if _ref and _ref.upper() in ('NONE', 'N/A', ''):
                 _ref = None
             _sq = sq_match.group(1) if sq_match else None
-            if not _ref and not _sq:
-                # Fallback: SQ-Nummer aus Sheet-Name extrahieren (z.B. 'SQK500741 fak' → 'SQK500741')
-                _sq_name_match = re.search(r'SQK?\d+', str(sheet_name), re.IGNORECASE)
-                _sq = _sq_name_match.group(0) if _sq_name_match else 'Unbekannt'
-            _contract_nr = _ref or _sq or 'Unbekannt'
+
+            _quote_ref = normalisiere_evergreen_quotation(_ref)
+            _quote_sq = normalisiere_evergreen_quotation(_sq)
+            _quote_sheet = normalisiere_evergreen_quotation(sheet_name_str)
+            _contract_nr = _quote_ref or _quote_sq or _quote_sheet or 'Unbekannt'
 
             rows.append({
                 'Carrier': 'Evergreen',
@@ -1803,7 +1820,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             for parser_funktion, parser_name in [
                 (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
                 (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
-                (extrahiere_evergreen_excel, 'Excel (Evergreen-SQ)'),
+                (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
             ]:
                 try:
                     df_spezial = parser_funktion(excel_dict, datei.name)
