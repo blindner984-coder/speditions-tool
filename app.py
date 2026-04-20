@@ -419,23 +419,28 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
     csv_text = df_raw.to_csv(index=False, header=False)
     zeilen = csv_text.split("\n")
 
-    # 4. Metadaten-Kontext (erste 15 Zeilen) + Rest
-    META_ZEILEN = 15
-    CHUNK_SIZE = 50
-    meta_kontext = "\n".join(zeilen[:META_ZEILEN])
-    daten_zeilen = zeilen[META_ZEILEN:]
+    # 4. Metadaten-Kontext + Chunking
+    #    Kleine Dateien (< 500 Zeilen) komplett in einem Request senden,
+    #    damit Gemini Raten UND Surcharges zusammen sieht.
+    MAX_SINGLE_REQUEST = 500
+    CHUNK_SIZE = 80
 
-    # 5. Chunks bilden
-    chunks = []
-    for start in range(0, len(daten_zeilen), CHUNK_SIZE):
-        chunk = "\n".join(daten_zeilen[start : start + CHUNK_SIZE])
-        if chunk.strip():
-            chunks.append(chunk)
-
-    # Falls die Datei kleiner als 15 Zeilen ist, alles als einen Chunk senden
-    if not chunks:
-        chunks = [meta_kontext]
+    if len(zeilen) <= MAX_SINGLE_REQUEST:
+        # Alles in einem Request – kein Chunking nötig
         meta_kontext = ""
+        chunks = ["\n".join(zeilen)]
+    else:
+        META_ZEILEN = 20
+        meta_kontext = "\n".join(zeilen[:META_ZEILEN])
+        daten_zeilen = zeilen[META_ZEILEN:]
+        chunks = []
+        for start in range(0, len(daten_zeilen), CHUNK_SIZE):
+            chunk = "\n".join(daten_zeilen[start : start + CHUNK_SIZE])
+            if chunk.strip():
+                chunks.append(chunk)
+        if not chunks:
+            chunks = [meta_kontext]
+            meta_kontext = ""
 
     # 6. Gemini-Client vorbereiten
     client = genai.Client(api_key=GEMINI_API_KEY)
