@@ -341,18 +341,30 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
     if not str(text).strip():
         return None
 
+    _GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         safe_text = str(text)[:15000]
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=_SYSTEM_PROMPT + "\n\n<pdf_inhalt>\n" + safe_text + "\n</pdf_inhalt>",
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ExtractionResponse,
-                temperature=0.1,
-            ),
+        contents = _SYSTEM_PROMPT + "\n\n<pdf_inhalt>\n" + safe_text + "\n</pdf_inhalt>"
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ExtractionResponse,
+            temperature=0.1,
         )
+        response = None
+        for model_name in _GEMINI_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=contents, config=config,
+                )
+                break  # Modell hat funktioniert
+            except Exception as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    continue
+                raise
+        if response is None:
+            st.warning("Alle Gemini-Modelle sind aktuell überlastet. Bitte versuche es in wenigen Minuten erneut.")
+            return None
         result = ExtractionResponse.model_validate_json(response.text)
         if not result.rates:
             return None
@@ -442,7 +454,8 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
             chunks = [meta_kontext]
             meta_kontext = ""
 
-    # 6. Gemini-Client vorbereiten
+    # 6. Gemini-Client vorbereiten (mit Modell-Fallback bei Überlastung)
+    _GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
     client = genai.Client(api_key=GEMINI_API_KEY)
     alle_raten = []
     fortschritt = st.progress(0)
@@ -458,37 +471,48 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
             + "\n\n--- DATENZEILEN (CHUNK) ---\n"
             + chunk
         )
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractionResponse,
-                    temperature=0.1,
-                ),
-            )
-            result = ExtractionResponse.model_validate_json(response.text)
-            for rate in result.rates:
-                alle_raten.append({
-                    "Carrier": rate.carrier,
-                    "Contract Number": rate.contract_number,
-                    "Port of Loading": rate.port_of_loading,
-                    "Port of Destination": rate.port_of_destination,
-                    "Valid from": rate.valid_from,
-                    "Valid to": rate.valid_to,
-                    "40HC": rate.rate_40hc,
-                    "Currency": rate.currency,
-                    "Included Prepaid Surcharges 40HC": ", ".join(
-                        [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.prepaid_surcharges]
+
+        chunk_success = False
+        for model_name in _GEMINI_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ExtractionResponse,
+                        temperature=0.1,
                     ),
-                    "Included Collect Surcharges 40HC": ", ".join(
-                        [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.collect_surcharges]
-                    ),
-                    "Remark": rate.remark,
-                })
-        except Exception as e:
-            st.warning(f"Chunk {idx + 1}/{len(chunks)} fehlgeschlagen: {e}")
+                )
+                result = ExtractionResponse.model_validate_json(response.text)
+                for rate in result.rates:
+                    alle_raten.append({
+                        "Carrier": rate.carrier,
+                        "Contract Number": rate.contract_number,
+                        "Port of Loading": rate.port_of_loading,
+                        "Port of Destination": rate.port_of_destination,
+                        "Valid from": rate.valid_from,
+                        "Valid to": rate.valid_to,
+                        "40HC": rate.rate_40hc,
+                        "Currency": rate.currency,
+                        "Included Prepaid Surcharges 40HC": ", ".join(
+                            [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.prepaid_surcharges]
+                        ),
+                        "Included Collect Surcharges 40HC": ", ".join(
+                            [f"{s.code} = {s.amount:.2f} {s.currency}" for s in rate.collect_surcharges]
+                        ),
+                        "Remark": rate.remark,
+                    })
+                chunk_success = True
+                break  # Modell hat funktioniert
+            except Exception as e:
+                if "503" in str(e) or "UNAVAILABLE" in str(e):
+                    continue  # Nächstes Modell versuchen
+                st.warning(f"Chunk {idx + 1}/{len(chunks)} fehlgeschlagen ({model_name}): {e}")
+                break  # Anderer Fehler → nicht weiter versuchen
+
+        if not chunk_success:
+            st.warning(f"Chunk {idx + 1}/{len(chunks)}: Alle Modelle überlastet oder fehlgeschlagen.")
 
         fortschritt.progress(min((idx + 1) / len(chunks), 1.0))
 
@@ -499,6 +523,24 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
         return pd.DataFrame(), "Gemini konnte keine Raten extrahieren."
 
     df = pd.DataFrame(alle_raten)
+
+    # Carrier-Namen normalisieren (Gemini liefert manchmal den vollen Firmennamen)
+    _CARRIER_NORMALIZE = {
+        'msc': 'MSC', 'hapag': 'Hapag-Lloyd', 'hapag-lloyd': 'Hapag-Lloyd',
+        'maersk': 'Maersk', 'one': 'ONE', 'ocean network': 'ONE',
+        'cma cgm': 'CMA CGM', 'cma-cgm': 'CMA CGM', 'cosco': 'COSCO',
+        'evergreen': 'Evergreen', 'yang ming': 'Yang Ming', 'zim': 'ZIM',
+        'hmm': 'HMM', 'hyundai': 'HMM', 'pil': 'PIL', 'wan hai': 'Wan Hai',
+        'oocl': 'OOCL',
+    }
+    def _normalize_carrier(name):
+        n_low = str(name).lower()
+        for kw, short in _CARRIER_NORMALIZE.items():
+            if kw in n_low:
+                return short
+        return str(name).strip()
+    df['Carrier'] = df['Carrier'].apply(_normalize_carrier)
+
     df["Valid from dt"] = pd.to_datetime(df["Valid from"], dayfirst=True, errors="coerce")
     df["Valid to dt"] = pd.to_datetime(df["Valid to"], dayfirst=True, errors="coerce")
     return df, "Excel/CSV (Gemini-Extraktion)"
