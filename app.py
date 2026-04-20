@@ -1051,13 +1051,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
     # === EXCEL / CSV VERARBEITUNG ===
     else:
-        # --- Primär: Gemini-Extraktion (wie bei PDF) ---
-        if GEMINI_API_KEY:
-            df_gemini, methode_gemini = extrahiere_excel_mit_gemini(file_bytes, file_name)
-            if not df_gemini.empty:
-                return df_gemini, methode_gemini
-            # Gemini hat nichts gefunden → Heuristik als Fallback
-            st.info("📡 Gemini-Extraktion ergab keine Ergebnisse – versuche heuristische Verarbeitung…")
+        # Strategie: Heuristik zuerst (schnell & kostenlos),
+        # Gemini nur als Fallback bei schlechten Ergebnissen.
 
         df_raw = pd.DataFrame()
         global_contract = "Unbekannt"
@@ -1565,6 +1560,21 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         if df_return.empty and GEMINI_API_KEY:
             st.info("📡 Heuristische Verarbeitung ergab keine verwertbaren Zeilen – versuche Gemini-Extraktion…")
             return extrahiere_excel_mit_gemini(file_bytes, file_name)
+
+        # === GEMINI FALLBACK #3: Heuristik hat Daten, aber keine Surcharges erkannt ===
+        # Bei wenigen Zeilen ODER fehlenden Surcharges lohnt sich Gemini
+        if GEMINI_API_KEY and not df_return.empty:
+            _prep_col = 'Included Prepaid Surcharges 40HC'
+            _hat_surcharges = (
+                _prep_col in df_return.columns
+                and df_return[_prep_col].astype(str).str.strip().replace({'': None, 'nan': None, 'None': None}).notna().any()
+            )
+            if not _hat_surcharges:
+                st.info("📡 Heuristik hat keine Zuschläge erkannt – versuche Gemini für vollständige Extraktion…")
+                df_gemini, methode_gemini = extrahiere_excel_mit_gemini(file_bytes, file_name)
+                if not df_gemini.empty:
+                    return df_gemini, methode_gemini
+                # Gemini hat nichts → Heuristik-Ergebnis behalten
 
         return df_return, "Excel/CSV (Multi-Sheet)"
 
