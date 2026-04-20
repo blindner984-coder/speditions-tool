@@ -6,6 +6,7 @@ import warnings
 import io
 import os
 import hmac
+import uuid
 import requests
 import pymongo
 from datetime import datetime, timezone
@@ -165,6 +166,8 @@ def init_db():
         db = client["SpeditionsDB"]
         collection = db["Raten"]
         collection.create_index("createdAt", expireAfterSeconds=15552000)
+        collection.create_index("importBatchId")
+        collection.create_index("sourceFile")
         return collection
     except Exception:
         st.error("Datenbankverbindung fehlgeschlagen. Bitte MONGO_URI und Netzfreigaben prüfen.")
@@ -846,6 +849,147 @@ def lade_raten_aus_db(such_pol="", such_pod="", such_contract="", fetch_limit=MA
     return pd.DataFrame(rows), ist_gekuerzt
 
 
+@st.cache_data(ttl=60)
+def lade_importierte_dateien():
+    pipeline = [
+        {
+            '$match': {
+                'importBatchId': {'$exists': True, '$ne': None},
+                'sourceFile': {'$exists': True, '$ne': None},
+            }
+        },
+        {
+            '$group': {
+                '_id': '$importBatchId',
+                'sourceFile': {'$first': '$sourceFile'},
+                'createdAt': {'$max': '$createdAt'},
+                'rowCount': {'$sum': 1},
+            }
+        },
+        {'$sort': {'createdAt': -1}},
+    ]
+    rows = list(collection.aggregate(pipeline))
+    if not rows:
+        return pd.DataFrame(columns=['importBatchId', 'sourceFile', 'createdAt', 'rowCount'])
+
+    df_files = pd.DataFrame(rows).rename(columns={'_id': 'importBatchId'})
+    if 'createdAt' in df_files.columns:
+        df_files['createdAt'] = pd.to_datetime(df_files['createdAt'], errors='coerce', utc=True)
+    return df_files
+
+
+@st.cache_data(ttl=60)
+def zaehle_legacy_eintraege_ohne_datei_metadata():
+    return collection.count_documents({
+        '$or': [
+            {'importBatchId': {'$exists': False}},
+            {'sourceFile': {'$exists': False}},
+            {'importBatchId': None},
+            {'sourceFile': None},
+        ]
+    })
+
+
+@st.cache_data(ttl=60)
+def lade_loeschbare_importgruppen():
+    df_modern = lade_importierte_dateien().copy()
+    modern_rows = []
+    if not df_modern.empty:
+        for _, row in df_modern.iterrows():
+            modern_rows.append({
+                'deleteMode': 'batch',
+                'importBatchId': row.get('importBatchId'),
+                'sourceFile': row.get('sourceFile', 'Unbekannt'),
+                'createdAt': row.get('createdAt'),
+                'rowCount': int(row.get('rowCount', 0) or 0),
+                'carrier': None,
+                'contractNumber': None,
+                'legacyCreatedDay': None,
+            })
+
+    legacy_docs = list(collection.find(
+        {
+            '$or': [
+                {'importBatchId': {'$exists': False}},
+                {'sourceFile': {'$exists': False}},
+                {'importBatchId': None},
+                {'sourceFile': None},
+            ]
+        },
+        {
+            '_id': 0,
+            'Carrier': 1,
+            'Contract Number': 1,
+            'createdAt': 1,
+        }
+    ))
+
+    legacy_groups = {}
+    for row in legacy_docs:
+        carrier = str(row.get('Carrier') or 'Unbekannt').strip() or 'Unbekannt'
+        contract = str(row.get('Contract Number') or 'Unbekannt').strip() or 'Unbekannt'
+        created_at = pd.to_datetime(row.get('createdAt'), errors='coerce', utc=True)
+        created_day = created_at.strftime('%Y-%m-%d') if pd.notna(created_at) else 'unknown-date'
+        key = (carrier, contract, created_day)
+        if key not in legacy_groups:
+            legacy_groups[key] = {
+                'deleteMode': 'legacy',
+                'importBatchId': None,
+                'sourceFile': f"Legacy-Import | {carrier} | {contract}",
+                'createdAt': created_at,
+                'rowCount': 0,
+                'carrier': carrier,
+                'contractNumber': contract,
+                'legacyCreatedDay': created_day,
+            }
+        legacy_groups[key]['rowCount'] += 1
+        if pd.notna(created_at):
+            current_ts = legacy_groups[key].get('createdAt')
+            if pd.isna(current_ts) or created_at > current_ts:
+                legacy_groups[key]['createdAt'] = created_at
+
+    combined = modern_rows + list(legacy_groups.values())
+    if not combined:
+        return pd.DataFrame(columns=['deleteMode', 'importBatchId', 'sourceFile', 'createdAt', 'rowCount', 'carrier', 'contractNumber', 'legacyCreatedDay'])
+
+    df_combined = pd.DataFrame(combined)
+    if 'createdAt' in df_combined.columns:
+        df_combined['createdAt'] = pd.to_datetime(df_combined['createdAt'], errors='coerce', utc=True)
+        df_combined = df_combined.sort_values(by='createdAt', ascending=False, na_position='last').reset_index(drop=True)
+    return df_combined
+
+
+def loesche_importgruppe(gruppe):
+    if gruppe.get('deleteMode') == 'batch':
+        return collection.delete_many({'importBatchId': gruppe.get('importBatchId')})
+
+    carrier = gruppe.get('carrier')
+    contract = gruppe.get('contractNumber')
+    created_day = gruppe.get('legacyCreatedDay')
+
+    query = {
+        '$and': [
+            {
+                '$or': [
+                    {'importBatchId': {'$exists': False}},
+                    {'sourceFile': {'$exists': False}},
+                    {'importBatchId': None},
+                    {'sourceFile': None},
+                ]
+            },
+            {'Carrier': carrier},
+            {'Contract Number': contract},
+        ]
+    }
+
+    if created_day and created_day != 'unknown-date':
+        day_start = pd.Timestamp(created_day, tz='UTC').to_pydatetime()
+        day_end = (pd.Timestamp(created_day, tz='UTC') + pd.Timedelta(days=1)).to_pydatetime()
+        query['$and'].append({'createdAt': {'$gte': day_start, '$lt': day_end}})
+
+    return collection.delete_many(query)
+
+
 def formatiere_datum_fuer_header(value):
     # 1. Fängt leere Werte ab (None, NaN, NaT)
     if pd.isna(value):
@@ -868,6 +1012,18 @@ def formatiere_datum_fuer_header(value):
         return parsed.strftime("%d.%m.%Y")
 
     return text
+
+
+def formatiere_import_timestamp(value):
+    if pd.isna(value):
+        return "?"
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_convert('UTC') if value.tzinfo else value.tz_localize('UTC')
+        return ts.strftime("%d.%m.%Y %H:%M UTC")
+    parsed = pd.to_datetime(value, errors='coerce', utc=True)
+    if pd.notna(parsed):
+        return parsed.strftime("%d.%m.%Y %H:%M UTC")
+    return str(value)
 
 
 def ermittle_erste_spalte(df, kandidaten):
@@ -1524,7 +1680,8 @@ def normalisiere_upload_dataframe(df_upload):
         '40HC', 'Currency', 'Included Prepaid Surcharges 40HC',
         'Included Collect Surcharges 40HC', 'Remark'
     ]
-    return out[ziel_spalten]
+    meta_spalten = [c for c in ['createdAt', 'sourceFile', 'importBatchId'] if c in out.columns]
+    return out[ziel_spalten + meta_spalten]
 
 
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
@@ -2345,6 +2502,10 @@ with tab_upload:
                             )
 
                             if not df_teil.empty:
+                                import_time = datetime.now(timezone.utc)
+                                df_teil['createdAt'] = import_time
+                                df_teil['sourceFile'] = datei.name
+                                df_teil['importBatchId'] = f"{int(import_time.timestamp())}_{uuid.uuid4().hex[:8]}"
                                 alle_daten.append(df_teil)
                             else:
                                 st.warning(f"⚠️ {datei.name} übersprungen: {format_name}")
@@ -2389,11 +2550,15 @@ with tab_upload:
                             else:
                                 st.write("Alle Zeilen wurden weggefiltert.")
 
-                        df_upload['createdAt'] = datetime.now(timezone.utc)
+                        if 'createdAt' not in df_upload.columns:
+                            df_upload['createdAt'] = datetime.now(timezone.utc)
                         gespeichert = speichere_dataframe_batchweise(df_upload)
 
                         if gespeichert > 0:
                             lade_raten_aus_db.clear()
+                            lade_importierte_dateien.clear()
+                            lade_loeschbare_importgruppen.clear()
+                            zaehle_legacy_eintraege_ohne_datei_metadata.clear()
                             st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                             st.balloons()
                         else:
@@ -2405,15 +2570,45 @@ with tab_upload:
 
         st.markdown("---")
         st.write("### 🚨 Gefahrenzone")
+        st.write("#### Einzelne Import-Datei löschen")
+
+        df_importe = lade_loeschbare_importgruppen()
+
+        if df_importe.empty:
+            st.info("Es sind aktuell keine löschbaren Import-Gruppen vorhanden.")
+        else:
+            optionen = []
+            for _, row in df_importe.iterrows():
+                label = (
+                    f"{row.get('sourceFile', 'Unbekannt')} | "
+                    f"{int(row.get('rowCount', 0))} Zeilen | "
+                    f"Import: {formatiere_import_timestamp(row.get('createdAt'))}"
+                )
+                optionen.append(label)
+
+            ausgewaehlte_datei = st.selectbox(
+                "Import-Datei oder Legacy-Import auswählen",
+                options=optionen,
+                key="single_delete_select",
+            )
+            if st.button("🗑️ Ausgewählte Import-Datei löschen"):
+                selected_row = df_importe.iloc[optionen.index(ausgewaehlte_datei)].to_dict()
+                ergebnis_file = loesche_importgruppe(selected_row)
+                lade_raten_aus_db.clear()
+                lade_importierte_dateien.clear()
+                lade_loeschbare_importgruppen.clear()
+                zaehle_legacy_eintraege_ohne_datei_metadata.clear()
+                st.success(f"✅ Import-Datei gelöscht. Es wurden {ergebnis_file.deleted_count} Einträge entfernt.")
+
+        st.markdown("---")
         st.error("Achtung: Der folgende Button löscht **alle** gespeicherten Raten unwiderruflich aus der Datenbank.")
 
-        delete_confirm = st.checkbox("Ich bestätige, dass ich alle Raten endgültig löschen will.", key="delete_confirm_checkbox")
-        delete_text = st.text_input("Zur Bestätigung exakt `DELETE ALL` eingeben:", key="delete_confirm_text")
-        delete_allowed = delete_confirm and delete_text.strip() == "DELETE ALL"
-
-        if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)", disabled=not delete_allowed):
+        if st.button("🗑️ Ganze Datenbank leeren (Alle Raten löschen)"):
             ergebnis_all = collection.delete_many({})
             lade_raten_aus_db.clear()
+            lade_importierte_dateien.clear()
+            lade_loeschbare_importgruppen.clear()
+            zaehle_legacy_eintraege_ohne_datei_metadata.clear()
             st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
     else:
         st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
