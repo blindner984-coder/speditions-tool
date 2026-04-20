@@ -600,6 +600,101 @@ def ist_doc_gebuehr(name):
     return False
 
 
+# --- SURCHARGE CODE → LESBARER NAME ---
+# Erweiterbar: Code als Key, lesbarer Name als Value.
+# Format in der Anzeige: "Lesbarer Name (CODE)"
+SURCHARGE_CODE_NAMEN = {
+    # Bunker / Fuel
+    'BAF':    'Bunker Adjustment Factor',
+    'BAF03':  'Bunker Adjustment Factor',
+    'BAF09':  'Emergency Fuel Surcharge',
+    'EBS':    'Emergency Bunker Surcharge',
+    'EFS':    'Emergency Fuel Surcharge',
+    'LSS':    'Low Sulphur Surcharge',
+    'LSF':    'Low Sulphur Fuel Surcharge',
+    'FSC':    'Fuel Surcharge',
+    'FRT42':  'Emergency Operational Recovery',
+    'IFO':    'Interim Fuel Oil Surcharge',
+    'MTD':    'Marine Fuel Recovery',
+    'MFR':    'Marinefuel Recover',
+    'NRJ00':  'Energy Transition Surcharge',
+    'ETS':    'Eu Emiss.Allowance',
+    'WRS':    'War Risk Surcharge',
+    # Terminal Handling
+    'THC':    'Origin Terminal Handling Charge',
+    'THC58':  'Terminal Handling Charge (OTHC) at origin',
+    'OTHC':   'Origin Terminal Handling Charge',
+    'DTHC':   'Destination Terminal Handling Charge',
+    'THD':    'Destination Terminal Handling Charge',
+    'VP1':    'Origin Terminal Handling Charge',
+    'VP2':    'Origin Terminal Handling Charge',
+    'CP1':    'Destination Terminal Handling Charge',
+    'CP2':    'Destination Terminal Handling Charge',
+    'THC34':  'Terminal Handling Charge (DTHC) at destination',
+    'LPC51':  'Low Peak Charges',
+    'LFD':    'Lift On/off Destin',
+    'GFD':    'Gate Fee Destinati',
+    'WHD':    'Weighing Chges.Des',
+    # Documentation
+    'ODF':    'Origin Documentation Fee',
+    'DDF':    'Destination Documentation Fee',
+    'DDC':    'Dest Delivery Chge',
+    'BLF':    'Bill of Lading Fee',
+    'DOC':    'Documentation Fee',
+    'DTI':    'Destination Terminal Inland',
+    'EPD':    'E-paym.Proc.Fee D',
+    'PDO':    'Delivery Order',
+    'ADD':    'Admin Fee Dest',
+    # Peak / Season
+    'PSS':    'Peak Season Surcharge',
+    'GRI':    'General Rate Increase',
+    # Port / Congestion
+    'CFO':    'Congestion Surcharge Origin',
+    'CFD':    'Congestion Surcharge Discharge',
+    'PCS':    'Port Congestion Surcharge',
+    'PCC':    'Port Congestion Surcharge',
+    # Equipment
+    'ECS':    'Equipment Control Surcharge',
+    'ERC':    'Logistic Fee / Equipment Repositioning Charge',
+    'CAR45':  'Carrier-specific Surcharge',
+    'IHI':    'Inland Haulage',
+    'RHD':    'Receiv./handl./del',
+    'TAO':    'Transp Addl Origin',
+    'CSU':    'Contingency Surch.',
+    'FTS':    'Flexi Tank Surcharge',
+    'DHC':    'Destination Handling Charges',
+    'ISF':    'Importer Security Filing',
+    'ISS01':  'ISPS - Vessel Security Surcharge',
+    'HZD01':  'Dangerous goods surcharge',
+    'VRS':    'Vessel Risk Surch.',
+    'DDF':    'Destination Documentation Fee',
+    'EMF':    'Environmental Monitoring Fee',
+}
+
+def surcharge_code_zu_label(name_roh: str) -> str:
+    """Gibt 'Lesbarer Name (CODE)' zurück, falls CODE im Mapping – sonst original."""
+    roh = str(name_roh or "").strip()
+    if not roh:
+        return ""
+
+    # Bereits formatiert (z.B. "Emergency Fuel Surcharge (BAF09)")
+    if re.search(r"\([A-Z0-9]{2,}\)$", roh):
+        return roh
+
+    code = roh.upper()
+    if code in SURCHARGE_CODE_NAMEN:
+        return f"{SURCHARGE_CODE_NAMEN[code]} ({roh})"
+
+    # Fallback: Suffix-Ziffern entfernen (z.B. BAF09 -> BAF)
+    basis_match = re.match(r"^([A-Z]{2,})\d+$", code)
+    if basis_match:
+        basis_code = basis_match.group(1)
+        if basis_code in SURCHARGE_CODE_NAMEN:
+            return f"{SURCHARGE_CODE_NAMEN[basis_code]} ({roh})"
+
+    return roh
+
+
 # --- HILFSFUNKTIONEN FÜR BERECHNUNGEN ---
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']:
@@ -611,7 +706,13 @@ def berechne_gebuehren(zuschlaege_str):
             betrag = parse_decimal_wert(t[1])
             if betrag is None:
                 continue
-            liste.append({"name": t[0].strip().strip(',').strip(), "betrag": betrag, "waehrung": t[2].upper()})
+            name_roh = t[0].strip().strip(',').strip()
+            liste.append({
+                "name": name_roh,
+                "label": surcharge_code_zu_label(name_roh),
+                "betrag": betrag,
+                "waehrung": t[2].upper()
+            })
         except (ValueError, IndexError):
             pass
     return liste
@@ -626,12 +727,12 @@ def berechne_total_eur_dynamic(row, price_col, prep_surcharge_col, coll_surcharg
     summe_gebuehren_eur = 0
 
     for g in berechne_gebuehren(str(row.get(prep_surcharge_col, ''))):
-        if ist_doc_gebuehr(g['name']):
+        if ist_doc_gebuehr(g['name']) or ist_doc_gebuehr(g.get('label', '')):
             continue
         summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
 
     for i, g in enumerate(berechne_gebuehren(str(row.get(coll_surcharge_col, '')))):
-        if ist_doc_gebuehr(g['name']):
+        if ist_doc_gebuehr(g['name']) or ist_doc_gebuehr(g.get('label', '')):
             continue
         if include_all_collect or st.session_state.get(f"chk_{row_index}_{i}_{g['name']}", False):
             summe_gebuehren_eur += (g['betrag'] * usd_to_eur) if g['waehrung'] == 'USD' else g['betrag'] if g['waehrung'] == 'EUR' else 0
@@ -662,20 +763,21 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         st.write("**Zusammensetzung (Prepaid):**")
         has_prep = False
         for g in prep_gebuehren:
-            if ist_doc_gebuehr(g['name']):
+            if ist_doc_gebuehr(g['name']) or ist_doc_gebuehr(g.get('label', '')):
                 doc_gebuehren.append(g)
                 continue
+            display_name = g.get('label') or g['name']
             has_prep = True
             if g['waehrung'] == 'USD':
                 umgerechnet = g['betrag'] * usd_to_eur
                 summe_gebuehren_eur += umgerechnet
-                st.write(f"➕ {g['name']}: {g['betrag']:.2f} USD <small>(≈ {umgerechnet:.2f} EUR)</small>", unsafe_allow_html=True)
+                st.write(f"➕ {display_name}: {g['betrag']:.2f} USD <small>(≈ {umgerechnet:.2f} EUR)</small>", unsafe_allow_html=True)
             elif g['waehrung'] == 'EUR':
                 summe_gebuehren_eur += g['betrag']
-                st.write(f"➕ {g['name']}: {g['betrag']:.2f} EUR", unsafe_allow_html=True)
+                st.write(f"➕ {display_name}: {g['betrag']:.2f} EUR", unsafe_allow_html=True)
             else:
-                fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']})")
-                st.markdown(f"➕ <span class='fremd-waehrung'>{g['name']}: {g['betrag']:.2f} {g['waehrung']}</span>", unsafe_allow_html=True)
+                fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({display_name})")
+                st.markdown(f"➕ <span class='fremd-waehrung'>{display_name}: {g['betrag']:.2f} {g['waehrung']}</span>", unsafe_allow_html=True)
         if not has_prep:
             st.write("<small>Keine extra Prepaid Gebühren</small>", unsafe_allow_html=True)
 
@@ -683,17 +785,18 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         st.write("**🏢 Collect (Zielort):**")
         has_coll = False
         for i, g in enumerate(coll_gebuehren):
-            if ist_doc_gebuehr(g['name']):
+            if ist_doc_gebuehr(g['name']) or ist_doc_gebuehr(g.get('label', '')):
                 doc_gebuehren.append(g)
                 continue
+            display_name = g.get('label') or g['name']
             has_coll = True
-            if st.checkbox(f"{g['name']} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
+            if st.checkbox(f"{display_name} ({g['betrag']:.2f} {g['waehrung']})", key=f"chk_{row_index}_{i}_{g['name']}"):
                 if g['waehrung'] == 'USD':
                     summe_gebuehren_eur += (g['betrag'] * usd_to_eur)
                 elif g['waehrung'] == 'EUR':
                     summe_gebuehren_eur += g['betrag']
                 else:
-                    fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({g['name']} - Collect)")
+                    fremd_gebuehren.append(f"{g['betrag']:.2f} {g['waehrung']} ({display_name} - Collect)")
         if not has_coll:
             st.write("<small>Keine Collect Gebühren</small>", unsafe_allow_html=True)
 
@@ -704,7 +807,8 @@ def anzeige_container_daten(row, size_label, price_col, prep_surcharge_col, coll
         else:
             st.write("<small><i>(Nicht im All-In)</i></small>", unsafe_allow_html=True)
             for g in doc_gebuehren:
-                st.markdown(f"🔹 {g['name']}: {g['betrag']:.2f} {g['waehrung']}")
+                display_name = g.get('label') or g['name']
+                st.markdown(f"🔹 {display_name}: {g['betrag']:.2f} {g['waehrung']}")
 
     with col_total:
         total_eur = basis_eur + summe_gebuehren_eur
