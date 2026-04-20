@@ -611,7 +611,7 @@ def berechne_gebuehren(zuschlaege_str):
             betrag = parse_decimal_wert(t[1])
             if betrag is None:
                 continue
-            liste.append({"name": t[0].strip().lstrip(','), "betrag": betrag, "waehrung": t[2].upper()})
+            liste.append({"name": t[0].strip().strip(',').strip(), "betrag": betrag, "waehrung": t[2].upper()})
         except (ValueError, IndexError):
             pass
     return liste
