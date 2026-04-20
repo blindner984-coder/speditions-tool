@@ -306,13 +306,29 @@ Regeln:
    Beispiel: 4 POLs × 2 PODs = 8 FreightRate-Objekte.
    WICHTIG: Wenn das Dokument mehrere PODs auflistet (z.B. Jeddah und Aqaba), müssen für
    JEDEN POD separate FreightRate-Objekte erstellt werden – auch wenn der POL derselbe ist.
+   WICHTIG: Wenn das Dokument mehrere POLs auflistet (z.B. "Hamburg, Bremerhaven, Antwerp"),
+   muss für JEDEN POL ein separates FreightRate-Objekt erstellt werden.
 2. Surcharges filtern: Priorisiere Zuschläge für 40' Container. Ignoriere Zuschläge nur für 20'.
+   Wenn eine Surcharge "per Container" ist, verwende den Betrag direkt.
+   Wenn eine Surcharge "per TEU" ist, verdopple den Betrag für 40' (1 TEU × 2 = 40').
 3. Monatswerte: Wenn es für einen Zuschlag (z. B. ETS, BAF) mehrere Beträge für verschiedene
    Monate gibt, nimm immer den neuesten/aktuellsten Wert.
 4. Collect vs. Prepaid: Destination Charges und als 'Collect' markierte Gebühren kommen in
-   collect_surcharges. Origin- und Seefracht-Zuschläge kommen in prepaid_surcharges.
-5. Datumsformat: Immer DD.MM.YYYY.
-6. Gib ausschließlich valides JSON zurück, das dem vorgegebenen Schema entspricht.
+   collect_surcharges. ALLE ANDEREN Zuschläge kommen in prepaid_surcharges, insbesondere:
+   - ERC / Logistic Fee → PREPAID
+   - EFS / Emergency Fuel Surcharge → PREPAID
+   - FTS / Flexi Tank Surcharge → PREPAID
+   - THC / Terminal Handling → PREPAID (wenn am Origin)
+   - BRQ / Bunker Recovery → PREPAID
+   - PRS / Piracy Risk → PREPAID
+   - ISPS / Security → PREPAID
+   Zuschläge mit "not subject to" oder ohne Betrag ignorieren.
+5. Zuschläge zu Raten zuordnen: Die Zuschläge aus der Surcharge-Tabelle gelten für ALLE
+   Frachtraten im gleichen Dokument/Sheet. Jedes FreightRate-Objekt bekommt dieselben
+   prepaid_surcharges.
+6. Datumsformat: Immer DD.MM.YYYY.
+7. Gib ausschließlich valides JSON zurück, das dem vorgegebenen Schema entspricht.
+8. Raten mit "upon request" oder "on request" statt einem Preis ignorieren.
 """
 
 
