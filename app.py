@@ -1455,9 +1455,15 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         _detected_carrier = 'Hapag-Lloyd'
                         break
 
+            # CMA-CGM-Format: Surcharge-Zeilen haben oft NaN bei Valid from/to.
+            # Forward-Fill, damit sie zur gleichen Gruppe wie die Fracht-Zeile gehören.
+            for _date_col in [eff_col, exp_col]:
+                if _date_col and _date_col in df_raw.columns:
+                    df_raw[_date_col] = df_raw[_date_col].ffill()
+
             group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
-            # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities etc. nicht überschrieben werden
-            for extra_col in ['Commodity Name', 'Service Mode', 'Equipment Type']:
+            # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities/Line refs etc. nicht zusammengemischt werden
+            for extra_col in ['Commodity Name', 'Service Mode', 'Equipment Type', 'Line ref']:
                 if extra_col in df_raw.columns and extra_col not in group_cols:
                     group_cols.append(extra_col)
 
@@ -1503,7 +1509,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     beschreibung = str(r.get(charge_desc_col, '')).lower().strip() if charge_desc_col else ''
                     section = str(r.get(charge_section_col, '')).lower().strip() if charge_section_col else ''
                     
-                    s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=waehrung)
+                    # Zeilen-Währung bevorzugen (z.B. THC in INR statt USD)
+                    row_currency = waehrung
+                    if 'Currency' in r.index and pd.notna(r['Currency']):
+                        _rc = str(r['Currency']).strip().upper()
+                        if len(_rc) == 3 and _rc.isalpha():
+                            row_currency = _rc
+                    s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=row_currency)
                     
                     # Nur Beträge > 0 übernehmen 
                     if s_amt is not None and s_amt > 0:
