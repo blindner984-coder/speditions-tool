@@ -1453,6 +1453,23 @@ def expandiere_mehrfach_pol_zeilen(df):
 
     return pd.DataFrame(neue_zeilen)
 
+def expandiere_mehrfach_pod_zeilen(df):
+    if 'Port of Destination' not in df.columns or df.empty:
+        return df
+
+    neue_zeilen = []
+    for _, row in df.iterrows():
+        pods = extrahiere_mehrfach_pols(row.get('Port of Destination'))
+        if len(pods) <= 1:
+            neue_zeilen.append(row.to_dict())
+            continue
+
+        for pod in pods:
+            neue_row = row.to_dict()
+            neue_row['Port of Destination'] = pod
+            neue_zeilen.append(neue_row)
+
+    return pd.DataFrame(neue_zeilen)
 
 def extrahiere_hapag_quotation_excel(excel_dict, file_name):
     alle_rows = []
@@ -2601,9 +2618,18 @@ def _msg_parse_route_text(route_text, fallback_pol='NCP0'):
         left, right = [p.strip() for p in text.split('-', 1)]
         pol_codes = re.findall(r'\b[A-Z]{5}\b', left.upper())
         pod_codes = re.findall(r'\b[A-Z]{4,5}\b', right.upper())
+        # In den HMM-MSG-Tabellen stehen teils mehrere POD-Codes links und ein
+        # weiterer Code rechts vom Bindestrich (z.B. "... KRPUS - FEMP").
+        # Der per Bindestrich verbundene Teil beschreibt dabei EIN gemeinsames Ziel
+        # (z.B. "KRPUS - FEMP") und wird nicht in zwei Ziele zerlegt.
+        if len(pol_codes) >= 2 and len(pod_codes) >= 1:
+            alle_pods = pol_codes[:-1] + [f"{pol_codes[-1]} - {pod_codes[0]}"] + pod_codes[1:]
+            alle_pods = dedupliziere_eintraege(alle_pods)
+            return fallback_pol, ', '.join(alle_pods), fallback_pol
         pol = ', '.join(pol_codes) if pol_codes else (left or fallback_pol)
         pod = ', '.join(pod_codes) if pod_codes else right
         return pol, pod, pol or fallback_pol
+    out = expandiere_mehrfach_pod_zeilen(out)
 
     codes = re.findall(r'\b[A-Z]{4,5}\b', text.upper())
     if codes:
