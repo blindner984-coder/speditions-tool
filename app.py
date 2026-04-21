@@ -702,7 +702,10 @@ def surcharge_code_zu_label(name_roh: str) -> str:
 def berechne_gebuehren(zuschlaege_str):
     if not isinstance(zuschlaege_str, str) or zuschlaege_str.lower() in ['nan', 'none', '']:
         return []
-    treffer = re.findall(r"([A-Za-z0-9\s\(\)\-\./,:+'&]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})", zuschlaege_str)
+    treffer = re.findall(
+        r"(?:^|[,;\n]\s*)([^=]+?)\s*=\s*([\d,\.]+)\s*([A-Za-z]{3})",
+        zuschlaege_str,
+    )
     liste = []
     for t in treffer:
         try:
@@ -1215,7 +1218,14 @@ def dedupliziere_eintraege(eintraege):
 def dedupliziere_surcharge_string(text):
     if not isinstance(text, str) or not text.strip():
         return ""
-    teile = [t.strip() for t in text.split(",") if t.strip()]
+    teile = [
+        t.strip()
+        for t in re.split(
+            r";|\n|,(?=\s*[A-Z0-9]{2,10}(?:\s*\[[^\]]+\])?\s*\([A-Z]+\)\s*=)",
+            text,
+        )
+        if t.strip()
+    ]
     return ", ".join(dedupliziere_eintraege(teile))
 
 
