@@ -549,7 +549,7 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
     return df, "Excel/CSV (Gemini-Extraktion)"
 
 
-def admin_login_bereich():
+def admin_login_bereich(key_suffix="default"):
     st.write("### 🔐 Admin-Zugang")
     if not ADMIN_PASSWORD:
         st.error("ADMIN_PASSWORD ist nicht gesetzt. Admin-Funktionen sind aus Sicherheitsgründen deaktiviert.")
@@ -566,13 +566,13 @@ def admin_login_bereich():
 
     if st.session_state.get("admin_authenticated", False):
         st.success("Admin-Zugang aktiv.")
-        if st.button("🔓 Admin abmelden", key="admin_logout"):
+        if st.button("🔓 Admin abmelden", key=f"admin_logout_{key_suffix}"):
             st.session_state["admin_authenticated"] = False
             st.rerun()
         return True
 
-    input_password = st.text_input("Admin-Passwort", type="password", key="admin_password_input")
-    if st.button("🔐 Admin anmelden", key="admin_login"):
+    input_password = st.text_input("Admin-Passwort", type="password", key=f"admin_password_input_{key_suffix}")
+    if st.button("🔐 Admin anmelden", key=f"admin_login_{key_suffix}"):
         if hmac.compare_digest(str(input_password), expected_password):
             st.session_state["admin_authenticated"] = True
             st.session_state["admin_failed_attempts"] = 0
@@ -2839,7 +2839,7 @@ with tab_suche:
 
 # === TAB 2: ADMIN UPLOAD & LÖSCHEN ===
 with tab_upload:
-    is_admin = admin_login_bereich()
+    is_admin = admin_login_bereich("upload")
 
     if is_admin:
         st.write("### 📥 Neue Raten-Dateien in die Datenbank importieren")
@@ -3039,7 +3039,7 @@ with tab_analytics:
 
 # === TAB 4: ZUSCHLÄGE ===
 with tab_zuschlaege:
-    is_admin_zuschlaege = admin_login_bereich()
+    is_admin_zuschlaege = admin_login_bereich("zuschlaege")
 
     if is_admin_zuschlaege:
         st.write("### 🧾 Zuschläge für ein ganzes Ratenblatt bearbeiten")
@@ -3125,133 +3125,3 @@ with tab_zuschlaege:
     else:
         st.info("Zuschlagsverwaltung ist gesperrt. Bitte als Admin anmelden.")
 
-
-# === TAB 4: ZUSCHLÄGE PFLEGEN ===
-with tab_zuschlaege:
-    st.write("### 🧾 Zuschläge je Ratenblatt pflegen")
-    st.caption("Suche per Contract-/Quotationnummer oder per Reederei. Änderungen werden für alle POL/POD-Zeilen des ausgewählten Ratenblatts übernommen.")
-
-    is_admin_zuschlaege = admin_login_bereich()
-    if not is_admin_zuschlaege:
-        st.info("Zuschlags-Änderungen sind gesperrt. Bitte als Admin anmelden.")
-    else:
-        z1, z2 = st.columns(2)
-        with z1:
-            zus_contract = st.text_input(
-                "📄 Contract / Quotation",
-                placeholder="z.B. Q2603HAM00167 oder MFRMB0000002",
-                key="zuschlag_contract",
-            )
-        with z2:
-            zus_carrier = st.text_input(
-                "🚢 Reederei",
-                placeholder="z.B. Hapag-Lloyd oder CMA CGM",
-                key="zuschlag_carrier",
-            )
-
-        if st.button("🔎 Ratenblatt suchen", type="primary", key="zuschlag_search_btn"):
-            if not zus_contract.strip() and not zus_carrier.strip():
-                st.warning("Bitte mindestens Contract/Quotation oder Reederei eingeben.")
-                st.session_state["zuschlag_last_search"] = None
-            else:
-                st.session_state["zuschlag_last_search"] = {
-                    "contract": zus_contract.strip(),
-                    "carrier": zus_carrier.strip(),
-                }
-
-        search_cfg = st.session_state.get("zuschlag_last_search")
-        if search_cfg:
-            df_zuschlag, _ = suche_ratenblatt_fuer_zuschlaege(
-                contract_query=search_cfg.get("contract", ""),
-                carrier_query=search_cfg.get("carrier", ""),
-            )
-
-            if df_zuschlag.empty:
-                st.warning("Keine passenden Datensätze gefunden.")
-            else:
-                gruppen = (
-                    df_zuschlag
-                    .groupby(['Carrier', 'Contract Number'], dropna=False)
-                    .agg(
-                        Routen=('Port of Destination', 'count'),
-                        POL=('Port of Loading', 'nunique'),
-                        POD=('Port of Destination', 'nunique'),
-                    )
-                    .reset_index()
-                    .sort_values(['Carrier', 'Contract Number'])
-                )
-
-                st.success(f"{len(df_zuschlag)} Zeilen gefunden, verteilt auf {len(gruppen)} Ratenblatt-Gruppe(n).")
-                st.dataframe(gruppen, width="stretch", hide_index=True)
-
-                optionen = []
-                for _, g in gruppen.iterrows():
-                    optionen.append(
-                        f"{g['Carrier']} | {g['Contract Number']} | Routen: {int(g['Routen'])} | POL: {int(g['POL'])} | POD: {int(g['POD'])}"
-                    )
-
-                auswahl = st.selectbox(
-                    "Ratenblatt auswählen",
-                    options=optionen,
-                    key="zuschlag_group_select",
-                )
-
-                idx = optionen.index(auswahl)
-                selected = gruppen.iloc[idx]
-                carrier_selected = str(selected['Carrier']).strip()
-                contract_selected = str(selected['Contract Number']).strip()
-
-                subset = df_zuschlag[
-                    (df_zuschlag['Carrier'].astype(str).str.strip() == carrier_selected)
-                    & (df_zuschlag['Contract Number'].astype(str).str.strip() == contract_selected)
-                ].copy()
-
-                def haeufigster_text(series):
-                    cleaned = series.fillna('').astype(str).str.strip()
-                    cleaned = cleaned[(cleaned != '') & (~cleaned.str.lower().isin(['nan', 'none']))]
-                    if cleaned.empty:
-                        return ''
-                    return cleaned.value_counts().index[0]
-
-                default_prepaid = haeufigster_text(subset.get('Included Prepaid Surcharges 40HC', pd.Series(dtype=str)))
-                default_collect = haeufigster_text(subset.get('Included Collect Surcharges 40HC', pd.Series(dtype=str)))
-
-                st.markdown("---")
-                st.write(f"**Ausgewählt:** {carrier_selected} | {contract_selected}")
-
-                new_prepaid = st.text_area(
-                    "Included Prepaid Surcharges 40HC (neu)",
-                    value=default_prepaid,
-                    height=160,
-                    key="zuschlag_prepaid_text",
-                )
-                new_collect = st.text_area(
-                    "Included Collect Surcharges 40HC (neu)",
-                    value=default_collect,
-                    height=160,
-                    key="zuschlag_collect_text",
-                )
-
-                st.caption(
-                    f"Die Änderung wird auf alle {len(subset)} Zeilen dieses Ratenblatts angewendet "
-                    f"(alle Fahrtgebiete/POL-POD für {carrier_selected} | {contract_selected})."
-                )
-                confirm_update = st.checkbox(
-                    "Ich bestätige die Massenänderung für dieses komplette Ratenblatt.",
-                    key="zuschlag_confirm_update",
-                )
-
-                if st.button("💾 Zuschläge für Ratenblatt übernehmen", key="zuschlag_apply_btn"):
-                    if not confirm_update:
-                        st.warning("Bitte die Bestätigung aktivieren.")
-                    else:
-                        result = aktualisiere_zuschlaege_fuer_ratenblatt(
-                            carrier_selected,
-                            contract_selected,
-                            new_prepaid,
-                            new_collect,
-                        )
-                        lade_raten_aus_db.clear()
-                        st.success(
-                            f"✅ Zuschläge aktualisiert. Treffer: {result.matched_count}, geändert: {result.modified_count}."
-                        )
