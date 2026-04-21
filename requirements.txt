@@ -10,3 +10,4 @@ google-genai
 pydantic
 rapidfuzz
 pycryptodome
+extract-msg

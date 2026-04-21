@@ -7,6 +7,7 @@ import io
 import os
 import hmac
 import uuid
+import tempfile
 import requests
 import pymongo
 from pathlib import Path
@@ -2558,10 +2559,102 @@ def loesche_pickup_importgruppe(import_batch_id, source_file=""):
     return pickup_collection.delete_many({'_id': None})
 
 
+def extrahiere_raten_aus_msg(file_name, file_bytes, monatswert_modus="neu", _tiefe=0):
+    """Liest Outlook-.msg und verarbeitet unterstützte Anhänge (xlsx/xlsm/csv/pdf/msg)."""
+    if _tiefe > 2:
+        return pd.DataFrame(), "MSG-Verschachtelung zu tief (max. 3 Ebenen)."
+
+    try:
+        import extract_msg
+    except Exception:
+        return pd.DataFrame(), "Fehlendes Paket für .msg-Import (installiere 'extract-msg')."
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+
+        msg = extract_msg.Message(tmp_path)
+        zusammengefuehrt = []
+        quellen = []
+        ignoriert = []
+        erlaubte_endungen = {'.xlsx', '.xlsm', '.csv', '.pdf', '.msg'}
+
+        for idx, anhang in enumerate(getattr(msg, 'attachments', []) or [], start=1):
+            anhang_name = (
+                str(getattr(anhang, 'longFilename', '') or '').strip()
+                or str(getattr(anhang, 'filename', '') or '').strip()
+                or f"attachment_{idx}"
+            )
+            anhang_bytes = getattr(anhang, 'data', None)
+            if not isinstance(anhang_bytes, (bytes, bytearray)) or len(anhang_bytes) == 0:
+                ignoriert.append(f"{anhang_name} (leer)")
+                continue
+
+            ext = Path(anhang_name).suffix.lower()
+            if ext not in erlaubte_endungen:
+                ignoriert.append(f"{anhang_name} (nicht unterstützt)")
+                continue
+
+            if ext == '.msg':
+                df_teil, _methode = extrahiere_raten_aus_msg(
+                    anhang_name,
+                    bytes(anhang_bytes),
+                    monatswert_modus=monatswert_modus,
+                    _tiefe=_tiefe + 1,
+                )
+            else:
+                df_teil, _methode = lade_und_uebersetze_cached(
+                    anhang_name,
+                    bytes(anhang_bytes),
+                    monatswert_modus=monatswert_modus,
+                )
+
+            if df_teil is not None and not df_teil.empty:
+                if 'Remark' in df_teil.columns:
+                    df_teil['Remark'] = df_teil['Remark'].fillna('').astype(str).str.strip()
+                    quelle_txt = f"Quelle: {file_name} -> {anhang_name}"
+                    df_teil['Remark'] = df_teil['Remark'].apply(
+                        lambda x: f"{x} | {quelle_txt}" if x else quelle_txt
+                    )
+                zusammengefuehrt.append(df_teil)
+                quellen.append(anhang_name)
+            else:
+                ignoriert.append(f"{anhang_name} (keine verwertbaren Raten)")
+
+        if zusammengefuehrt:
+            df_msg = pd.concat(zusammengefuehrt, ignore_index=True)
+            status = f"MSG ({len(quellen)} Anhang/Anhänge verarbeitet"
+            if ignoriert:
+                status += f", {len(ignoriert)} ignoriert"
+            status += ")"
+            return df_msg, status
+
+        if ignoriert:
+            return pd.DataFrame(), f"MSG ohne verwertbare Daten. Ignoriert: {', '.join(ignoriert[:5])}"
+        return pd.DataFrame(), "MSG enthält keine verarbeitbaren Anhänge."
+    except Exception as e:
+        return pd.DataFrame(), f"Fehler beim Lesen der MSG-Datei: {e}"
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
     datei = io.BytesIO(file_bytes)
     datei.name = file_name
+
+    if datei.name.lower().endswith('.msg'):
+        return extrahiere_raten_aus_msg(
+            datei.name,
+            file_bytes,
+            monatswert_modus=monatswert_modus,
+        )
 
     # === PDF VERARBEITUNG ===
     if datei.name.lower().endswith('.pdf'):
@@ -3383,7 +3476,11 @@ with tab_upload:
             help="Gilt nur für MSC Quote PDFs mit mehrfachen Monatswerten (z.B. Feb/März).",
         )
         monatswert_modus = "neu" if monatswert_auswahl == "Neuester Betrag" else "alt"
-        uploaded_files = st.file_uploader("Dateien auswählen (.xlsx, .csv, .pdf)", type=["xlsx", "csv", "pdf"], accept_multiple_files=True)
+        uploaded_files = st.file_uploader(
+            "Dateien auswählen (.xlsx, .xlsm, .csv, .pdf, .msg)",
+            type=["xlsx", "xlsm", "csv", "pdf", "msg"],
+            accept_multiple_files=True,
+        )
 
         if uploaded_files:
             if st.button("🚀 Hochladen & in MongoDB speichern", type="primary"):
