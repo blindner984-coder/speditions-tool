@@ -2068,7 +2068,19 @@ def lese_pdf_text_kompakt(file_bytes):
         page_text = page.extract_text() or ''
         if page_text:
             texte.append(' '.join(page_text.split()))
-    return ' '.join(texte)
+    text = ' '.join(texte)
+    # PDF-Extraktion liefert teils Typografie-Ligaturen (z.B. "Salzuﬂen"),
+    # die Regex-Matches fuer Depotnamen stoeren.
+    ligaturen = {
+        'ﬀ': 'ff',
+        'ﬁ': 'fi',
+        'ﬂ': 'fl',
+        'ﬃ': 'ffi',
+        'ﬄ': 'ffl',
+    }
+    for alt, neu in ligaturen.items():
+        text = text.replace(alt, neu)
+    return text
 
 
 def erkenne_pickup_carrier(file_name, text):
@@ -2155,7 +2167,7 @@ def pickup_analysiere_standard_tabelle(text, carrier, default_note=''):
     token_pattern = r'(?:FREE|NIL|No deal|Not allowed|c/h only|m/h only|\d+(?:[.,]\d+)?)'
     pattern = re.compile(
         rf'(?:\b[A-Z]{{2}}\s+)?([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(EUR|USD|€)\s+'
-        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})(?=\s+(?:[A-Z]{{2}}\s+)?[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)',
+        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})(?=\s+(?:(?:[A-Z]{{2}}\s+)?[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|\d+\s+Best\s+regards)|$)',
         re.IGNORECASE,
     )
     rows = []
@@ -2163,7 +2175,7 @@ def pickup_analysiere_standard_tabelle(text, carrier, default_note=''):
         depot = bereinige_pickup_depotname(match.group(1))
         if not ist_gueltiger_pickup_depotname(depot):
             continue
-        value_40hc = parse_pickup_betrag(match.group(4))
+        value_40hc = parse_pickup_betrag(match.group(5))
         rows.append({
             'Depot': depot,
             '40HC Pick Up': value_40hc,
@@ -2503,6 +2515,47 @@ def lade_pickup_aus_db(limit=400, such_carrier="", such_depot=""):
     if 'createdAt' in df_pickup.columns:
         df_pickup['createdAt'] = pd.to_datetime(df_pickup['createdAt'], errors='coerce', utc=True)
     return df_pickup
+
+
+@st.cache_data(ttl=60)
+def lade_pickup_importgruppen():
+    pipeline = [
+        {
+            '$match': {
+                'importBatchId': {'$exists': True, '$ne': None},
+                'sourceFile': {'$exists': True, '$ne': None},
+            }
+        },
+        {
+            '$group': {
+                '_id': '$importBatchId',
+                'sourceFile': {'$first': '$sourceFile'},
+                'createdAt': {'$max': '$createdAt'},
+                'rowCount': {'$sum': 1},
+                'carrier': {'$first': '$Carrier'},
+            }
+        },
+        {'$sort': {'createdAt': -1}},
+    ]
+    rows = list(pickup_collection.aggregate(pipeline))
+    if not rows:
+        return pd.DataFrame(columns=['importBatchId', 'sourceFile', 'createdAt', 'rowCount', 'carrier'])
+
+    df_groups = pd.DataFrame(rows).rename(columns={'_id': 'importBatchId'})
+    if 'createdAt' in df_groups.columns:
+        df_groups['createdAt'] = pd.to_datetime(df_groups['createdAt'], errors='coerce', utc=True)
+    return df_groups
+
+
+def loesche_pickup_importgruppe(import_batch_id, source_file=""):
+    import_batch_id = str(import_batch_id or '').strip()
+    source_file = str(source_file or '').strip()
+
+    if import_batch_id:
+        return pickup_collection.delete_many({'importBatchId': import_batch_id})
+    if source_file:
+        return pickup_collection.delete_many({'sourceFile': source_file})
+    return pickup_collection.delete_many({'_id': None})
 
 
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
@@ -3767,4 +3820,37 @@ with tab_pickup:
         else:
             st.caption(f"Angezeigt: {len(df_pickup_db)} Datensätze")
             st.dataframe(df_pickup_db, width="stretch", hide_index=True)
+
+    st.markdown("---")
+    st.write("### 🚨 PICK UP Uploads löschen")
+    st.caption("Loescht einen kompletten PICK-UP Upload (Batch) aus der PICK-UP Datenbank.")
+
+    if is_admin_pickup:
+        df_pickup_importe = lade_pickup_importgruppen()
+        if df_pickup_importe.empty:
+            st.info("Es sind aktuell keine loeschbaren PICK-UP Upload-Gruppen vorhanden.")
+        else:
+            pickup_optionen = []
+            for _, row in df_pickup_importe.iterrows():
+                pickup_optionen.append(
+                    f"{row.get('sourceFile', 'Unbekannt')} | {row.get('carrier', 'Unbekannt')} | "
+                    f"{int(row.get('rowCount', 0))} Zeilen | Import: {formatiere_import_timestamp(row.get('createdAt'))}"
+                )
+
+            pickup_auswahl = st.selectbox(
+                "PICK-UP Upload auswählen",
+                options=pickup_optionen,
+                key="pickup_delete_select",
+            )
+            if st.button("🗑️ Ausgewählten PICK-UP Upload löschen", key="pickup_delete_btn"):
+                selected_row = df_pickup_importe.iloc[pickup_optionen.index(pickup_auswahl)].to_dict()
+                ergebnis_delete = loesche_pickup_importgruppe(
+                    selected_row.get('importBatchId'),
+                    selected_row.get('sourceFile', ''),
+                )
+                lade_pickup_aus_db.clear()
+                lade_pickup_importgruppen.clear()
+                st.success(f"✅ PICK-UP Upload gelöscht. Entfernte Datensätze: {ergebnis_delete.deleted_count}")
+    else:
+        st.info("Loeschfunktion ist gesperrt. Bitte als Admin anmelden.")
 
