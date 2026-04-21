@@ -993,6 +993,130 @@ def loesche_importgruppe(gruppe):
     return collection.delete_many(query)
 
 
+def erster_nichtleerer_wert(series, default=""):
+    for value in series:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {'nan', 'none', 'null', 'nil'}:
+            return text
+    return default
+
+
+def baue_zuschlag_gruppen_query(such_contract="", such_carrier=""):
+    query = {}
+    if str(such_contract).strip():
+        query['Contract Number'] = {'$regex': re.escape(str(such_contract).strip()), '$options': 'i'}
+    if str(such_carrier).strip():
+        query['Carrier'] = {'$regex': re.escape(str(such_carrier).strip()), '$options': 'i'}
+    return query
+
+
+def baue_zuschlag_update_query(gruppe):
+    import_batch_id = str(gruppe.get('importBatchId') or '').strip()
+    source_file = str(gruppe.get('sourceFile') or '').strip()
+    carrier = str(gruppe.get('carrier') or '').strip()
+    contract_number = str(gruppe.get('contractNumber') or '').strip()
+
+    if import_batch_id:
+        return {'importBatchId': import_batch_id}
+
+    if source_file:
+        return {
+            'sourceFile': source_file,
+            'Carrier': carrier,
+            'Contract Number': contract_number,
+        }
+
+    return {
+        'Carrier': carrier,
+        'Contract Number': contract_number,
+    }
+
+
+@st.cache_data(ttl=60)
+def lade_zuschlag_gruppen(such_contract="", such_carrier="", fetch_limit=5000):
+    projection = {
+        '_id': 0,
+        'Carrier': 1,
+        'Contract Number': 1,
+        'Included Prepaid Surcharges 40HC': 1,
+        'Included Collect Surcharges 40HC': 1,
+        'sourceFile': 1,
+        'importBatchId': 1,
+        'createdAt': 1,
+    }
+    rows = list(collection.find(baue_zuschlag_gruppen_query(such_contract, such_carrier), projection).limit(int(fetch_limit)))
+    if not rows:
+        return pd.DataFrame(columns=[
+            'groupKey', 'carrier', 'contractNumber', 'sourceFile', 'importBatchId',
+            'createdAt', 'rowCount', 'prepaidSurcharges', 'collectSurcharges'
+        ])
+
+    df = pd.DataFrame(rows)
+    for col in ['Carrier', 'Contract Number', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', 'sourceFile', 'importBatchId', 'createdAt']:
+        if col not in df.columns:
+            df[col] = None
+
+    df['createdAt'] = pd.to_datetime(df['createdAt'], errors='coerce', utc=True)
+    df['groupKey'] = df.apply(
+        lambda row: str(row['importBatchId']).strip() if pd.notna(row['importBatchId']) and str(row['importBatchId']).strip() else (
+            f"{str(row.get('sourceFile') or '').strip()}|{str(row.get('Carrier') or '').strip()}|{str(row.get('Contract Number') or '').strip()}"
+        ),
+        axis=1,
+    )
+
+    gruppen = []
+    for _, gruppe in df.groupby('groupKey', dropna=False):
+        gruppen.append({
+            'groupKey': str(gruppe['groupKey'].iloc[0]),
+            'carrier': erster_nichtleerer_wert(gruppe['Carrier'], default='Unbekannt'),
+            'contractNumber': erster_nichtleerer_wert(gruppe['Contract Number'], default='Unbekannt'),
+            'sourceFile': erster_nichtleerer_wert(gruppe['sourceFile'], default=''),
+            'importBatchId': erster_nichtleerer_wert(gruppe['importBatchId'], default=''),
+            'createdAt': gruppe['createdAt'].max(),
+            'rowCount': int(len(gruppe)),
+            'prepaidSurcharges': erster_nichtleerer_wert(gruppe['Included Prepaid Surcharges 40HC'], default=''),
+            'collectSurcharges': erster_nichtleerer_wert(gruppe['Included Collect Surcharges 40HC'], default=''),
+        })
+
+    df_gruppen = pd.DataFrame(gruppen)
+    if not df_gruppen.empty:
+        df_gruppen['createdAt'] = pd.to_datetime(df_gruppen['createdAt'], errors='coerce', utc=True)
+        df_gruppen = df_gruppen.sort_values(by=['createdAt', 'carrier', 'contractNumber'], ascending=[False, True, True], na_position='last').reset_index(drop=True)
+    return df_gruppen
+
+
+@st.cache_data(ttl=60)
+def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carrier="", contractNumber="", limit=50):
+    gruppe = {
+        'groupKey': groupKey,
+        'importBatchId': importBatchId,
+        'sourceFile': sourceFile,
+        'carrier': carrier,
+        'contractNumber': contractNumber,
+    }
+    rows = list(collection.find(
+        baue_zuschlag_update_query(gruppe),
+        {'_id': 0, 'Port of Loading': 1, 'Port of Destination': 1}
+    ).limit(int(limit)))
+    if not rows:
+        return pd.DataFrame(columns=['Port of Loading', 'Port of Destination'])
+    return pd.DataFrame(rows).fillna('').drop_duplicates().reset_index(drop=True)
+
+
+def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text):
+    return collection.update_many(
+        baue_zuschlag_update_query(gruppe),
+        {
+            '$set': {
+                'Included Prepaid Surcharges 40HC': dedupliziere_surcharge_string(prepaid_text),
+                'Included Collect Surcharges 40HC': dedupliziere_surcharge_string(collect_text),
+            }
+        }
+    )
+
+
 def formatiere_datum_fuer_header(value):
     # 1. Fängt leere Werte ab (None, NaN, NaT)
     if pd.isna(value):
@@ -1023,6 +1147,46 @@ def formatiere_import_timestamp(value):
     if isinstance(value, pd.Timestamp):
         ts = value.tz_convert('UTC') if value.tzinfo else value.tz_localize('UTC')
         return ts.strftime("%d.%m.%Y %H:%M UTC")
+
+
+def suche_ratenblatt_fuer_zuschlaege(contract_query='', carrier_query='', limit=3000):
+    query = {}
+    if contract_query and str(contract_query).strip():
+        query['Contract Number'] = {'$regex': re.escape(str(contract_query).strip()), '$options': 'i'}
+    if carrier_query and str(carrier_query).strip():
+        query['Carrier'] = {'$regex': re.escape(str(carrier_query).strip()), '$options': 'i'}
+
+    if not query:
+        return pd.DataFrame(), query
+
+    projection = {
+        '_id': 0,
+        'Carrier': 1,
+        'Contract Number': 1,
+        'Port of Loading': 1,
+        'Port of Destination': 1,
+        'Included Prepaid Surcharges 40HC': 1,
+        'Included Collect Surcharges 40HC': 1,
+    }
+
+    docs = list(collection.find(query, projection).limit(int(limit)))
+    if not docs:
+        return pd.DataFrame(), query
+    return pd.DataFrame(docs), query
+
+
+def aktualisiere_zuschlaege_fuer_ratenblatt(carrier, contract_number, prepaid_text, collect_text):
+    query = {
+        'Carrier': str(carrier).strip(),
+        'Contract Number': str(contract_number).strip(),
+    }
+    update_doc = {
+        '$set': {
+            'Included Prepaid Surcharges 40HC': dedupliziere_surcharge_string(prepaid_text),
+            'Included Collect Surcharges 40HC': dedupliziere_surcharge_string(collect_text),
+        }
+    }
+    return collection.update_many(query, update_doc)
     parsed = pd.to_datetime(value, errors='coerce', utc=True)
     if pd.notna(parsed):
         return parsed.strftime("%d.%m.%Y %H:%M UTC")
@@ -2546,7 +2710,12 @@ def speichere_dataframe_batchweise(df_upload):
 
 
 # --- TABS FÜR UI ---
-tab_suche, tab_upload, tab_analytics = st.tabs(["🔍 Raten suchen", "⚙️ Daten hochladen (Admin)", "📈 Analytics"])
+tab_suche, tab_upload, tab_analytics, tab_zuschlaege = st.tabs([
+    "🔍 Raten suchen",
+    "⚙️ Daten hochladen (Admin)",
+    "📈 Analytics",
+    "🧾 Zuschlägen",
+])
 
 # === TAB 1: SUCHEN ===
 with tab_suche:
@@ -2866,3 +3035,223 @@ with tab_analytics:
                         width="stretch",
                         hide_index=True
                     )
+
+
+# === TAB 4: ZUSCHLÄGE ===
+with tab_zuschlaege:
+    is_admin_zuschlaege = admin_login_bereich()
+
+    if is_admin_zuschlaege:
+        st.write("### 🧾 Zuschläge für ein ganzes Ratenblatt bearbeiten")
+        st.caption("Suche nach Contract-/Quotationnummer oder Reederei und übernimm Änderungen für alle Fahrgebiete des ausgewählten Ratenblatts.")
+
+        col_z1, col_z2 = st.columns(2)
+        with col_z1:
+            such_z_contract = st.text_input(
+                "📄 Contract / Quotationnummer",
+                placeholder="z.B. Q2603HAM00167 oder MFRMB0000002",
+                key="surcharge_contract",
+            )
+        with col_z2:
+            such_z_carrier = st.text_input(
+                "🚢 Reederei",
+                placeholder="z.B. Hapag-Lloyd",
+                key="surcharge_carrier",
+            )
+
+        if st.button("🔎 Ratenblätter suchen", type="primary", key="surcharge_search_btn"):
+            st.session_state['surcharge_search_started'] = True
+
+        if st.session_state.get('surcharge_search_started', False):
+            df_gruppen = lade_zuschlag_gruppen(such_z_contract, such_z_carrier)
+
+            if df_gruppen.empty:
+                st.warning("Keine passenden Ratenblätter gefunden.")
+            else:
+                gruppen_optionen = []
+                for _, row in df_gruppen.iterrows():
+                    gruppen_optionen.append(
+                        f"{row.get('carrier', 'Unbekannt')} | {row.get('contractNumber', 'Unbekannt')} | "
+                        f"{row.get('sourceFile', 'ohne Quelldatei')} | {int(row.get('rowCount', 0))} Routen | "
+                        f"Import: {formatiere_import_timestamp(row.get('createdAt'))}"
+                    )
+
+                ausgewaehlte_gruppe_label = st.selectbox(
+                    "Ratenblatt auswählen",
+                    options=gruppen_optionen,
+                    key="surcharge_group_select",
+                )
+                gruppe = df_gruppen.iloc[gruppen_optionen.index(ausgewaehlte_gruppe_label)].to_dict()
+
+                st.info(f"Änderungen werden für {int(gruppe.get('rowCount', 0))} Datensätze des ausgewählten Ratenblatts übernommen.")
+
+                preview_df = lade_zuschlag_routen_preview(
+                    str(gruppe.get('groupKey', '')),
+                    importBatchId=str(gruppe.get('importBatchId', '')),
+                    sourceFile=str(gruppe.get('sourceFile', '')),
+                    carrier=str(gruppe.get('carrier', '')),
+                    contractNumber=str(gruppe.get('contractNumber', '')),
+                )
+                if not preview_df.empty:
+                    st.write("#### Betroffene Fahrgebiete")
+                    st.dataframe(preview_df, width="stretch", hide_index=True)
+
+                with st.form(f"surcharge_update_form_{gruppe.get('groupKey', 'default')}"):
+                    neuer_prepaid_text = st.text_area(
+                        "Included Prepaid Surcharges 40HC",
+                        value=str(gruppe.get('prepaidSurcharges', '') or ''),
+                        height=180,
+                    )
+                    neuer_collect_text = st.text_area(
+                        "Included Collect Surcharges 40HC",
+                        value=str(gruppe.get('collectSurcharges', '') or ''),
+                        height=140,
+                    )
+                    st.caption(
+                        f"Erkannte Prepaid-Zuschläge: {len(berechne_gebuehren(neuer_prepaid_text))} | "
+                        f"Collect-Zuschläge: {len(berechne_gebuehren(neuer_collect_text))}"
+                    )
+                    speichern_zuschlaege = st.form_submit_button("💾 Zuschläge für ganzes Ratenblatt speichern", type="primary")
+
+                if speichern_zuschlaege:
+                    ergebnis_update = aktualisiere_zuschlaege_fuer_gruppe(gruppe, neuer_prepaid_text, neuer_collect_text)
+                    lade_raten_aus_db.clear()
+                    lade_importierte_dateien.clear()
+                    lade_loeschbare_importgruppen.clear()
+                    zaehle_legacy_eintraege_ohne_datei_metadata.clear()
+                    lade_zuschlag_gruppen.clear()
+                    lade_zuschlag_routen_preview.clear()
+                    st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
+    else:
+        st.info("Zuschlagsverwaltung ist gesperrt. Bitte als Admin anmelden.")
+
+
+# === TAB 4: ZUSCHLÄGE PFLEGEN ===
+with tab_zuschlaege:
+    st.write("### 🧾 Zuschläge je Ratenblatt pflegen")
+    st.caption("Suche per Contract-/Quotationnummer oder per Reederei. Änderungen werden für alle POL/POD-Zeilen des ausgewählten Ratenblatts übernommen.")
+
+    is_admin_zuschlaege = admin_login_bereich()
+    if not is_admin_zuschlaege:
+        st.info("Zuschlags-Änderungen sind gesperrt. Bitte als Admin anmelden.")
+    else:
+        z1, z2 = st.columns(2)
+        with z1:
+            zus_contract = st.text_input(
+                "📄 Contract / Quotation",
+                placeholder="z.B. Q2603HAM00167 oder MFRMB0000002",
+                key="zuschlag_contract",
+            )
+        with z2:
+            zus_carrier = st.text_input(
+                "🚢 Reederei",
+                placeholder="z.B. Hapag-Lloyd oder CMA CGM",
+                key="zuschlag_carrier",
+            )
+
+        if st.button("🔎 Ratenblatt suchen", type="primary", key="zuschlag_search_btn"):
+            if not zus_contract.strip() and not zus_carrier.strip():
+                st.warning("Bitte mindestens Contract/Quotation oder Reederei eingeben.")
+                st.session_state["zuschlag_last_search"] = None
+            else:
+                st.session_state["zuschlag_last_search"] = {
+                    "contract": zus_contract.strip(),
+                    "carrier": zus_carrier.strip(),
+                }
+
+        search_cfg = st.session_state.get("zuschlag_last_search")
+        if search_cfg:
+            df_zuschlag, _ = suche_ratenblatt_fuer_zuschlaege(
+                contract_query=search_cfg.get("contract", ""),
+                carrier_query=search_cfg.get("carrier", ""),
+            )
+
+            if df_zuschlag.empty:
+                st.warning("Keine passenden Datensätze gefunden.")
+            else:
+                gruppen = (
+                    df_zuschlag
+                    .groupby(['Carrier', 'Contract Number'], dropna=False)
+                    .agg(
+                        Routen=('Port of Destination', 'count'),
+                        POL=('Port of Loading', 'nunique'),
+                        POD=('Port of Destination', 'nunique'),
+                    )
+                    .reset_index()
+                    .sort_values(['Carrier', 'Contract Number'])
+                )
+
+                st.success(f"{len(df_zuschlag)} Zeilen gefunden, verteilt auf {len(gruppen)} Ratenblatt-Gruppe(n).")
+                st.dataframe(gruppen, width="stretch", hide_index=True)
+
+                optionen = []
+                for _, g in gruppen.iterrows():
+                    optionen.append(
+                        f"{g['Carrier']} | {g['Contract Number']} | Routen: {int(g['Routen'])} | POL: {int(g['POL'])} | POD: {int(g['POD'])}"
+                    )
+
+                auswahl = st.selectbox(
+                    "Ratenblatt auswählen",
+                    options=optionen,
+                    key="zuschlag_group_select",
+                )
+
+                idx = optionen.index(auswahl)
+                selected = gruppen.iloc[idx]
+                carrier_selected = str(selected['Carrier']).strip()
+                contract_selected = str(selected['Contract Number']).strip()
+
+                subset = df_zuschlag[
+                    (df_zuschlag['Carrier'].astype(str).str.strip() == carrier_selected)
+                    & (df_zuschlag['Contract Number'].astype(str).str.strip() == contract_selected)
+                ].copy()
+
+                def haeufigster_text(series):
+                    cleaned = series.fillna('').astype(str).str.strip()
+                    cleaned = cleaned[(cleaned != '') & (~cleaned.str.lower().isin(['nan', 'none']))]
+                    if cleaned.empty:
+                        return ''
+                    return cleaned.value_counts().index[0]
+
+                default_prepaid = haeufigster_text(subset.get('Included Prepaid Surcharges 40HC', pd.Series(dtype=str)))
+                default_collect = haeufigster_text(subset.get('Included Collect Surcharges 40HC', pd.Series(dtype=str)))
+
+                st.markdown("---")
+                st.write(f"**Ausgewählt:** {carrier_selected} | {contract_selected}")
+
+                new_prepaid = st.text_area(
+                    "Included Prepaid Surcharges 40HC (neu)",
+                    value=default_prepaid,
+                    height=160,
+                    key="zuschlag_prepaid_text",
+                )
+                new_collect = st.text_area(
+                    "Included Collect Surcharges 40HC (neu)",
+                    value=default_collect,
+                    height=160,
+                    key="zuschlag_collect_text",
+                )
+
+                st.caption(
+                    f"Die Änderung wird auf alle {len(subset)} Zeilen dieses Ratenblatts angewendet "
+                    f"(alle Fahrtgebiete/POL-POD für {carrier_selected} | {contract_selected})."
+                )
+                confirm_update = st.checkbox(
+                    "Ich bestätige die Massenänderung für dieses komplette Ratenblatt.",
+                    key="zuschlag_confirm_update",
+                )
+
+                if st.button("💾 Zuschläge für Ratenblatt übernehmen", key="zuschlag_apply_btn"):
+                    if not confirm_update:
+                        st.warning("Bitte die Bestätigung aktivieren.")
+                    else:
+                        result = aktualisiere_zuschlaege_fuer_ratenblatt(
+                            carrier_selected,
+                            contract_selected,
+                            new_prepaid,
+                            new_collect,
+                        )
+                        lade_raten_aus_db.clear()
+                        st.success(
+                            f"✅ Zuschläge aktualisiert. Treffer: {result.matched_count}, geändert: {result.modified_count}."
+                        )
