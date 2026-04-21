@@ -2476,9 +2476,15 @@ def speichere_pickup_ergebnisse_in_db(pickup_ergebnisse):
 
 
 @st.cache_data(ttl=60)
-def lade_pickup_aus_db(limit=400):
+def lade_pickup_aus_db(limit=400, such_carrier="", such_depot=""):
+    query = {}
+    if str(such_carrier).strip():
+        query['Carrier'] = {'$regex': re.escape(str(such_carrier).strip()), '$options': 'i'}
+    if str(such_depot).strip():
+        query['Depot'] = {'$regex': re.escape(str(such_depot).strip()), '$options': 'i'}
+
     rows = list(pickup_collection.find(
-        {},
+        query,
         {
             '_id': 0,
             'Carrier': 1,
@@ -3601,9 +3607,91 @@ with tab_zuschlaege:
 # === TAB 5: PICK UP ===
 with tab_pickup:
     st.write("### 📦 PICK UP Analyse")
-    st.caption("Prüft die PDFs im Ordner data/upload darauf, ob Reeder, Leercontainerdepot und 40HC-Pick-up-Kosten sauber auslesbar sind.")
+    st.caption("Eigener PICK-UP Upload, Auslese und Suche nach Reeder/Depot in den gespeicherten PICK-UP Saetzen.")
 
     is_admin_pickup = admin_login_bereich("pickup")
+
+    st.write("### 📤 Eigener PICK-UP Upload")
+    pickup_upload_files = st.file_uploader(
+        "PICK-UP PDFs hochladen",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="pickup_upload_files",
+    )
+
+    if st.button("🧪 Upload-PDFs analysieren", type="primary", key="pickup_upload_analyze_btn"):
+        st.session_state['pickup_upload_results'] = []
+        if not pickup_upload_files:
+            st.warning("Bitte mindestens eine PICK-UP PDF auswaehlen.")
+        else:
+            upload_results = []
+            for datei in pickup_upload_files:
+                try:
+                    datei_bytes = datei.getvalue()
+                    if len(datei_bytes) > MAX_UPLOAD_SIZE_BYTES:
+                        upload_results.append({
+                            'fileName': datei.name,
+                            'carrier': 'Unbekannt',
+                            'status': 'Nicht sauber auslesbar',
+                            'note': f"Datei groesser als {MAX_UPLOAD_SIZE_MB} MB",
+                            'rows': [],
+                        })
+                        continue
+                    upload_results.append(analysiere_pickup_pdf(datei.name, datei_bytes))
+                except Exception as exc:
+                    upload_results.append({
+                        'fileName': datei.name,
+                        'carrier': 'Unbekannt',
+                        'status': 'Nicht sauber auslesbar',
+                        'note': str(exc),
+                        'rows': [],
+                    })
+            st.session_state['pickup_upload_results'] = upload_results
+
+    pickup_upload_results = st.session_state.get('pickup_upload_results', [])
+    if pickup_upload_results:
+        df_upload_summary = pd.DataFrame([
+            {
+                'Datei': ergebnis.get('fileName', ''),
+                'Reeder': ergebnis.get('carrier', 'Unbekannt'),
+                'Status': ergebnis.get('status', 'Unbekannt'),
+                'Gefundene Depotzeilen': len(ergebnis.get('rows', [])),
+                'Hinweis': ergebnis.get('note', ''),
+            }
+            for ergebnis in pickup_upload_results
+        ])
+        st.dataframe(df_upload_summary, width="stretch", hide_index=True)
+
+        upload_optionen = [
+            f"{ergebnis.get('fileName', '')} | {ergebnis.get('carrier', 'Unbekannt')} | {ergebnis.get('status', 'Unbekannt')}"
+            for ergebnis in pickup_upload_results
+        ]
+        upload_auswahl = st.selectbox("Upload-Detailansicht", options=upload_optionen, key="pickup_upload_detail_select")
+        upload_detail = pickup_upload_results[upload_optionen.index(upload_auswahl)]
+
+        if upload_detail.get('rows'):
+            st.write("#### Aus Upload ausgelesene Leercontainerdepots")
+            st.dataframe(pd.DataFrame(upload_detail['rows']), width="stretch", hide_index=True)
+        else:
+            st.warning("Fuer diese Upload-Datei konnten keine belastbaren 40HC-Daten erzeugt werden.")
+
+        if is_admin_pickup:
+            if st.button("💾 Upload-Ergebnisse in Datenbank speichern", key="pickup_save_upload_db_btn"):
+                try:
+                    gespeichert = speichere_pickup_ergebnisse_in_db(pickup_upload_results)
+                    lade_pickup_aus_db.clear()
+                    if gespeichert > 0:
+                        st.success(f"✅ {gespeichert} PICK-UP Zeilen aus Upload gespeichert.")
+                    else:
+                        st.warning("Keine speicherbaren PICK-UP Zeilen im Upload gefunden.")
+                except Exception as e:
+                    st.error(f"Fehler beim Speichern der Upload-Ergebnisse: {e}")
+        else:
+            st.info("Upload kann analysiert werden. Zum Speichern in die Datenbank bitte als Admin anmelden.")
+
+    st.markdown("---")
+    st.write("### 📂 Analyse aus Ordner data/upload")
+    st.caption("Optionaler Schnelltest aller PICK-UP PDFs im Upload-Ordner.")
 
     if st.button("🔎 PICK UP PDFs prüfen", type="primary", key="pickup_scan_btn"):
         st.session_state['pickup_scan_started'] = True
@@ -3662,14 +3750,20 @@ with tab_pickup:
                 st.info("Für das Speichern in die Datenbank bitte als Admin anmelden.")
 
     st.markdown("---")
-    st.write("### 📚 Bereits gespeicherte PICK UP Datensätze")
-    if st.button("🔄 PICK UP Daten aus Datenbank laden", key="pickup_load_db_btn"):
+    st.write("### 🔍 PICK UP Suche in Datenbank")
+    such_col1, such_col2 = st.columns(2)
+    with such_col1:
+        pickup_such_carrier = st.text_input("🚢 Reeder", placeholder="z.B. Maersk", key="pickup_search_carrier")
+    with such_col2:
+        pickup_such_depot = st.text_input("🏭 Pick Up Depot", placeholder="z.B. Duisburg", key="pickup_search_depot")
+
+    if st.button("🔄 PICK UP Daten suchen", key="pickup_load_db_btn"):
         st.session_state['pickup_db_load_started'] = True
 
     if st.session_state.get('pickup_db_load_started', False):
-        df_pickup_db = lade_pickup_aus_db()
+        df_pickup_db = lade_pickup_aus_db(such_carrier=pickup_such_carrier, such_depot=pickup_such_depot)
         if df_pickup_db.empty:
-            st.info("Es sind aktuell keine PICK-UP Datensätze in der Datenbank vorhanden.")
+            st.info("Keine PICK-UP Datensaetze fuer die aktuelle Suche gefunden.")
         else:
             st.caption(f"Angezeigt: {len(df_pickup_db)} Datensätze")
             st.dataframe(df_pickup_db, width="stretch", hide_index=True)
