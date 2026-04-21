@@ -9,6 +9,7 @@ import hmac
 import uuid
 import requests
 import pymongo
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import List
 from pydantic import BaseModel, Field
@@ -175,6 +176,26 @@ def init_db():
 
 
 collection = init_db()
+
+
+@st.cache_resource
+def init_pickup_collection():
+    try:
+        client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        db = client["SpeditionsDB"]
+        pickup_coll = db["PickupRates"]
+        pickup_coll.create_index("createdAt")
+        pickup_coll.create_index("importBatchId")
+        pickup_coll.create_index("sourceFile")
+        pickup_coll.create_index("Carrier")
+        return pickup_coll
+    except Exception:
+        st.error("PICK-UP Datenbankverbindung fehlgeschlagen. Bitte MONGO_URI und Netzfreigaben prüfen.")
+        st.stop()
+
+
+pickup_collection = init_pickup_collection()
 
 # --- LIVE WECHSELKURS ---
 @st.cache_data(ttl=3600)
@@ -2028,6 +2049,456 @@ def normalisiere_upload_dataframe(df_upload):
     return out[ziel_spalten + meta_spalten]
 
 
+def ist_pickup_pdf_datei(file_name):
+    name_lower = str(file_name or '').strip().lower()
+    if not name_lower.endswith('.pdf'):
+        return False
+
+    pickup_keywords = ['pick up', 'pick-up', 'pickup', 'pudo', 'pu do']
+    if not any(keyword in name_lower for keyword in pickup_keywords):
+        return False
+
+    return 'yang ming export fak rates' not in name_lower
+
+
+def lese_pdf_text_kompakt(file_bytes):
+    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    texte = []
+    for page in reader.pages:
+        page_text = page.extract_text() or ''
+        if page_text:
+            texte.append(' '.join(page_text.split()))
+    return ' '.join(texte)
+
+
+def erkenne_pickup_carrier(file_name, text):
+    file_name_lower = str(file_name or '').lower()
+    text_lower = str(text or '').lower()
+    suchtext = f"{file_name_lower} {text_lower[:5000]}"
+
+    if 'cosco' in suchtext:
+        return 'COSCO'
+    if 'evergreen' in suchtext or 'de_exp_pickuptariff' in file_name_lower:
+        return 'Evergreen'
+    if 'maersk' in suchtext:
+        return 'Maersk'
+    if 'mediterranean shipping company' in suchtext or re.search(r'\bmsc\b', suchtext):
+        return 'MSC'
+    if re.search(r'\bhmm\b', suchtext) or 'hyundai merchant marine' in suchtext:
+        return 'HMM'
+    if 'one pudo' in suchtext or 'ocean network express' in suchtext or 'pudo remarks' in suchtext:
+        return 'ONE'
+    if re.search(r'\bq\d{4}[a-z]{3}\d{5,}(?:/\d+)?\b', suchtext):
+        return 'Hapag-Lloyd'
+    if 'imt europe' in suchtext:
+        return 'IMT Europe'
+    return 'Unbekannt'
+
+
+def parse_pickup_betrag(value):
+    text = str(value or '').strip()
+    if not text:
+        return None
+
+    upper_text = text.upper()
+    if upper_text in {'FREE', 'NIL'}:
+        return 0.0
+    if upper_text in {'NO DEAL', 'NOT ALLOWED', 'C/H ONLY', 'M/H ONLY', 'N/A'}:
+        return None
+    return parse_decimal_wert(text)
+
+
+def ist_gueltiger_pickup_depotname(name):
+    text = str(name or '').strip()
+    if not text:
+        return False
+
+    lower_text = text.lower()
+    blacklisted = [
+        'country depot currency', 'location evgl code', 'pick-up tariff', 'empty pick up charge',
+        'customer:', 'contract:', 'validity:', 'booking reference', 'rate agreement',
+        'germany -', 'austria city/address', 'remarks', 'scope & validity', 'drop off charge',
+        'pick up charge', 'pick-up & drop-off charges', 'charges germany', 'depot 20',
+    ]
+    return not any(token in lower_text for token in blacklisted)
+
+
+def bereinige_pickup_depotname(name):
+    text = re.sub(r'\s+', ' ', str(name or '')).strip(' ,')
+    text = re.sub(r'^HC\s+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^(?:DE|AT|BE|CH|CZ|FR|HU|NL|PL|SK)\s+(?=[A-ZÄÖÜ])', '', text)
+    return text.strip(' ,')
+
+
+def dedupliziere_pickup_rows(rows):
+    unique_rows = []
+    gesehen = set()
+    for row in rows:
+        depot = str(row.get('Depot') or '').strip()
+        amount_40hc = row.get('40HC Pick Up')
+        if amount_40hc is None:
+            continue
+        key = (depot.lower(), row.get('40HC Pick Up'), str(row.get('Currency') or '').upper(), str(row.get('Hinweis') or '').strip())
+        if not depot or key in gesehen:
+            continue
+        gesehen.add(key)
+        unique_rows.append({
+            'Depot': depot,
+            '40HC Pick Up': row.get('40HC Pick Up'),
+            'Currency': str(row.get('Currency') or 'EUR').upper(),
+            'Hinweis': str(row.get('Hinweis') or '').strip(),
+        })
+    return unique_rows
+
+
+def pickup_analysiere_standard_tabelle(text, carrier, default_note=''):
+    token_pattern = r'(?:FREE|NIL|No deal|Not allowed|c/h only|m/h only|\d+(?:[.,]\d+)?)'
+    pattern = re.compile(
+        rf'(?:\b[A-Z]{{2}}\s+)?([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(EUR|USD|€)\s+'
+        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})(?=\s+(?:[A-Z]{{2}}\s+)?[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)',
+        re.IGNORECASE,
+    )
+    rows = []
+    for match in pattern.finditer(text):
+        depot = bereinige_pickup_depotname(match.group(1))
+        if not ist_gueltiger_pickup_depotname(depot):
+            continue
+        value_40hc = parse_pickup_betrag(match.group(4))
+        rows.append({
+            'Depot': depot,
+            '40HC Pick Up': value_40hc,
+            'Currency': 'EUR' if match.group(2) == '€' else match.group(2).upper(),
+            'Hinweis': default_note,
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    status = 'Vollautomatisch' if rows else 'Nicht sauber auslesbar'
+    note = default_note if rows else 'Es konnten keine stabilen Depot-/40HC-Zeilen erkannt werden.'
+    return {
+        'carrier': carrier,
+        'status': status,
+        'note': note,
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_cosco(text):
+    match = re.search(r'Depot\s+20[´\'` ]\s*40[´\'` ]\s*40[´\'` ]?HC\s+(.*?)(?:Depots outside of Germa|$)', text, re.IGNORECASE)
+    section = match.group(1) if match else text
+    pattern = re.compile(
+        r'([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)(?=\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)'
+    )
+    rows = []
+    for depot, _, _, value_40hc in pattern.findall(section):
+        depot_clean = bereinige_pickup_depotname(depot)
+        if not ist_gueltiger_pickup_depotname(depot_clean):
+            continue
+        rows.append({
+            'Depot': depot_clean,
+            '40HC Pick Up': parse_pickup_betrag(value_40hc),
+            'Currency': 'EUR',
+            'Hinweis': '',
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': 'COSCO',
+        'status': 'Vollautomatisch' if rows else 'Nicht sauber auslesbar',
+        'note': '' if rows else 'COSCO-Tabelle konnte nicht stabil gelesen werden.',
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_evergreen(text):
+    token_pattern = r'(?:FREE|NIL|\d+(?:[.,]\d+)?)'
+    pattern = re.compile(
+        rf'([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+[A-Z]{{5}}\s+€\s+({token_pattern})\s+€\s+({token_pattern})\s+€\s+({token_pattern})(?=\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)',
+        re.IGNORECASE,
+    )
+    rows = []
+    for depot, _, _, value_40hc in pattern.findall(text):
+        depot_clean = bereinige_pickup_depotname(depot)
+        if not ist_gueltiger_pickup_depotname(depot_clean):
+            continue
+        rows.append({
+            'Depot': depot_clean,
+            '40HC Pick Up': parse_pickup_betrag(value_40hc),
+            'Currency': 'EUR',
+            'Hinweis': 'Exaktes Depot laut Dokument nur auf Anfrage.',
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': 'Evergreen',
+        'status': 'Vollautomatisch' if rows else 'Nicht sauber auslesbar',
+        'note': 'Depotadresse nur auf Anfrage ausgewiesen.' if rows else 'Evergreen-Tabelle konnte nicht stabil gelesen werden.',
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_imt(text):
+    pattern = re.compile(
+        r'[A-Z]{3}\s+[A-Za-z]+\s+([A-Z][A-Za-z ()/\-]+)\s+[A-Z]{5,6}\s+[A-Z0-9]{8,12}\s+(.+?)\s+€\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)(?=\s+[A-Z]{3}\s+[A-Za-z]+\s+[A-Z]|$)',
+        re.IGNORECASE,
+    )
+    rows = []
+    for location, depot_info, _, _, _, _, _, value_puhc in pattern.findall(text):
+        depot = re.sub(r'\s+', ' ', f"{location} | {depot_info}").strip(' |')
+        rows.append({
+            'Depot': depot,
+            '40HC Pick Up': parse_pickup_betrag(value_puhc),
+            'Currency': 'EUR',
+            'Hinweis': 'IMT-Layout ist mehrspaltig; Werte wurden heuristisch gelesen.',
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': 'IMT Europe',
+        'status': 'Teilweise' if rows else 'Nicht sauber auslesbar',
+        'note': 'Mehrspaltiges Layout, bitte Stichprobe prüfen.' if rows else 'IMT-Dokument ist in der Textausgabe zu stark verdichtet.',
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_msc(text):
+    token_pattern = r'(?:FREE|NIL|No deal|Not allowed|c/h only|m/h only|\d+(?:[.,]\d+)?)'
+    pattern = re.compile(
+        rf'([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(EUR|USD|€)\s+'
+        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})\s+'
+        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})(?=\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)',
+        re.IGNORECASE,
+    )
+    rows = []
+    for match in pattern.finditer(text):
+        depot = bereinige_pickup_depotname(match.group(1))
+        if not ist_gueltiger_pickup_depotname(depot):
+            continue
+
+        # Fachregel: fuer Pick-up gilt c/h; wenn c/h nicht vorhanden, fallback auf m/h.
+        ch_40hc = parse_pickup_betrag(match.group(5))
+        mh_40hc = parse_pickup_betrag(match.group(8))
+        final_40hc = ch_40hc if ch_40hc is not None else mh_40hc
+
+        rows.append({
+            'Depot': depot,
+            '40HC Pick Up': final_40hc,
+            'Currency': 'EUR' if match.group(2) == '€' else match.group(2).upper(),
+            'Hinweis': 'Regel: 40HC Pick-up = c/h-Block, bei fehlendem c/h wird m/h verwendet.',
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': 'MSC',
+        'status': 'Teilweise' if rows else 'Nicht sauber auslesbar',
+        'note': 'MSC-Regel aktiv: c/h fuer 40HC Pick-up, fallback auf m/h falls c/h fehlt.' if rows else 'MSC-Tabelle konnte nicht stabil gelesen werden.',
+        'rows': rows,
+    }
+
+
+def one_code_zu_klarnamen(code):
+    country_code = str(code or '').upper()[:2]
+    loc_code = str(code or '').upper()[2:5]
+
+    loc_names = {
+        'ENA': 'Enns', 'GRZ': 'Graz', 'KRE': 'Krems', 'LNZ': 'Linz', 'SZG': 'Salzburg',
+        'VIE': 'Vienna', 'WOL': 'Wolfurt',
+        'CTR': 'Ceska Trebova', 'PLZ': 'Plzen', 'PRG': 'Prague', 'SNO': 'Ostrava', 'ULN': 'Usti nad Labem', 'ZLN': 'Zlin',
+        'BUD': 'Budapest',
+        'ANB': 'Antwerp', 'GBB': 'Grobbendonk', 'GNE': 'Gent', 'GNK': 'Genk', 'LLO': 'La Louviere',
+        'MEH': 'Meerhout', 'VIL': 'Vilvoorde', 'WLB': 'Willebroek', 'ZWE': 'Zwevegem',
+        'BSL': 'Basel',
+        'BER': 'Berlin (Grossbeeren)', 'BFN': 'Bad Salzuflen', 'BON': 'Bonn', 'BRE': 'Bremen',
+        'CGN': 'Cologne', 'DTM': 'Dortmund', 'DUI': 'Duisburg', 'DUS': 'Duesseldorf',
+        'EMM': 'Emmerich', 'FRA': 'Frankfurt', 'HAL': 'Halle', 'HOQ': 'Hof', 'KEH': 'Kehl',
+        'LUG': 'Ludwigshafen', 'LUH': 'Ludwigshafen', 'MAI': 'Mainz', 'MHG': 'Mannheim', 'MUC': 'Munich',
+        'NSS': 'Neuss', 'NUE': 'Nuernberg', 'REG': 'Regensburg', 'SCW': 'Schweinfurt',
+        'SKO': 'Kornwestheim', 'STR': 'Stuttgart', 'TRI': 'Trier', 'ULM': 'Ulm', 'WOE': 'Woerth',
+        'MAD': 'Madrid', 'MIX': 'Miranda de Ebro', 'PNA': 'Pamplona', 'ZAZ': 'Zaragoza',
+        'BLU': 'Bruay-sur-l Escaut', 'BOD': 'Bordeaux', 'CFE': 'Clermont Ferrand', 'CLR': 'Chatenoy le Royal',
+        'DGS': 'Dourges', 'LIO': 'Lyon', 'MOM': 'Montoir de Bretagne', 'OTM': 'Ottmarsheim',
+        'PAR': 'Paris', 'PLD': 'Saint Jean d Angely', 'RNS': 'Rennes', 'SJY': 'Saint Jean d Angely',
+        'SXB': 'Strasbourg', 'TLS': 'Toulouse', 'URO': 'Rouen', 'VEA': 'Veauche', 'VZN': 'Vierzon',
+        'MOD': 'Marzaglia (Modena)', 'MZO': 'Pozzolo Formigaro', 'PDA': 'Padova', 'PLO': 'Pioltello',
+        'PTN': 'Piacenza', 'PZF': 'Fidenza', 'RNE': 'Rubiera', 'RUB': 'Rubiera',
+        'LUX': 'Liege',
+        'ABL': 'Alblasserdam', 'AMS': 'Amsterdam', 'BON': 'Born', 'HGL': 'Hengelo', 'MOE': 'Moerdijk',
+        'VEN': 'Venlo', 'WAS': 'Wanssum', 'ZAA': 'Zaandam',
+        'BZD': 'Brzeg Dolny', 'DAB': 'Dabrowa Gornicza', 'GWC': 'Gliwice', 'KZA': 'Katy Wroclawskie',
+        'LRK': 'Kolbuszowa', 'POZ': 'Poznan', 'WAW': 'Pruszkow (Warsaw)', 'WRO': 'Wroclaw',
+        'DJA': 'Dunajska Streda', 'KSC': 'Kosice', 'TNV': 'Trnava',
+    }
+
+    country_names = {
+        'AT': 'Austria', 'BE': 'Belgium', 'CH': 'Switzerland', 'CZ': 'Czech Republic',
+        'DE': 'Germany', 'ES': 'Spain', 'FR': 'France', 'HU': 'Hungary', 'IT': 'Italy',
+        'LU': 'Luxembourg', 'NL': 'Netherlands', 'PL': 'Poland', 'SK': 'Slovakia',
+    }
+
+    loc_name = loc_names.get(loc_code, loc_code)
+    country_name = country_names.get(country_code, country_code)
+    return f"{loc_name} ({country_name}) [{code}]"
+
+
+def pickup_analysiere_one(text):
+    token_pattern = r'(?:FREE|NIL|No deal|Not allowed|c/h only|m/h only|\d+(?:[.,]\d+)?)'
+    pattern = re.compile(
+        rf'\b([A-Z]{{5}}\d{{2}})\s+(EUR|CHF|USD)\s+({token_pattern})\s+({token_pattern})\s+({token_pattern})',
+        re.IGNORECASE,
+    )
+    rows = []
+    for code, currency, _, _, value_40hc in pattern.findall(text):
+        rows.append({
+            'Depot': one_code_zu_klarnamen(code),
+            '40HC Pick Up': parse_pickup_betrag(value_40hc),
+            'Currency': currency.upper(),
+            'Hinweis': 'ONE-Depotcode auf Klarname gemappt; Code bleibt zur Eindeutigkeit erhalten.',
+        })
+
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': 'ONE',
+        'status': 'Teilweise' if rows else 'Nicht sauber auslesbar',
+        'note': 'ONE trennt Depotnamen und Tarife; Mapping auf Klarnamen erfolgt ueber Depotcode-Heuristik.' if rows else 'ONE-Tariftabelle konnte nicht stabil gelesen werden.',
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_hmm(text):
+    return {
+        'carrier': 'HMM',
+        'status': 'Nicht sauber auslesbar',
+        'note': 'Im HMM-Dokument ist nur 20DC ausgewiesen; ein 40HC-Wert fehlt.',
+        'rows': [],
+    }
+
+
+def analysiere_pickup_pdf(file_name, file_bytes):
+    text = lese_pdf_text_kompakt(file_bytes)
+    if not text.strip():
+        return {
+            'fileName': file_name,
+            'carrier': 'Unbekannt',
+            'status': 'Nicht sauber auslesbar',
+            'note': 'PDF enthält keinen auslesbaren Text.',
+            'rows': [],
+        }
+
+    name_lower = str(file_name or '').lower()
+    carrier = erkenne_pickup_carrier(file_name, text)
+
+    if 'cosco' in name_lower:
+        result = pickup_analysiere_cosco(text)
+    elif 'de_exp' in name_lower or carrier == 'Evergreen':
+        result = pickup_analysiere_evergreen(text)
+    elif 'fms' in name_lower:
+        result = pickup_analysiere_standard_tabelle(text, carrier or 'Hapag-Lloyd')
+    elif 'maersk' in name_lower:
+        result = pickup_analysiere_standard_tabelle(text, 'Maersk')
+    elif 'imt europe' in name_lower:
+        result = pickup_analysiere_imt(text)
+    elif 'one pudo' in name_lower:
+        result = pickup_analysiere_one(text)
+    elif 'pick-up - drop off charges' in name_lower:
+        result = pickup_analysiere_msc(text)
+    elif 'hmm' in name_lower:
+        result = pickup_analysiere_hmm(text)
+    else:
+        result = pickup_analysiere_standard_tabelle(text, carrier)
+
+    result['fileName'] = file_name
+    if result.get('carrier') in {'Unbekannt', '', None}:
+        result['carrier'] = carrier
+    return result
+
+
+@st.cache_data(ttl=60)
+def analysiere_pickup_upload_ordner():
+    upload_dir = Path('data/upload')
+    if not upload_dir.exists():
+        return []
+
+    ergebnisse = []
+    for path in sorted(upload_dir.glob('*.pdf')):
+        if not ist_pickup_pdf_datei(path.name):
+            continue
+        try:
+            ergebnisse.append(analysiere_pickup_pdf(path.name, path.read_bytes()))
+        except Exception as exc:
+            ergebnisse.append({
+                'fileName': path.name,
+                'carrier': 'Unbekannt',
+                'status': 'Nicht sauber auslesbar',
+                'note': str(exc),
+                'rows': [],
+            })
+    return ergebnisse
+
+
+def baue_pickup_docs_aus_ergebnissen(pickup_ergebnisse):
+    docs = []
+    import_time = datetime.now(timezone.utc)
+    import_batch_id = f"pickup_{int(import_time.timestamp())}_{uuid.uuid4().hex[:8]}"
+
+    for ergebnis in pickup_ergebnisse:
+        file_name = str(ergebnis.get('fileName', '')).strip()
+        carrier = str(ergebnis.get('carrier', 'Unbekannt')).strip() or 'Unbekannt'
+        status = str(ergebnis.get('status', 'Unbekannt')).strip() or 'Unbekannt'
+        note = str(ergebnis.get('note', '')).strip()
+
+        for row in ergebnis.get('rows', []):
+            depot = str(row.get('Depot', '')).strip()
+            amount_40hc = parse_pickup_betrag(row.get('40HC Pick Up'))
+            currency = str(row.get('Currency', 'EUR')).strip().upper() or 'EUR'
+            row_note = str(row.get('Hinweis', '')).strip()
+            if not depot or amount_40hc is None:
+                continue
+            docs.append({
+                'Carrier': carrier,
+                'Depot': depot,
+                'Pickup 40HC': amount_40hc,
+                'Currency': currency,
+                'Status': status,
+                'Remark': row_note or note,
+                'sourceFile': file_name,
+                'importBatchId': import_batch_id,
+                'createdAt': import_time,
+            })
+
+    return docs
+
+
+def speichere_pickup_ergebnisse_in_db(pickup_ergebnisse):
+    docs = baue_pickup_docs_aus_ergebnissen(pickup_ergebnisse)
+    if not docs:
+        return 0
+    pickup_collection.insert_many(docs, ordered=False)
+    return len(docs)
+
+
+@st.cache_data(ttl=60)
+def lade_pickup_aus_db(limit=400):
+    rows = list(pickup_collection.find(
+        {},
+        {
+            '_id': 0,
+            'Carrier': 1,
+            'Depot': 1,
+            'Pickup 40HC': 1,
+            'Currency': 1,
+            'Status': 1,
+            'sourceFile': 1,
+            'createdAt': 1,
+            'Remark': 1,
+        }
+    ).sort('createdAt', -1).limit(int(limit)))
+    if not rows:
+        return pd.DataFrame()
+    df_pickup = pd.DataFrame(rows)
+    if 'createdAt' in df_pickup.columns:
+        df_pickup['createdAt'] = pd.to_datetime(df_pickup['createdAt'], errors='coerce', utc=True)
+    return df_pickup
+
+
 # --- DATEI READER FÜR DEN ADMIN-UPLOAD ---
 def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
     datei = io.BytesIO(file_bytes)
@@ -2710,11 +3181,12 @@ def speichere_dataframe_batchweise(df_upload):
 
 
 # --- TABS FÜR UI ---
-tab_suche, tab_upload, tab_analytics, tab_zuschlaege = st.tabs([
+tab_suche, tab_upload, tab_analytics, tab_zuschlaege, tab_pickup = st.tabs([
     "🔍 Raten suchen",
     "⚙️ Daten hochladen (Admin)",
     "📈 Analytics",
     "🧾 Zuschlägen",
+    "📦 PICK UP",
 ])
 
 # === TAB 1: SUCHEN ===
@@ -3124,4 +3596,81 @@ with tab_zuschlaege:
                     st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
     else:
         st.info("Zuschlagsverwaltung ist gesperrt. Bitte als Admin anmelden.")
+
+
+# === TAB 5: PICK UP ===
+with tab_pickup:
+    st.write("### 📦 PICK UP Analyse")
+    st.caption("Prüft die PDFs im Ordner data/upload darauf, ob Reeder, Leercontainerdepot und 40HC-Pick-up-Kosten sauber auslesbar sind.")
+
+    is_admin_pickup = admin_login_bereich("pickup")
+
+    if st.button("🔎 PICK UP PDFs prüfen", type="primary", key="pickup_scan_btn"):
+        st.session_state['pickup_scan_started'] = True
+
+    if st.session_state.get('pickup_scan_started', False):
+        pickup_ergebnisse = analysiere_pickup_upload_ordner()
+
+        if not pickup_ergebnisse:
+            st.warning("Keine passenden PICK-UP-PDFs im Ordner data/upload gefunden.")
+        else:
+            df_pickup_summary = pd.DataFrame([
+                {
+                    'Datei': ergebnis.get('fileName', ''),
+                    'Reeder': ergebnis.get('carrier', 'Unbekannt'),
+                    'Status': ergebnis.get('status', 'Unbekannt'),
+                    'Gefundene Depotzeilen': len(ergebnis.get('rows', [])),
+                    'Hinweis': ergebnis.get('note', ''),
+                }
+                for ergebnis in pickup_ergebnisse
+            ])
+            st.dataframe(df_pickup_summary, width="stretch", hide_index=True)
+
+            optionen = [
+                f"{ergebnis.get('fileName', '')} | {ergebnis.get('carrier', 'Unbekannt')} | {ergebnis.get('status', 'Unbekannt')}"
+                for ergebnis in pickup_ergebnisse
+            ]
+            auswahl = st.selectbox("PDF-Detailansicht", options=optionen, key="pickup_detail_select")
+            detail = pickup_ergebnisse[optionen.index(auswahl)]
+
+            st.info(
+                f"Reeder: {detail.get('carrier', 'Unbekannt')} | Status: {detail.get('status', 'Unbekannt')} | "
+                f"Depotzeilen: {len(detail.get('rows', []))}"
+            )
+            if detail.get('note'):
+                st.caption(detail.get('note'))
+
+            if detail.get('rows'):
+                df_pickup_rows = pd.DataFrame(detail['rows'])
+                st.write("#### Ausgelesene Leercontainerdepots")
+                st.dataframe(df_pickup_rows, width="stretch", hide_index=True)
+            else:
+                st.warning("Für dieses Dokument konnten noch keine belastbaren 40HC-Depotdaten vollautomatisch erzeugt werden.")
+
+            if is_admin_pickup:
+                if st.button("💾 Ausgelesene PICK UP Daten in Datenbank speichern", key="pickup_save_db_btn"):
+                    try:
+                        gespeichert = speichere_pickup_ergebnisse_in_db(pickup_ergebnisse)
+                        lade_pickup_aus_db.clear()
+                        if gespeichert > 0:
+                            st.success(f"✅ {gespeichert} PICK-UP Zeilen in MongoDB gespeichert.")
+                        else:
+                            st.warning("Keine speicherbaren PICK-UP Zeilen gefunden (z.B. fehlende 40HC-Werte).")
+                    except Exception as e:
+                        st.error(f"Fehler beim Speichern der PICK-UP Daten: {e}")
+            else:
+                st.info("Für das Speichern in die Datenbank bitte als Admin anmelden.")
+
+    st.markdown("---")
+    st.write("### 📚 Bereits gespeicherte PICK UP Datensätze")
+    if st.button("🔄 PICK UP Daten aus Datenbank laden", key="pickup_load_db_btn"):
+        st.session_state['pickup_db_load_started'] = True
+
+    if st.session_state.get('pickup_db_load_started', False):
+        df_pickup_db = lade_pickup_aus_db()
+        if df_pickup_db.empty:
+            st.info("Es sind aktuell keine PICK-UP Datensätze in der Datenbank vorhanden.")
+        else:
+            st.caption(f"Angezeigt: {len(df_pickup_db)} Datensätze")
+            st.dataframe(df_pickup_db, width="stretch", hide_index=True)
 

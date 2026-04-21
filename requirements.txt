@@ -9,3 +9,4 @@ dnspython
 google-genai
 pydantic
 rapidfuzz
+pycryptodome
