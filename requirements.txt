@@ -11,3 +11,4 @@ pydantic
 rapidfuzz
 pycryptodome
 extract-msg
+lxml

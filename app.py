@@ -2559,6 +2559,239 @@ def loesche_pickup_importgruppe(import_batch_id, source_file=""):
     return pickup_collection.delete_many({'_id': None})
 
 
+def _msg_bestimme_carrier(subject_text, body_text):
+    suchtext = f"{subject_text or ''} {body_text or ''}".lower()
+    if 'hmm' in suchtext or 'hmm21' in suchtext or 'hyundai merchant marine' in suchtext:
+        return 'HMM'
+    if 'msc' in suchtext:
+        return 'MSC'
+    if 'maersk' in suchtext:
+        return 'Maersk'
+    if 'hapag' in suchtext:
+        return 'Hapag-Lloyd'
+    if 'cma' in suchtext:
+        return 'CMA CGM'
+    if 'one' in suchtext or 'ocean network express' in suchtext:
+        return 'ONE'
+    if 'evergreen' in suchtext:
+        return 'Evergreen'
+    if 'cosco' in suchtext:
+        return 'COSCO'
+    return 'FMS'
+
+
+def _msg_parse_route_text(route_text, fallback_pol='NCP0'):
+    text = re.sub(r'\s+', ' ', str(route_text or '')).strip()
+    text = re.sub(r'\b(sind|zuzuglich|zuzueglich|inclusive|incl\.?|only)\b.*$', '', text, flags=re.IGNORECASE).strip(' ,;:-')
+
+    if not text:
+        return fallback_pol, '', fallback_pol
+
+    if '-' in text:
+        left, right = [p.strip() for p in text.split('-', 1)]
+        pol_codes = re.findall(r'\b[A-Z]{5}\b', left.upper())
+        pod_codes = re.findall(r'\b[A-Z]{4,5}\b', right.upper())
+        pol = ', '.join(pol_codes) if pol_codes else (left or fallback_pol)
+        pod = ', '.join(pod_codes) if pod_codes else right
+        return pol, pod, pol or fallback_pol
+
+    codes = re.findall(r'\b[A-Z]{4,5}\b', text.upper())
+    if codes:
+        return fallback_pol, ', '.join(codes), fallback_pol
+
+    return fallback_pol, text, fallback_pol
+
+
+def _msg_extrahiere_surcharges(meta_text):
+    text = str(meta_text or '')
+    if not text.strip():
+        return '', ''
+
+    collect_hinweis = bool(re.search(r'to\s+be\s+collect|destination\s+local\s+surcharges?\s+to\s+be\s+collect', text, re.IGNORECASE))
+
+    surcharge_pattern = re.compile(
+        r'^\s*([A-Z0-9]{2,5})\s+(.{1,120}?)\s+\b(USD|EUR)\b\s*(\d{1,4}(?:[\.,]\d{1,2})?)\s*/\s*(BL|TEU|CTR|CONTAINER|CNTR)\b',
+        re.IGNORECASE,
+    )
+    surcharge_header_pattern = re.compile(
+        r'^\s*([A-Z0-9]{2,5})\s*(?:\(([^\)]{1,120})\))?\s*(.{0,120})$',
+        re.IGNORECASE,
+    )
+    surcharge_amount_pattern = re.compile(
+        r'\b(USD|EUR)\b\s*(\d{1,4}(?:[\.,]\d{1,2})?)\s*/\s*(BL|TEU|CTR|CONTAINER|CNTR)\b',
+        re.IGNORECASE,
+    )
+    code_blacklist = {'FROM', 'DAYS', 'BOARD', 'VALID', 'TERM'}
+
+    prepaid_entries = []
+    collect_entries = []
+    gesehen = set()
+
+    lines = text.splitlines()
+
+    for idx, line in enumerate(lines):
+        if not line or len(line) > 220:
+            continue
+        match = surcharge_pattern.search(line)
+        if match:
+            code = (match.group(1) or '').upper().strip()
+            if code in code_blacklist:
+                continue
+            desc = re.sub(r'\s+', ' ', (match.group(2) or '').strip())
+            curr = (match.group(3) or '').upper().strip()
+            amount = parse_decimal_wert(match.group(4))
+            unit = (match.group(5) or '').upper().strip()
+            if not code or amount is None or amount <= 0:
+                continue
+        else:
+            header_match = surcharge_header_pattern.search(line)
+            if not header_match:
+                continue
+
+            code = (header_match.group(1) or '').upper().strip()
+            if code in code_blacklist:
+                continue
+
+            desc_head = re.sub(r'\s+', ' ', (header_match.group(2) or '').strip())
+            desc_tail = re.sub(r'\s+', ' ', (header_match.group(3) or '').strip())
+            if not desc_head and not desc_tail:
+                continue
+
+            desc_probe = f"{desc_head} {desc_tail}".lower()
+            if 'to be collect' in desc_probe:
+                continue
+
+            amount_match = None
+            for look_ahead in range(idx + 1, min(idx + 3, len(lines))):
+                line_next = lines[look_ahead]
+                if not line_next or len(line_next) > 220:
+                    continue
+                if re.match(r'^\s*[A-Z0-9]{2,5}\s+', line_next, re.IGNORECASE) and not re.match(r'^\s*FROM\b', line_next, re.IGNORECASE):
+                    continue
+                amount_match = surcharge_amount_pattern.search(line_next)
+                if amount_match:
+                    break
+
+            if not amount_match:
+                continue
+
+            curr = (amount_match.group(1) or '').upper().strip()
+            amount = parse_decimal_wert(amount_match.group(2))
+            unit = (amount_match.group(3) or '').upper().strip()
+            if amount is None or amount <= 0:
+                continue
+            desc = re.sub(r'\s+', ' ', f"{desc_head} {desc_tail}".strip())
+
+        key = (code, curr, float(amount), unit)
+        if key in gesehen:
+            continue
+        gesehen.add(key)
+
+        label = f"{desc} ({code})" if desc else code
+        eintrag = f"{label} = {amount:.2f} {curr}/{unit}"
+
+        if collect_hinweis:
+            collect_entries.append(eintrag)
+        else:
+            prepaid_entries.append(eintrag)
+
+    return ', '.join(prepaid_entries), ', '.join(collect_entries)
+
+
+def extrahiere_raten_aus_msg_body(msg_obj, file_name):
+    body_text = str(getattr(msg_obj, 'body', '') or '')
+    html_raw = getattr(msg_obj, 'htmlBody', None)
+    if isinstance(html_raw, (bytes, bytearray)):
+        html_text = html_raw.decode('utf-8', errors='ignore')
+    else:
+        html_text = str(html_raw or '')
+
+    if not html_text.strip() and not body_text.strip():
+        return pd.DataFrame(), "MSG enthält keinen verwertbaren Text."
+
+    subject_text = str(getattr(msg_obj, 'subject', '') or '')
+    meta_text = f"{subject_text}\n{body_text}\n{re.sub(r'<[^>]+>', ' ', html_text)}"
+    carrier = _msg_bestimme_carrier(subject_text, meta_text)
+
+    contract_match = re.search(r'\b(?:Rate\s*Ref\.?|Contract|Quote)\s*[:#-]?\s*([A-Z]{1,4}\d{5,})\b', meta_text, re.IGNORECASE)
+    contract_no = contract_match.group(1).strip() if contract_match else 'Unbekannt'
+    surcharge_prepaid, surcharge_collect = _msg_extrahiere_surcharges(body_text or meta_text)
+
+    valid_from, valid_to = None, None
+    date_range = re.search(r'(\d{2}[./-]\d{2}[./-]\d{4}).{0,40}?(?:bis|to|until|-).{0,40}?(\d{2}[./-]\d{2}[./-]\d{4})', meta_text, re.IGNORECASE | re.DOTALL)
+    if date_range:
+        valid_from = normalisiere_datum_token(date_range.group(1))
+        valid_to = normalisiere_datum_token(date_range.group(2))
+    else:
+        date_hits = re.findall(r'\d{2}[./-]\d{2}[./-]\d{4}', meta_text)
+        if len(date_hits) >= 2:
+            valid_from = normalisiere_datum_token(date_hits[0])
+            valid_to = normalisiere_datum_token(date_hits[1])
+
+    if not html_text.strip():
+        return pd.DataFrame(), "MSG enthält kein HTML mit Tabellen."
+
+    try:
+        msg_tables = pd.read_html(io.StringIO(html_text))
+    except Exception as e:
+        return pd.DataFrame(), f"MSG-HTML konnte nicht gelesen werden: {e}"
+
+    rows = []
+    fallback_pol = 'NCP0'
+
+    for table in msg_tables:
+        if table is None or table.empty:
+            continue
+
+        t = table.fillna('').astype(str)
+
+        for _, r in t.iterrows():
+            vals = [str(v).strip() for v in r.tolist()]
+            if not vals:
+                continue
+
+            currencies = [i for i, v in enumerate(vals) if v.upper() in {'USD', 'EUR'}]
+            if not currencies:
+                continue
+
+            cur_idx = currencies[0]
+            cur = vals[cur_idx].upper()
+            if cur not in {'USD', 'EUR'}:
+                continue
+
+            amount_candidates = [parse_decimal_wert(v) for v in vals[cur_idx + 1:]]
+            amount_candidates = [a for a in amount_candidates if a is not None and a > 0]
+            if not amount_candidates:
+                continue
+
+            value_40 = amount_candidates[1] if len(amount_candidates) >= 2 else amount_candidates[0]
+
+            route_text = vals[2] if len(vals) >= 3 else " ".join(vals)
+            pol, pod, fallback_pol = _msg_parse_route_text(route_text, fallback_pol=fallback_pol)
+            if not pol or not pod:
+                continue
+
+            rows.append({
+                'Carrier': carrier,
+                'Contract Number': contract_no,
+                'Port of Loading': pol,
+                'Port of Destination': pod,
+                'Valid from': valid_from,
+                'Valid to': valid_to,
+                '40HC': value_40,
+                'Currency': cur,
+                'Included Prepaid Surcharges 40HC': surcharge_prepaid,
+                'Included Collect Surcharges 40HC': surcharge_collect,
+                'Remark': f"Automatisch aus MSG-Body extrahiert ({file_name})",
+            })
+
+    if not rows:
+        return pd.DataFrame(), "MSG-Body enthält keine erkennbaren Ratenzeilen."
+
+    df_msg = pd.DataFrame(rows).drop_duplicates(subset=['Port of Loading', 'Port of Destination', '40HC', 'Currency'])
+    return df_msg, f"MSG-Body ({len(df_msg)} Raten extrahiert)"
+
+
 def extrahiere_raten_aus_msg(file_name, file_bytes, monatswert_modus="neu", _tiefe=0):
     """Liest Outlook-.msg und verarbeitet unterstützte Anhänge (xlsx/xlsm/csv/pdf/msg)."""
     if _tiefe > 2:
@@ -2631,9 +2864,13 @@ def extrahiere_raten_aus_msg(file_name, file_bytes, monatswert_modus="neu", _tie
             status += ")"
             return df_msg, status
 
+        df_body, body_status = extrahiere_raten_aus_msg_body(msg, file_name)
+        if df_body is not None and not df_body.empty:
+            return df_body, body_status
+
         if ignoriert:
-            return pd.DataFrame(), f"MSG ohne verwertbare Daten. Ignoriert: {', '.join(ignoriert[:5])}"
-        return pd.DataFrame(), "MSG enthält keine verarbeitbaren Anhänge."
+            return pd.DataFrame(), f"MSG ohne verwertbare Daten. Ignoriert: {', '.join(ignoriert[:5])}. {body_status}"
+        return pd.DataFrame(), f"MSG enthält keine verarbeitbaren Anhänge. {body_status}"
     except Exception as e:
         return pd.DataFrame(), f"Fehler beim Lesen der MSG-Datei: {e}"
     finally:
