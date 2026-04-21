@@ -1449,6 +1449,38 @@ def normalisiere_cma_quotation(raw_value):
     return None
 
 
+def normalisiere_hapag_quotation(raw_value):
+    if pd.isna(raw_value):
+        return None
+
+    text = str(raw_value).strip().upper()
+    if not text or text in {'NAN', 'NONE', 'NULL', 'NIL'}:
+        return None
+
+    # Typisches Hapag-Format in Ratenblaettern: Q2603HAM00167 (optional /1)
+    match = re.search(r"\bQ\d{4}[A-Z]{3}\d{5,}(?:/\d+)?\b", text)
+    if match:
+        return match.group(0)
+    return None
+
+
+def erkenne_ccpr_carrier(quotation_value, file_name, meta_text):
+    if normalisiere_hapag_quotation(quotation_value):
+        return 'Hapag-Lloyd'
+    if normalisiere_cma_quotation(quotation_value):
+        return 'CMA CGM'
+
+    # Fallbacks auf Datei-/Metadaten
+    hint_text = f"{file_name} {meta_text}".lower()
+    if 'hapag' in hint_text or 'hlag' in hint_text:
+        return 'Hapag-Lloyd'
+    if 'cma cgm' in hint_text or 'cma-cgm' in hint_text or ' cma ' in f" {hint_text} ":
+        return 'CMA CGM'
+
+    # Historischer Default fuer dieses Parser-Format
+    return 'CMA CGM'
+
+
 def extrahiere_ccpr_excel(excel_dict, file_name):
     if 'Seafreights' not in excel_dict:
         return None
@@ -1471,6 +1503,23 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
 
     df_rates = dataframe_mit_header_aus_zeile(df_sheet, header_idx, data_start_offset=2)
     surcharge_lookup = baue_ccpr_surcharge_lookup(excel_dict.get('Surcharges', pd.DataFrame())) if 'Surcharges' in excel_dict else {}
+
+    # Dateiweiten Default-Reeder aus vorhandenen Quotation-Mustern ableiten,
+    # damit Zeilen ohne QUOTATION_NUMBER konsistent behandelt werden.
+    default_ccpr_carrier = erkenne_ccpr_carrier('', file_name, meta_text)
+    if 'QUOTATION_NUMBER' in df_rates.columns:
+        q_vals = [
+            str(v).strip()
+            for v in df_rates['QUOTATION_NUMBER'].dropna().tolist()
+            if str(v).strip() and str(v).strip().lower() not in {'nan', 'none'}
+        ]
+        if q_vals:
+            hapag_hits = sum(1 for q in q_vals if normalisiere_hapag_quotation(q))
+            cma_hits = sum(1 for q in q_vals if normalisiere_cma_quotation(q))
+            if hapag_hits > cma_hits:
+                default_ccpr_carrier = 'Hapag-Lloyd'
+            elif cma_hits > hapag_hits:
+                default_ccpr_carrier = 'CMA CGM'
 
     rows = []
     collect_codes = {'THD', 'DDF', 'EMF', 'ISF', 'LFD', 'CDC', 'SMD', 'TAD', 'CP3', 'DHC'}
@@ -1507,17 +1556,25 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
             else:
                 prepaid.append(entry)
 
+        quotation_raw = str(row.get('QUOTATION_NUMBER', '')).strip()
+
         contract_no = (
             normalisiere_cma_quotation(row.get('QUOTATION_NUMBER'))
+            or normalisiere_hapag_quotation(row.get('QUOTATION_NUMBER'))
             or normalisiere_cma_quotation(file_name)
+            or normalisiere_hapag_quotation(file_name)
             or normalisiere_cma_quotation(meta_text)
+            or normalisiere_hapag_quotation(meta_text)
         )
         if not contract_no:
-            contract_no_raw = str(row.get('QUOTATION_NUMBER', '')).strip()
-            if contract_no_raw and contract_no_raw.lower() not in {'nan', 'none'}:
-                contract_no = contract_no_raw
+            if quotation_raw and quotation_raw.lower() not in {'nan', 'none'}:
+                contract_no = quotation_raw
             else:
                 contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
+
+        carrier_name = erkenne_ccpr_carrier(quotation_raw or contract_no, file_name, meta_text)
+        if (not quotation_raw or quotation_raw.lower() in {'nan', 'none'}) and carrier_name == 'CMA CGM':
+            carrier_name = default_ccpr_carrier
         valid_from = parse_datum_standard(row.get('VALID_FROM')) or (parse_datum_standard(valid_from_match.group(1)) if valid_from_match else None)
         valid_to = parse_datum_standard(row.get('VALID_TO')) or (parse_datum_standard(valid_to_match.group(1)) if valid_to_match else None)
 
@@ -1527,8 +1584,10 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
             remark_parts.append(f"Commodity: {commodity}")
         if basis < 0:
             remark_parts.append("Negative Vertragsrate")
-        remark_parts.append("CMA CGM Tarif-Rabattvertrag")
-        remark_parts.append("CMA Quotation-Format: MFRMB0000002")
+        if carrier_name == 'Hapag-Lloyd':
+            remark_parts.append("Hapag-Lloyd Tarif-Rabattvertrag")
+        else:
+            remark_parts.append("CMA CGM Tarif-Rabattvertrag")
 
         end_description = row.get('END_DESCRIPTION', '')
         pod_value = str(end_description).strip() if pd.notna(end_description) else ''
@@ -1536,7 +1595,7 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
             pod_value = str(row.get('BTO_DESCRIPTION', '')).strip()
 
         rows.append({
-            'Carrier': 'CMA CGM',
+            'Carrier': carrier_name,
             'Contract Number': contract_no,
             'Port of Loading': str(row.get('BFR_DESCRIPTION', '')).strip(),
             'Port of Destination': pod_value,
