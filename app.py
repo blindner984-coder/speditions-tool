@@ -1904,6 +1904,13 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
+    def normalisiere_hafen_alias(value):
+        text = str(value or '').strip()
+        text_upper = text.upper().replace(' ', '')
+        if text_upper in {'NCP0', 'NCPØ'}:
+            return 'HAM / BRMHV'
+        return text
+
     def ist_leerwert_series(series):
         return series.astype(str).str.strip().str.lower().isin({'', 'nan', 'none', 'null', 'nil'})
 
@@ -1969,6 +1976,9 @@ def normalisiere_upload_dataframe(df_upload):
         'Delivery', 'Place of Delivery', 'POD', 'Destination Port', 'Destination',
         'Discharge Port', 'Port of Discharge', 'Dest Port', 'POD Name', 'Arrival Port', 'To Port', 'Pod',
     ])
+
+    # Fachregel: NCP0 ist ein POL-Synonym für Hamburg/Bremerhaven.
+    out['Port of Loading'] = out['Port of Loading'].apply(normalisiere_hafen_alias)
 
     if '40HC' not in out.columns:
         preis_col = ermittle_preisspalte_40hc(out)
@@ -2768,6 +2778,10 @@ def extrahiere_raten_aus_msg_body(msg_obj, file_name):
 
             route_text = vals[2] if len(vals) >= 3 else " ".join(vals)
             pol, pod, fallback_pol = _msg_parse_route_text(route_text, fallback_pol=fallback_pol)
+            origin_hint = vals[0] if len(vals) >= 1 else ''
+            origin_hint_norm = str(origin_hint or '').upper().replace(' ', '')
+            if origin_hint_norm in {'NCP0', 'NCPØ'}:
+                pol = 'HAM / BRMHV'
             if not pol or not pod:
                 continue
 
