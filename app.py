@@ -1741,6 +1741,9 @@ def normalisiere_upload_dataframe(df_upload):
     if 'Included Collect Surcharges 40HC' not in out.columns:
         out['Included Collect Surcharges 40HC'] = ""
 
+    # Fachregel: Die Zeile "Included Prepaid Surcharges 40HC" gehoert zu PREPAID-Kosten
+    # und bleibt daher immer in der Prepaid-Spalte.
+
     # Bereinigung Strings
     out['Carrier'] = out['Carrier'].replace('Unbekannt', 'FMS').astype(str).str.strip()
     out['Contract Number'] = out['Contract Number'].astype(str).str.strip().replace({'': 'Unbekannt'})
