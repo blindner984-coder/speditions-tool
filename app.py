@@ -1426,6 +1426,29 @@ def waehle_ccpr_surcharge(code, surcharge_lookup, account_name='', geo_from=''):
     return kandidaten[-1]
 
 
+def normalisiere_cma_quotation(raw_value):
+    # CMA-Quotation in Ratenblaettern folgt typischerweise dem Muster wie
+    # MFRMB0000002 (Prefix + 7 Ziffern).
+    if pd.isna(raw_value):
+        return None
+
+    text = str(raw_value).strip().upper()
+    if not text or text in {'NAN', 'NONE', 'NULL', 'NIL'}:
+        return None
+
+    pattern = r"\bMFR[A-Z]{2}\d{7}\b"
+    match = re.search(pattern, text)
+    if match:
+        return match.group(0)
+
+    compact = re.sub(r"\s+", "", text)
+    match = re.search(pattern, compact)
+    if match:
+        return match.group(0)
+
+    return None
+
+
 def extrahiere_ccpr_excel(excel_dict, file_name):
     if 'Seafreights' not in excel_dict:
         return None
@@ -1484,9 +1507,17 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
             else:
                 prepaid.append(entry)
 
-        contract_no = str(row.get('QUOTATION_NUMBER', '')).strip()
-        if not contract_no or contract_no.lower() in {'nan', 'none'}:
-            contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
+        contract_no = (
+            normalisiere_cma_quotation(row.get('QUOTATION_NUMBER'))
+            or normalisiere_cma_quotation(file_name)
+            or normalisiere_cma_quotation(meta_text)
+        )
+        if not contract_no:
+            contract_no_raw = str(row.get('QUOTATION_NUMBER', '')).strip()
+            if contract_no_raw and contract_no_raw.lower() not in {'nan', 'none'}:
+                contract_no = contract_no_raw
+            else:
+                contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
         valid_from = parse_datum_standard(row.get('VALID_FROM')) or (parse_datum_standard(valid_from_match.group(1)) if valid_from_match else None)
         valid_to = parse_datum_standard(row.get('VALID_TO')) or (parse_datum_standard(valid_to_match.group(1)) if valid_to_match else None)
 
@@ -1497,6 +1528,7 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
         if basis < 0:
             remark_parts.append("Negative Vertragsrate")
         remark_parts.append("CMA CGM Tarif-Rabattvertrag")
+        remark_parts.append("CMA Quotation-Format: MFRMB0000002")
 
         end_description = row.get('END_DESCRIPTION', '')
         pod_value = str(end_description).strip() if pd.notna(end_description) else ''
