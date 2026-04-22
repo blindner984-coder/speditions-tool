@@ -3551,6 +3551,29 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                 global_contract = fn_match.group(1)
 
+        # Maersk-Metadaten-Scan: Contract Number steht in den ersten ~10 Zeilen der Excel-Datei
+        # (z.B. Maersk "Tender Quote"-Sheet Row 3: "Contract Number" | "299592520")
+        if global_contract == "Unbekannt" and datei.name.lower().endswith('.xlsx'):
+            try:
+                datei.seek(0)
+                import openpyxl as _openpyxl
+                _wb = _openpyxl.load_workbook(datei, read_only=True, data_only=True)
+                for _sname in _wb.sheetnames:
+                    _ws = _wb[_sname]
+                    for _row in _ws.iter_rows(min_row=1, max_row=10, values_only=True):
+                        if not _row or len(_row) < 2:
+                            continue
+                        key_val = str(_row[0]).strip().lower() if _row[0] is not None else ''
+                        cell_val = str(_row[1]).strip() if _row[1] is not None else ''
+                        if 'contract' in key_val and 'number' in key_val and re.match(r'^\d{6,12}$', cell_val):
+                            global_contract = cell_val
+                            break
+                    if global_contract != "Unbekannt":
+                        break
+                _wb.close()
+            except Exception:
+                pass
+
         # --- Maersk-Format Check ---
         charge_col = None
         for preferred in ['charge code', 'charge type', 'chrg', 'charge']:
