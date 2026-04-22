@@ -3614,156 +3614,239 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if _date_col and _date_col in df_raw.columns:
                     df_raw[_date_col] = df_raw[_date_col].ffill()
 
-            group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
-            # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities/Line refs etc. nicht zusammengemischt werden
-            for extra_col in ['Commodity Name', 'Service Mode', 'Equipment Type', 'Line ref']:
-                if extra_col in df_raw.columns and extra_col not in group_cols:
-                    group_cols.append(extra_col)
-
-            standard_rows = []
-            for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
-                code_series = group[charge_col].astype(str).str.strip().str.upper()
-                bas_mask = code_series.isin(['BAS', 'BASIC'])
-                if charge_section_col in group.columns:
-                    bas_mask = bas_mask | group[charge_section_col].astype(str).str.strip().str.lower().eq('freight')
-                if charge_desc_col in group.columns:
-                    bas_mask = bas_mask | group[charge_desc_col].astype(str).str.contains(
-                        r'rate\s*per\s*container|ocean\s*freight|base\s*rate',
-                        flags=re.IGNORECASE,
-                        regex=True,
-                        na=False,
-                    )
-
-                bas_row = group[bas_mask]
-                if bas_row.empty: continue
-                
-                bas_text = str(bas_row['40HC'].values[0]).strip()
-                waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
-                if basis_betrag is None or basis_betrag <= 0: continue
-
-                group_dict = dict(zip(group_cols, name if isinstance(name, tuple) else (name,)))
-                pol_val = group_dict.get('Port of Loading', 'Unbekannt')
-                pod_val = group_dict.get('Port of Destination', 'Unbekannt')
-                eff_val = group_dict.get(eff_col, '') if eff_col else ''
-                exp_val = group_dict.get(exp_col, '') if exp_col else ''
-                commodity_val = group_dict.get('Commodity Name', '')
-
-                # =================================================================
-                # FIX 2: ZUSCHLÄGE SAUBER EXTRAHIEREN (Ignoriert 0 USD & Inclusive)
-                # =================================================================
-                prepaid_surcharges = []
-                collect_surcharges = []
-                collect_codes = {'CP1', 'CP2', 'CP3', 'VP1', 'THD', 'DTHC', 'DHC', 'DDF', 'DDC', 'THC34', 'LPC51', 'CAR45'}
-                surcharge_rows = group[~bas_mask]
-                
-                for _, r in surcharge_rows.iterrows():
-                    code = str(r[charge_col]).strip()
-                    code_upper = code.upper()
-                    val_text = str(r['40HC']).strip()
-                    beschreibung_raw = str(r.get(charge_desc_col, '')).strip() if charge_desc_col else ''
-                    beschreibung = beschreibung_raw.lower()
-                    section = str(r.get(charge_section_col, '')).lower().strip() if charge_section_col else ''
-                    
-                    # Zeilen-Währung bevorzugen (z.B. THC in INR statt USD)
-                    row_currency = waehrung
-                    if 'Currency' in r.index and pd.notna(r['Currency']):
-                        _rc = str(r['Currency']).strip().upper()
-                        if len(_rc) == 3 and _rc.isalpha():
-                            row_currency = _rc
-                    s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=row_currency)
-                    curr_upper = str(s_curr or row_currency or '').strip().upper()
-                    
-                    # Nur Beträge > 0 übernehmen 
-                    if s_amt is not None and s_amt > 0:
-                        # Beschreibungsname statt nur Code (z.B. "Emergency Fuel Surcharge (BAF09)")
-                        label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in ('nan', 'none', '') else code
-                        eintrag = f"{label} = {s_amt:.2f} {s_curr}"
-                        # Fachregel: DHC in USD ist Prepaid, auch wenn DHC sonst Collect sein kann.
-                        if code_upper == 'DHC' and curr_upper == 'USD':
-                            ist_collect = False
-                        else:
-                            # Heuristik: Nicht-USD/EUR-Zuschlaege sind in diesen Tarifen haeufig Collect.
-                            ist_collect = (
-                                code_upper in collect_codes
-                                or 'destination' in beschreibung
-                                or 'dthc' in beschreibung
-                                or 'local terminal recovery' in beschreibung
-                                or section == 'destination'
-                                or (curr_upper and curr_upper not in {'USD', 'EUR'})
-                            )
-                        if ist_collect:
-                            collect_surcharges.append(eintrag)
-                        else:
-                            prepaid_surcharges.append(eintrag)
-
-                remark_parts = []
-                if tt_col and tt_col in bas_row.columns:
-                    remark_parts.append(f"Transit Time: {bas_row[tt_col].values[0]}")
-                if commodity_val:
-                    remark_parts.append(f"Commodity: {commodity_val}")
-
-                group_contract = global_contract
-                if 'Contract Number' in group.columns:
-                    raw_group_contract = erster_nichtleerer_wert(group['Contract Number'], default='')
-                    normalized_group_contract = (
-                        normalisiere_cma_quotation(raw_group_contract)
-                        or normalisiere_hapag_quotation(raw_group_contract)
-                        or raw_group_contract
-                    )
-                    if normalized_group_contract:
-                        group_contract = normalized_group_contract
-
-                if (_detected_carrier == 'CMA CGM') and (not group_contract or group_contract == 'Unbekannt'):
-                    group_contract = normalisiere_cma_quotation(datei.name) or group_contract
-
-                standard_rows.append({
-                    'Carrier': _detected_carrier,
-                    'Contract Number': group_contract,
-                    'Port of Loading': pol_val,
-                    'Port of Destination': pod_val,
-                    'Valid from': eff_val,
-                    'Valid to': exp_val,
-                    '40HC': basis_betrag,
-                    'Currency': waehrung,
-                    'Included Prepaid Surcharges 40HC': ", ".join(prepaid_surcharges),
-                    'Included Collect Surcharges 40HC': ", ".join(collect_surcharges),
-                    'Remark': " | ".join(remark_parts),
-                })
-            
-            if standard_rows:
-                df_return = pd.DataFrame(standard_rows)
-            else:
-                if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
-                    df_raw['Contract Number'] = global_contract
-                elif global_contract != "Unbekannt":
-                    df_raw['Contract Number'] = global_contract
-                df_return = df_raw
-                
-        else:
-            if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
-                df_raw['Contract Number'] = global_contract
-            elif global_contract != "Unbekannt":
-                df_raw['Contract Number'] = global_contract
-            df_return = df_raw
-
-        # === GEMINI FALLBACK #2: Heuristik hat Daten, aber alles Trash ===
-        if df_return.empty and GEMINI_API_KEY:
-            st.info("📡 Heuristische Verarbeitung ergab keine verwertbaren Zeilen – versuche Gemini-Extraktion…")
-            return extrahiere_excel_mit_gemini(file_bytes, file_name)
-
-        # === GEMINI FALLBACK #3: Heuristik hat Daten, aber keine Surcharges erkannt ===
-        # Bei wenigen Zeilen ODER fehlenden Surcharges lohnt sich Gemini
-        if GEMINI_API_KEY and not df_return.empty:
-            _prep_col = 'Included Prepaid Surcharges 40HC'
-            _hat_surcharges = (
-                _prep_col in df_return.columns
-                and df_return[_prep_col].astype(str).str.strip().replace({'': None, 'nan': None, 'None': None}).notna().any()
+            ist_maersk_tender = (
+                _detected_carrier == 'Maersk'
+                and charge_col is not None
+                and '40HC' in df_raw.columns
+                and '40DRY' in df_raw.columns
             )
-            if not _hat_surcharges:
-                st.info("📡 Heuristik hat keine Zuschläge erkannt – versuche Gemini für vollständige Extraktion…")
-                df_gemini, methode_gemini = extrahiere_excel_mit_gemini(file_bytes, file_name)
-                if not df_gemini.empty:
-                    return df_gemini, methode_gemini
+
+            if ist_maersk_tender:
+                route_group_cols = [c for c in ['Port of Loading', 'Port of Destination'] if c in df_raw.columns]
+                for extra_col in ['Commodity Name', 'Service Mode']:
+                    if extra_col in df_raw.columns and extra_col not in route_group_cols:
+                        route_group_cols.append(extra_col)
+
+                standard_rows = []
+                for name, group in df_raw.dropna(subset=['40HC']).groupby(route_group_cols, dropna=False):
+                    code_series = group[charge_col].astype(str).str.strip().str.upper()
+                    bas_rows = group[code_series.isin(['BAS', 'BASIC'])].copy()
+                    if bas_rows.empty:
+                        continue
+
+                    if eff_col and eff_col in bas_rows.columns:
+                        bas_rows['_eff_sort'] = pd.to_datetime(bas_rows[eff_col], dayfirst=True, errors='coerce')
+                    else:
+                        bas_rows['_eff_sort'] = pd.NaT
+                    if exp_col and exp_col in bas_rows.columns:
+                        bas_rows['_exp_sort'] = pd.to_datetime(bas_rows[exp_col], dayfirst=True, errors='coerce')
+                    else:
+                        bas_rows['_exp_sort'] = pd.NaT
+
+                    bas_rows = bas_rows.sort_values(by=['_eff_sort', '_exp_sort'], ascending=[False, False], na_position='last')
+                    bas_row = bas_rows.iloc[0]
+
+                    basis_betrag = parse_decimal_wert(bas_row.get('40HC'))
+                    if basis_betrag is None or basis_betrag <= 0:
+                        continue
+
+                    basis_waehrung = str(bas_row.get('Currency', '')).strip().upper()
+                    if not basis_waehrung or len(basis_waehrung) != 3:
+                        basis_waehrung, _ = extrahiere_waehrung_und_betrag(str(bas_row.get('40HC', '')).strip(), default_currency='USD')
+
+                    prepaid_surcharges = []
+                    collect_surcharges = []
+                    surcharge_rows = group[group.index != bas_row.name]
+
+                    for _, surcharge_row in surcharge_rows.iterrows():
+                        code = str(surcharge_row.get(charge_col, '')).strip()
+                        code_upper = code.upper()
+                        if not code or code_upper in {'BAS', 'BASIC'}:
+                            continue
+
+                        amount = parse_decimal_wert(surcharge_row.get('40HC'))
+                        if amount is None or amount <= 0:
+                            continue
+
+                        row_currency = str(surcharge_row.get('Currency', basis_waehrung or 'USD')).strip().upper() or (basis_waehrung or 'USD')
+                        if len(row_currency) != 3:
+                            row_currency, _ = extrahiere_waehrung_und_betrag(str(surcharge_row.get('40HC', '')).strip(), default_currency=basis_waehrung or 'USD')
+                        curr_upper = str(row_currency or '').strip().upper()
+
+                        beschreibung_raw = str(surcharge_row.get(charge_desc_col, '')).strip() if charge_desc_col else ''
+                        beschreibung = beschreibung_raw.lower()
+                        section = str(surcharge_row.get(charge_section_col, '')).strip().lower() if charge_section_col else ''
+
+                        label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in {'nan', 'none', ''} else code
+                        entry = f"{label} = {amount:.2f} {row_currency}"
+
+                        ist_collect = (
+                            curr_upper not in {'USD', 'EUR'}
+                            or 'destination' in beschreibung
+                            or 'dthc' in beschreibung
+                            or 'local terminal recovery' in beschreibung
+                            or section == 'destination'
+                        )
+                        if ist_collect:
+                            collect_surcharges.append(entry)
+                        else:
+                            prepaid_surcharges.append(entry)
+
+                    group_contract = global_contract
+                    if 'Contract Number' in group.columns:
+                        raw_group_contract = erster_nichtleerer_wert(group['Contract Number'], default='')
+                        if raw_group_contract:
+                            group_contract = raw_group_contract
+
+                    group_dict = dict(zip(route_group_cols, name if isinstance(name, tuple) else (name,)))
+                    remark_parts = []
+                    if tt_col and pd.notna(bas_row.get(tt_col)):
+                        remark_parts.append(f"Transit Time: {bas_row.get(tt_col)}")
+                    commodity_val = group_dict.get('Commodity Name', '')
+                    if commodity_val:
+                        remark_parts.append(f"Commodity: {commodity_val}")
+
+                    standard_rows.append({
+                        'Carrier': _detected_carrier,
+                        'Contract Number': group_contract,
+                        'Port of Loading': str(group_dict.get('Port of Loading', '')).strip(),
+                        'Port of Destination': str(group_dict.get('Port of Destination', '')).strip(),
+                        'Valid from': bas_row.get(eff_col, '') if eff_col else '',
+                        'Valid to': bas_row.get(exp_col, '') if exp_col else '',
+                        '40HC': basis_betrag,
+                        'Currency': basis_waehrung or 'USD',
+                        'Included Prepaid Surcharges 40HC': ", ".join(dedupliziere_eintraege(prepaid_surcharges)),
+                        'Included Collect Surcharges 40HC': ", ".join(dedupliziere_eintraege(collect_surcharges)),
+                        'Remark': " | ".join(remark_parts),
+                    })
+
+                if standard_rows:
+                    df_return = pd.DataFrame(standard_rows)
+                else:
+                    if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
+                        df_raw['Contract Number'] = global_contract
+                    elif global_contract != "Unbekannt":
+                        df_raw['Contract Number'] = global_contract
+                    df_return = df_raw
+            else:
+                group_cols = [c for c in ['Port of Loading', 'Port of Destination', eff_col, exp_col] if c and c in df_raw.columns]
+                # Zusätzliche Spalten aufnehmen, damit Raten für verschiedene Commodities/Line refs etc. nicht zusammengemischt werden
+                for extra_col in ['Commodity Name', 'Service Mode', 'Equipment Type', 'Line ref']:
+                    if extra_col in df_raw.columns and extra_col not in group_cols:
+                        group_cols.append(extra_col)
+
+                standard_rows = []
+                for name, group in df_raw.dropna(subset=['40HC']).groupby(group_cols):
+                    code_series = group[charge_col].astype(str).str.strip().str.upper()
+                    bas_mask = code_series.isin(['BAS', 'BASIC'])
+                    if not bas_mask.any() and charge_section_col in group.columns:
+                        bas_mask = group[charge_section_col].astype(str).str.strip().str.lower().eq('freight')
+                    if not bas_mask.any() and charge_desc_col in group.columns:
+                        bas_mask = group[charge_desc_col].astype(str).str.contains(
+                            r'rate\s*per\s*container|ocean\s*freight|base\s*rate',
+                            flags=re.IGNORECASE,
+                            regex=True,
+                            na=False,
+                        )
+
+                    bas_row = group[bas_mask]
+                    if bas_row.empty:
+                        continue
+
+                    bas_text = str(bas_row['40HC'].values[0]).strip()
+                    waehrung, basis_betrag = extrahiere_waehrung_und_betrag(bas_text, default_currency='USD')
+                    if basis_betrag is None or basis_betrag <= 0:
+                        continue
+
+                    group_dict = dict(zip(group_cols, name if isinstance(name, tuple) else (name,)))
+                    pol_val = group_dict.get('Port of Loading', 'Unbekannt')
+                    pod_val = group_dict.get('Port of Destination', 'Unbekannt')
+                    eff_val = group_dict.get(eff_col, '') if eff_col else ''
+                    exp_val = group_dict.get(exp_col, '') if exp_col else ''
+                    commodity_val = group_dict.get('Commodity Name', '')
+
+                    prepaid_surcharges = []
+                    collect_surcharges = []
+                    collect_codes = {'CP1', 'CP2', 'CP3', 'VP1', 'THD', 'DTHC', 'DHC', 'DDF', 'DDC', 'THC34', 'LPC51', 'CAR45'}
+                    surcharge_rows = group[~bas_mask]
+
+                    for _, r in surcharge_rows.iterrows():
+                        code = str(r[charge_col]).strip()
+                        code_upper = code.upper()
+                        val_text = str(r['40HC']).strip()
+                        beschreibung_raw = str(r.get(charge_desc_col, '')).strip() if charge_desc_col else ''
+                        beschreibung = beschreibung_raw.lower()
+                        section = str(r.get(charge_section_col, '')).lower().strip() if charge_section_col else ''
+
+                        row_currency = waehrung
+                        if 'Currency' in r.index and pd.notna(r['Currency']):
+                            _rc = str(r['Currency']).strip().upper()
+                            if len(_rc) == 3 and _rc.isalpha():
+                                row_currency = _rc
+                        s_curr, s_amt = extrahiere_waehrung_und_betrag(val_text, default_currency=row_currency)
+                        curr_upper = str(s_curr or row_currency or '').strip().upper()
+
+                        if s_amt is not None and s_amt > 0:
+                            label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in ('nan', 'none', '') else code
+                            eintrag = f"{label} = {s_amt:.2f} {s_curr}"
+                            if code_upper == 'DHC' and curr_upper == 'USD':
+                                ist_collect = False
+                            else:
+                                ist_collect = (
+                                    code_upper in collect_codes
+                                    or 'destination' in beschreibung
+                                    or 'dthc' in beschreibung
+                                    or 'local terminal recovery' in beschreibung
+                                    or section == 'destination'
+                                    or (curr_upper and curr_upper not in {'USD', 'EUR'})
+                                )
+                            if ist_collect:
+                                collect_surcharges.append(eintrag)
+                            else:
+                                prepaid_surcharges.append(eintrag)
+
+                    remark_parts = []
+                    if tt_col and tt_col in bas_row.columns:
+                        remark_parts.append(f"Transit Time: {bas_row[tt_col].values[0]}")
+                    if commodity_val:
+                        remark_parts.append(f"Commodity: {commodity_val}")
+
+                    group_contract = global_contract
+                    if 'Contract Number' in group.columns:
+                        raw_group_contract = erster_nichtleerer_wert(group['Contract Number'], default='')
+                        normalized_group_contract = (
+                            normalisiere_cma_quotation(raw_group_contract)
+                            or normalisiere_hapag_quotation(raw_group_contract)
+                            or raw_group_contract
+                        )
+                        if normalized_group_contract:
+                            group_contract = normalized_group_contract
+
+                    if (_detected_carrier == 'CMA CGM') and (not group_contract or group_contract == 'Unbekannt'):
+                        group_contract = normalisiere_cma_quotation(datei.name) or group_contract
+
+                    standard_rows.append({
+                        'Carrier': _detected_carrier,
+                        'Contract Number': group_contract,
+                        'Port of Loading': pol_val,
+                        'Port of Destination': pod_val,
+                        'Valid from': eff_val,
+                        'Valid to': exp_val,
+                        '40HC': basis_betrag,
+                        'Currency': waehrung,
+                        'Included Prepaid Surcharges 40HC': ", ".join(prepaid_surcharges),
+                        'Included Collect Surcharges 40HC': ", ".join(collect_surcharges),
+                        'Remark': " | ".join(remark_parts),
+                    })
+
+                if standard_rows:
+                    df_return = pd.DataFrame(standard_rows)
+                else:
+                    if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
+                        df_raw['Contract Number'] = global_contract
+                    elif global_contract != "Unbekannt":
+                        df_raw['Contract Number'] = global_contract
+                    df_return = df_raw
                 # Gemini hat nichts → Heuristik-Ergebnis behalten
 
         return df_return, "Excel/CSV (Multi-Sheet)"
