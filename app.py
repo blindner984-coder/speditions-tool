@@ -1631,7 +1631,7 @@ def waehle_ccpr_surcharge(code, surcharge_lookup, account_name='', geo_from=''):
 
 def normalisiere_cma_quotation(raw_value):
     # CMA-Quotation in Ratenblaettern folgt typischerweise dem Muster wie
-    # MFRMB0000002 (Prefix + 7 Ziffern).
+    # MFRMS0000006 (Prefix + 7 Ziffern).
     if pd.isna(raw_value):
         return None
 
@@ -1639,13 +1639,29 @@ def normalisiere_cma_quotation(raw_value):
     if not text or text in {'NAN', 'NONE', 'NULL', 'NIL'}:
         return None
 
-    pattern = r"\bMFR[A-Z]{2}\d{7}\b"
-    match = re.search(pattern, text)
-    if match:
-        return match.group(0)
+    # Erst striktes Zielformat (MFRMS + 7 Ziffern), dann generisches MFRxx + 7 Ziffern.
+    patterns = [
+        r"MFR\s*[-_/]?\s*MS\s*[-_/]?\s*(\d{7})",
+        r"MFR\s*[-_/]?\s*([A-Z]{2})\s*[-_/]?\s*(\d{7})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            if len(match.groups()) == 1:
+                return f"MFRMS{match.group(1)}"
+            return f"MFR{match.group(1)}{match.group(2)}"
 
     compact = re.sub(r"\s+", "", text)
-    match = re.search(pattern, compact)
+    for pattern in patterns:
+        match = re.search(pattern, compact)
+        if match:
+            if len(match.groups()) == 1:
+                return f"MFRMS{match.group(1)}"
+            return f"MFR{match.group(1)}{match.group(2)}"
+
+    # Legacy-Fallback ohne Trennzeichen.
+    match = re.search(r"\bMFR[A-Z]{2}\d{7}\b", compact)
     if match:
         return match.group(0)
 
@@ -1761,23 +1777,41 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
 
         quotation_raw = str(row.get('QUOTATION_NUMBER', '')).strip()
 
-        contract_no = (
-            normalisiere_cma_quotation(row.get('QUOTATION_NUMBER'))
+        carrier_hint = (
+            quotation_raw
+            or normalisiere_cma_quotation(row.get('QUOTATION_NUMBER'))
             or normalisiere_hapag_quotation(row.get('QUOTATION_NUMBER'))
-            or normalisiere_cma_quotation(file_name)
-            or normalisiere_hapag_quotation(file_name)
-            or normalisiere_cma_quotation(meta_text)
-            or normalisiere_hapag_quotation(meta_text)
         )
-        if not contract_no:
-            if quotation_raw and quotation_raw.lower() not in {'nan', 'none'}:
-                contract_no = quotation_raw
-            else:
-                contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
-
-        carrier_name = erkenne_ccpr_carrier(quotation_raw or contract_no, file_name, meta_text)
+        carrier_name = erkenne_ccpr_carrier(carrier_hint, file_name, meta_text)
         if (not quotation_raw or quotation_raw.lower() in {'nan', 'none'}) and carrier_name == 'CMA CGM':
             carrier_name = default_ccpr_carrier
+
+        cma_quote = (
+            normalisiere_cma_quotation(row.get('QUOTATION_NUMBER'))
+            or normalisiere_cma_quotation(file_name)
+            or normalisiere_cma_quotation(meta_text)
+        )
+        hapag_quote = (
+            normalisiere_hapag_quotation(row.get('QUOTATION_NUMBER'))
+            or normalisiere_hapag_quotation(file_name)
+            or normalisiere_hapag_quotation(meta_text)
+        )
+
+        if carrier_name == 'CMA CGM':
+            contract_no = cma_quote
+            if not contract_no and quotation_raw and quotation_raw.lower() not in {'nan', 'none'}:
+                contract_no = quotation_raw.upper()
+            if not contract_no:
+                # Fallback fuer CMA: Feld immer als Quotation befuellen.
+                contract_no = 'MFRMS0000000'
+        else:
+            contract_no = hapag_quote
+            if not contract_no:
+                if quotation_raw and quotation_raw.lower() not in {'nan', 'none'}:
+                    contract_no = quotation_raw
+                else:
+                    contract_no = contract_match.group(0) if contract_match else 'Unbekannt'
+
         valid_from = parse_datum_standard(row.get('VALID_FROM')) or (parse_datum_standard(valid_from_match.group(1)) if valid_from_match else None)
         valid_to = parse_datum_standard(row.get('VALID_TO')) or (parse_datum_standard(valid_to_match.group(1)) if valid_to_match else None)
 
