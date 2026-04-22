@@ -3087,200 +3087,309 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             except Exception:
                 pass
 
-            # --- Multi-Sheet Verarbeitung ---
-            datei.seek(0)
+            # Schneller Sheet-Header-Scan:
+            # Viele Carrier-Dateien starten mit Disclaimer-Sheets. Statt sofort den
+            # teuren Komplett-Import (alle Sheets + Deep-Scan) zu machen, suchen wir
+            # in den Top-Zeilen je Sheet nach einer plausiblen Header-Zeile.
             try:
-                excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
-            except Exception as e:
-                return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
+                datei.seek(0)
+                xls = pd.ExcelFile(datei)
+                header_scan_limit = 120
 
-            for parser_funktion, parser_name in [
-                (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
-                (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
-                (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
-            ]:
-                try:
-                    df_spezial = parser_funktion(excel_dict, datei.name)
-                except Exception:
-                    df_spezial = None
-                if isinstance(df_spezial, pd.DataFrame) and not df_spezial.empty:
-                    return df_spezial, parser_name
+                for sheet_name in xls.sheet_names:
+                    try:
+                        df_preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=header_scan_limit)
+                    except Exception:
+                        continue
 
-            alle_sheets_dfs = []
+                    if df_preview.empty:
+                        continue
 
-            for sheet_name, df_sheet in excel_dict.items():
-                if df_sheet.empty:
-                    continue
-
-                # A. Bestimme Header-Zeile durch SCORING (Deep-Scan)
-                sheet_header_idx = None
-                
-                # Gehe alle Zeilen durch (auch tausende), aber überspringe leere Zeilen sofort
-                for i in range(len(df_sheet)):
-                    row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
-                    if len(row_vals) < 3: 
-                        continue # Überspringt Zeilen mit weniger als 3 Werten (spart enorm Zeit)
-                        
-                    # Strenge Suche (3 Treffer)
-                    if zaehle_bekannte_spalten(row_vals) >= 3:
-                        sheet_header_idx = i
-                        break 
-                
-                # 2. Versuch: Lockere Suche (2 Treffer), falls nichts gefunden wurde
-                if sheet_header_idx is None:
-                    for i in range(len(df_sheet)):
-                        row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
-                        if len(row_vals) < 2:
+                    quick_header_idx = None
+                    for i in range(min(len(df_preview), header_scan_limit)):
+                        row_vals = df_preview.iloc[i].dropna().astype(str).tolist()
+                        if len(row_vals) < 3:
                             continue
-                        if zaehle_bekannte_spalten(row_vals) >= 2:
-                            sheet_header_idx = i
-                            break 
+                        if zaehle_bekannte_spalten(row_vals) >= 3:
+                            quick_header_idx = i
+                            break
 
-                if sheet_header_idx is None:
-                    continue 
-
-                # B. Metadaten VOR dem Header aus dem Freitext "scrapen"
-                df_top = df_sheet.iloc[:sheet_header_idx]
-                sheet_contract = global_contract
-                sheet_pol = "Unbekannt"
-                sheet_valid_from = None
-                sheet_valid_to = None
-                sheet_carrier = None
-                sheet_currency = None
-
-                _BEKANNTE_CARRIER = {
-                    'msc': 'MSC', 'hapag': 'Hapag-Lloyd', 'hapag-lloyd': 'Hapag-Lloyd',
-                    'maersk': 'Maersk', 'one': 'ONE', 'ocean network express': 'ONE',
-                    'cma cgm': 'CMA CGM', 'cma-cgm': 'CMA CGM', 'cosco': 'COSCO',
-                    'evergreen': 'Evergreen', 'yang ming': 'Yang Ming', 'zim': 'ZIM',
-                    'hmm': 'HMM', 'hyundai': 'HMM', 'pil': 'PIL', 'wan hai': 'Wan Hai',
-                    'oocl': 'OOCL',
-                }
-                _DATE_PATTERN = re.compile(r'\d{4}[./-]\d{2}[./-]\d{2}|\d{2}[./-]\d{2}[./-]\d{2,4}|\d{8}')
-
-                for i in range(len(df_top)):
-                    row_vals = df_top.iloc[i].dropna().astype(str).tolist()
-                    full_row_text = " ".join(row_vals).lower()
-
-                    # Carrier-Erkennung aus Metadaten
-                    if not sheet_carrier:
-                        for kw, carrier_name in _BEKANNTE_CARRIER.items():
-                            if re.search(r'\b' + re.escape(kw) + r'\b', full_row_text):
-                                sheet_carrier = carrier_name
+                    if quick_header_idx is None:
+                        for i in range(min(len(df_preview), header_scan_limit)):
+                            row_vals = df_preview.iloc[i].dropna().astype(str).tolist()
+                            if len(row_vals) < 2:
+                                continue
+                            if zaehle_bekannte_spalten(row_vals) >= 2:
+                                quick_header_idx = i
                                 break
 
-                    row_contract_hint = (
-                        normalisiere_cma_quotation(" ".join(row_vals))
-                        or normalisiere_hapag_quotation(" ".join(row_vals))
+                    if quick_header_idx is None:
+                        continue
+
+                    try:
+                        df_quick = pd.read_excel(xls, sheet_name=sheet_name, header=quick_header_idx)
+                    except Exception:
+                        continue
+
+                    if df_quick.empty:
+                        continue
+
+                    df_quick_std = standardisiere_spalten(df_quick)
+                    hat_charge_spalte = any(
+                        str(c).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']
+                        for c in df_quick_std.columns
                     )
-                    if row_contract_hint and sheet_contract == "Unbekannt":
-                        sheet_contract = row_contract_hint
-                        global_contract = row_contract_hint
+                    hat_hafen_spalte = any(
+                        col in df_quick_std.columns
+                        for col in ['Port of Loading', 'Port of Destination', 'POL', 'POD', 'Receipt', 'Delivery']
+                    )
 
-                    for j, val in enumerate(row_vals):
-                        v_low = val.lower()
-                        if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
-                            if j + 1 < len(row_vals):
-                                sheet_contract = (
-                                    normalisiere_cma_quotation(row_vals[j + 1])
-                                    or normalisiere_hapag_quotation(row_vals[j + 1])
-                                    or row_vals[j + 1]
-                                )
-                                global_contract = sheet_contract
-                        if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
-                            if j + 1 < len(row_vals):
-                                sheet_pol = row_vals[j + 1]
+                    hat_preis_daten = False
+                    for _col in df_quick_std.columns:
+                        _c_low = str(_col).strip().lower()
+                        if any(kw in _c_low for kw in ['40', 'rate', 'price', 'amount', 'freight', 'o/f']):
+                            _parsed = df_quick_std[_col].head(800).apply(parse_decimal_wert)
+                            if (_parsed.notna() & (_parsed > 0)).any():
+                                hat_preis_daten = True
+                                break
 
-                        # Währungs-Erkennung
-                        if not sheet_currency and ('currency' in v_low or 'cur' == v_low.strip()):
-                            if j + 1 < len(row_vals):
-                                _c = row_vals[j + 1].strip().upper()
-                                if _c in ('USD', 'EUR', 'GBP', 'CNY'):
-                                    sheet_currency = _c
+                    # Charge-Sheets laufen durch den bestehenden Grouping-Pfad weiter,
+                    # damit BAS/Surcharges weiterhin korrekt aggregiert werden.
+                    # Sicherheitsnetz: Nur dann akzeptieren, wenn auch echte Preis-
+                    # und Hafeninformationen vorhanden sind (kein Abkuerzungsblatt).
+                    if hat_charge_spalte and hat_preis_daten and hat_hafen_spalte:
+                        df_raw = df_quick_std
+                        break
 
-                        # Validity-Erkennung (erweitert)
-                        if 'valid' in v_low:
-                            # Datums-Suche: Zuerst im aktuellen Feld, dann im nächsten
-                            search_texts = [val]
-                            if j + 1 < len(row_vals):
-                                search_texts.append(row_vals[j + 1])
-                            combined = " ".join(search_texts)
-                            # Unterstützt auch '~'-getrennte Bereiche (Yang Ming: 2026/04/01~2026/04/30)
-                            dates = _DATE_PATTERN.findall(combined)
-                            if len(dates) >= 1 and not sheet_valid_from:
-                                sheet_valid_from = dates[0]
-                            if len(dates) >= 2 and not sheet_valid_to:
-                                sheet_valid_to = dates[1]
+                    if 'Port of Destination' in df_quick_std.columns and '40HC' in df_quick_std.columns:
+                        _rate_40 = df_quick_std['40HC'].head(800).apply(parse_decimal_wert)
+                        if not (_rate_40.notna() & (_rate_40 > 0)).any():
+                            continue
 
-                # C. Spaltennamen setzen und bereinigen
-                rohe = df_sheet.iloc[sheet_header_idx].astype(str).str.strip().tolist()
-                neu, gesehen = [], {}
-                for s in rohe:
-                    if s in gesehen:
-                        gesehen[s] += 1
-                        neu.append(f"{s}.{gesehen[s]}")
-                    else:
-                        gesehen[s] = 0
-                        neu.append(s)
+                        for _ziel, _vorrang in [('Port of Loading', ['Receipt', 'Place of Receipt']),
+                                                ('Port of Destination', ['Delivery', 'Place of Delivery'])]:
+                            _vorrang_col = ermittle_erste_spalte(df_quick_std, _vorrang)
+                            if _vorrang_col:
+                                _hat_daten = not df_quick_std[_vorrang_col].astype(str).str.strip().replace(
+                                    {'nan': '', 'None': '', 'NaN': ''}
+                                ).eq('').all()
+                                if _hat_daten:
+                                    if _ziel not in df_quick_std.columns:
+                                        df_quick_std[_ziel] = df_quick_std[_vorrang_col]
+                                    else:
+                                        _ziel_leer = df_quick_std[_ziel].astype(str).str.strip().replace(
+                                            {'nan': '', 'None': '', 'NaN': ''}
+                                        ).eq('')
+                                        _quelle_ok = ~df_quick_std[_vorrang_col].astype(str).str.strip().replace(
+                                            {'nan': '', 'None': '', 'NaN': ''}
+                                        ).eq('')
+                                        _mask = _ziel_leer & _quelle_ok
+                                        if _mask.any():
+                                            df_quick_std.loc[_mask, _ziel] = df_quick_std.loc[_mask, _vorrang_col]
 
-                df_clean = df_sheet.copy()
-                df_clean.columns = neu
-                df_clean = df_clean.iloc[sheet_header_idx + 1:].reset_index(drop=True)
-                df_clean = standardisiere_spalten(df_clean)
+                        if 'Contract Number' not in df_quick_std.columns:
+                            if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
+                                df_quick_std['Contract Number'] = fn_match.group(1)
+                        return df_quick_std, "Excel (Schnell-Tab)"
+            except Exception:
+                pass
 
-                # C2. Fix für zusammengeführte Spalten: Wenn Port of Destination
-                #     nur 2-3 Zeichen hat (Ländercodes wie AE, BH, IQ), liegt der
-                #     echte Portname oft in der nächsten 'nan'-Spalte.
-                if 'Port of Destination' in df_clean.columns:
-                    _pod_vals = df_clean['Port of Destination'].dropna().astype(str).str.strip()
-                    _pod_lens = _pod_vals.str.len()
-                    if len(_pod_vals) > 0 and (_pod_lens <= 3).mean() > 0.7:
-                        _pod_col_idx = df_clean.columns.get_loc('Port of Destination')
-                        if _pod_col_idx + 1 < len(df_clean.columns):
-                            _next_col = df_clean.columns[_pod_col_idx + 1]
-                            _next_vals = df_clean[_next_col].dropna().astype(str).str.strip()
-                            _next_lens = _next_vals.str.len()
-                            if len(_next_vals) > 0 and (_next_lens > 3).mean() > 0.5:
-                                df_clean['Port of Destination'] = df_clean[_next_col]
+            # --- Multi-Sheet Verarbeitung ---
+            if df_raw.empty:
+                datei.seek(0)
+                try:
+                    excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
+                except Exception as e:
+                    return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
 
-                # D. Gefundene Metadaten in die Tabelle injizieren
-                if 'Contract Number' not in df_clean.columns and sheet_contract != "Unbekannt":
-                    df_clean['Contract Number'] = sheet_contract
-                if 'Port of Loading' not in df_clean.columns and sheet_pol != "Unbekannt":
-                    df_clean['Port of Loading'] = sheet_pol
-                if 'Valid from' not in df_clean.columns and sheet_valid_from:
-                    df_clean['Valid from'] = sheet_valid_from
-                if 'Valid to' not in df_clean.columns and sheet_valid_to:
-                    df_clean['Valid to'] = sheet_valid_to
-                if 'Carrier' not in df_clean.columns and sheet_carrier:
-                    df_clean['Carrier'] = sheet_carrier
-                if 'Currency' not in df_clean.columns and sheet_currency:
-                    df_clean['Currency'] = sheet_currency
+                for parser_funktion, parser_name in [
+                    (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
+                    (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
+                    (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
+                ]:
+                    try:
+                        df_spezial = parser_funktion(excel_dict, datei.name)
+                    except Exception:
+                        df_spezial = None
+                    if isinstance(df_spezial, pd.DataFrame) and not df_spezial.empty:
+                        return df_spezial, parser_name
 
-                # E. Sheet-Validierung: Nur anhängen wenn es mindestens eine
-                #    Spalte mit numerischen/Preis-Daten gibt (verhindert Müll-Sheets
-                #    wie Comments/Freetimes ohne Raten)
-                _hat_numerische_daten = False
-                for _col in df_clean.columns:
-                    _c_low = str(_col).strip().lower()
-                    if any(kw in _c_low for kw in ['40', 'rate', 'price', 'amount', 'freight', 'o/f']):
-                        _parsed = df_clean[_col].apply(parse_decimal_wert)
-                        if (_parsed.notna() & (_parsed > 0)).any():
-                            _hat_numerische_daten = True
+                alle_sheets_dfs = []
+
+                for sheet_name, df_sheet in excel_dict.items():
+                    if df_sheet.empty:
+                        continue
+
+                    # A. Bestimme Header-Zeile durch SCORING (Deep-Scan)
+                    sheet_header_idx = None
+                    sheet_scan_limit = min(len(df_sheet), 200)
+
+                    # Gehe nur die oberen Zeilen durch, dort steht der Header in der Praxis
+                    for i in range(sheet_scan_limit):
+                        row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
+                        if len(row_vals) < 3:
+                            continue
+
+                        # Strenge Suche (3 Treffer)
+                        if zaehle_bekannte_spalten(row_vals) >= 3:
+                            sheet_header_idx = i
                             break
-                if not _hat_numerische_daten and '40HC' in df_clean.columns:
-                    _parsed = df_clean['40HC'].apply(parse_decimal_wert)
-                    _hat_numerische_daten = (_parsed.notna() & (_parsed > 0)).any()
 
-                if not _hat_numerische_daten:
-                    continue
+                    # 2. Versuch: Lockere Suche (2 Treffer), falls nichts gefunden wurde
+                    if sheet_header_idx is None:
+                        for i in range(sheet_scan_limit):
+                            row_vals = df_sheet.iloc[i].dropna().astype(str).tolist()
+                            if len(row_vals) < 2:
+                                continue
+                            if zaehle_bekannte_spalten(row_vals) >= 2:
+                                sheet_header_idx = i
+                                break
 
-                alle_sheets_dfs.append(df_clean)
+                    if sheet_header_idx is None:
+                        continue
 
-            if not alle_sheets_dfs:
-                return pd.DataFrame(), "Keine verwertbaren Header-Zeilen in den Tabs gefunden."
+                    # B. Metadaten VOR dem Header aus dem Freitext "scrapen"
+                    df_top = df_sheet.iloc[:sheet_header_idx]
+                    sheet_contract = global_contract
+                    sheet_pol = "Unbekannt"
+                    sheet_valid_from = None
+                    sheet_valid_to = None
+                    sheet_carrier = None
+                    sheet_currency = None
 
-            df_raw = pd.concat(alle_sheets_dfs, ignore_index=True)
+                    _BEKANNTE_CARRIER = {
+                        'msc': 'MSC', 'hapag': 'Hapag-Lloyd', 'hapag-lloyd': 'Hapag-Lloyd',
+                        'maersk': 'Maersk', 'one': 'ONE', 'ocean network express': 'ONE',
+                        'cma cgm': 'CMA CGM', 'cma-cgm': 'CMA CGM', 'cosco': 'COSCO',
+                        'evergreen': 'Evergreen', 'yang ming': 'Yang Ming', 'zim': 'ZIM',
+                        'hmm': 'HMM', 'hyundai': 'HMM', 'pil': 'PIL', 'wan hai': 'Wan Hai',
+                        'oocl': 'OOCL',
+                    }
+                    _DATE_PATTERN = re.compile(r'\d{4}[./-]\d{2}[./-]\d{2}|\d{2}[./-]\d{2}[./-]\d{2,4}|\d{8}')
+
+                    for i in range(len(df_top)):
+                        row_vals = df_top.iloc[i].dropna().astype(str).tolist()
+                        full_row_text = " ".join(row_vals).lower()
+
+                        # Carrier-Erkennung aus Metadaten
+                        if not sheet_carrier:
+                            for kw, carrier_name in _BEKANNTE_CARRIER.items():
+                                if re.search(r'\b' + re.escape(kw) + r'\b', full_row_text):
+                                    sheet_carrier = carrier_name
+                                    break
+
+                        row_contract_hint = (
+                            normalisiere_cma_quotation(" ".join(row_vals))
+                            or normalisiere_hapag_quotation(" ".join(row_vals))
+                        )
+                        if row_contract_hint and sheet_contract == "Unbekannt":
+                            sheet_contract = row_contract_hint
+                            global_contract = row_contract_hint
+
+                        for j, val in enumerate(row_vals):
+                            v_low = val.lower()
+                            if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
+                                if j + 1 < len(row_vals):
+                                    sheet_contract = (
+                                        normalisiere_cma_quotation(row_vals[j + 1])
+                                        or normalisiere_hapag_quotation(row_vals[j + 1])
+                                        or row_vals[j + 1]
+                                    )
+                                    global_contract = sheet_contract
+                            if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
+                                if j + 1 < len(row_vals):
+                                    sheet_pol = row_vals[j + 1]
+
+                            # Währungs-Erkennung
+                            if not sheet_currency and ('currency' in v_low or 'cur' == v_low.strip()):
+                                if j + 1 < len(row_vals):
+                                    _c = row_vals[j + 1].strip().upper()
+                                    if _c in ('USD', 'EUR', 'GBP', 'CNY'):
+                                        sheet_currency = _c
+
+                            # Validity-Erkennung (erweitert)
+                            if 'valid' in v_low:
+                                # Datums-Suche: Zuerst im aktuellen Feld, dann im nächsten
+                                search_texts = [val]
+                                if j + 1 < len(row_vals):
+                                    search_texts.append(row_vals[j + 1])
+                                combined = " ".join(search_texts)
+                                # Unterstützt auch '~'-getrennte Bereiche (Yang Ming: 2026/04/01~2026/04/30)
+                                dates = _DATE_PATTERN.findall(combined)
+                                if len(dates) >= 1 and not sheet_valid_from:
+                                    sheet_valid_from = dates[0]
+                                if len(dates) >= 2 and not sheet_valid_to:
+                                    sheet_valid_to = dates[1]
+
+                    # C. Spaltennamen setzen und bereinigen
+                    rohe = df_sheet.iloc[sheet_header_idx].astype(str).str.strip().tolist()
+                    neu, gesehen = [], {}
+                    for s in rohe:
+                        if s in gesehen:
+                            gesehen[s] += 1
+                            neu.append(f"{s}.{gesehen[s]}")
+                        else:
+                            gesehen[s] = 0
+                            neu.append(s)
+
+                    df_clean = df_sheet.copy()
+                    df_clean.columns = neu
+                    df_clean = df_clean.iloc[sheet_header_idx + 1:].reset_index(drop=True)
+                    df_clean = standardisiere_spalten(df_clean)
+
+                    # C2. Fix für zusammengeführte Spalten: Wenn Port of Destination
+                    #     nur 2-3 Zeichen hat (Ländercodes wie AE, BH, IQ), liegt der
+                    #     echte Portname oft in der nächsten 'nan'-Spalte.
+                    if 'Port of Destination' in df_clean.columns:
+                        _pod_vals = df_clean['Port of Destination'].dropna().astype(str).str.strip()
+                        _pod_lens = _pod_vals.str.len()
+                        if len(_pod_vals) > 0 and (_pod_lens <= 3).mean() > 0.7:
+                            _pod_col_idx = df_clean.columns.get_loc('Port of Destination')
+                            if _pod_col_idx + 1 < len(df_clean.columns):
+                                _next_col = df_clean.columns[_pod_col_idx + 1]
+                                _next_vals = df_clean[_next_col].dropna().astype(str).str.strip()
+                                _next_lens = _next_vals.str.len()
+                                if len(_next_vals) > 0 and (_next_lens > 3).mean() > 0.5:
+                                    df_clean['Port of Destination'] = df_clean[_next_col]
+
+                    # D. Gefundene Metadaten in die Tabelle injizieren
+                    if 'Contract Number' not in df_clean.columns and sheet_contract != "Unbekannt":
+                        df_clean['Contract Number'] = sheet_contract
+                    if 'Port of Loading' not in df_clean.columns and sheet_pol != "Unbekannt":
+                        df_clean['Port of Loading'] = sheet_pol
+                    if 'Valid from' not in df_clean.columns and sheet_valid_from:
+                        df_clean['Valid from'] = sheet_valid_from
+                    if 'Valid to' not in df_clean.columns and sheet_valid_to:
+                        df_clean['Valid to'] = sheet_valid_to
+                    if 'Carrier' not in df_clean.columns and sheet_carrier:
+                        df_clean['Carrier'] = sheet_carrier
+                    if 'Currency' not in df_clean.columns and sheet_currency:
+                        df_clean['Currency'] = sheet_currency
+
+                    # E. Sheet-Validierung: Nur anhängen wenn es mindestens eine
+                    #    Spalte mit numerischen/Preis-Daten gibt (verhindert Müll-Sheets
+                    #    wie Comments/Freetimes ohne Raten)
+                    _hat_numerische_daten = False
+                    for _col in df_clean.columns:
+                        _c_low = str(_col).strip().lower()
+                        if any(kw in _c_low for kw in ['40', 'rate', 'price', 'amount', 'freight', 'o/f']):
+                            _parsed = df_clean[_col].apply(parse_decimal_wert)
+                            if (_parsed.notna() & (_parsed > 0)).any():
+                                _hat_numerische_daten = True
+                                break
+                    if not _hat_numerische_daten and '40HC' in df_clean.columns:
+                        _parsed = df_clean['40HC'].apply(parse_decimal_wert)
+                        _hat_numerische_daten = (_parsed.notna() & (_parsed > 0)).any()
+
+                    if not _hat_numerische_daten:
+                        continue
+
+                    alle_sheets_dfs.append(df_clean)
+
+                if not alle_sheets_dfs:
+                    return pd.DataFrame(), "Keine verwertbaren Header-Zeilen in den Tabs gefunden."
+
+                df_raw = pd.concat(alle_sheets_dfs, ignore_index=True)
 
         elif datei.name.lower().endswith('.csv'):
             datei.seek(0)
