@@ -3657,6 +3657,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     prepaid_surcharges = []
                     collect_surcharges = []
                     surcharge_rows = group[group.index != bas_row.name]
+                    maersk_prepaid_codes = {'EMS', 'CP1'}
+                    maersk_collect_codes = {'VP1', 'DHC', 'DDF', 'CP2', 'CP3', 'THD', 'DTHC', 'DDC', 'THC34', 'LPC51', 'CAR45'}
 
                     for _, surcharge_row in surcharge_rows.iterrows():
                         code = str(surcharge_row.get(charge_col, '')).strip()
@@ -3664,33 +3666,32 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if not code or code_upper in {'BAS', 'BASIC'}:
                             continue
 
-                        amount = parse_decimal_wert(surcharge_row.get('40HC'))
+                        val_text = str(surcharge_row.get('40HC', '')).strip()
+                        row_currency, amount_from_text = extrahiere_waehrung_und_betrag(val_text, default_currency=basis_waehrung or 'USD')
+                        amount = amount_from_text if amount_from_text is not None else parse_decimal_wert(surcharge_row.get('40HC'))
                         if amount is None or amount <= 0:
                             continue
 
-                        row_currency = str(surcharge_row.get('Currency', basis_waehrung or 'USD')).strip().upper() or (basis_waehrung or 'USD')
-                        if len(row_currency) != 3:
-                            row_currency, _ = extrahiere_waehrung_und_betrag(str(surcharge_row.get('40HC', '')).strip(), default_currency=basis_waehrung or 'USD')
+                        row_currency = str(row_currency or basis_waehrung or 'USD').strip().upper()
                         curr_upper = str(row_currency or '').strip().upper()
 
                         beschreibung_raw = str(surcharge_row.get(charge_desc_col, '')).strip() if charge_desc_col else ''
-                        beschreibung = beschreibung_raw.lower()
-                        section = str(surcharge_row.get(charge_section_col, '')).strip().lower() if charge_section_col else ''
 
                         label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in {'nan', 'none', ''} else code
                         entry = f"{label} = {amount:.2f} {row_currency}"
 
-                        ist_collect = (
-                            curr_upper not in {'USD', 'EUR'}
-                            or 'destination' in beschreibung
-                            or 'dthc' in beschreibung
-                            or 'local terminal recovery' in beschreibung
-                            or section == 'destination'
-                        )
-                        if ist_collect:
-                            collect_surcharges.append(entry)
-                        else:
+                        # Fachregel Maersk-Tender:
+                        # - EMS + CP1 sind aktuell immer Prepaid
+                        # - bekannte Destination-Codes bleiben Collect
+                        # - neue/unbekannte USD/EUR-Zuschlaege vorerst Prepaid
+                        if code_upper in maersk_prepaid_codes:
                             prepaid_surcharges.append(entry)
+                        elif code_upper in maersk_collect_codes:
+                            collect_surcharges.append(entry)
+                        elif curr_upper in {'USD', 'EUR'}:
+                            prepaid_surcharges.append(entry)
+                        else:
+                            collect_surcharges.append(entry)
 
                     group_contract = global_contract
                     if 'Contract Number' in group.columns:
