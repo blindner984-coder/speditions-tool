@@ -3680,8 +3680,6 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     prepaid_surcharges = []
                     collect_surcharges = []
                     surcharge_rows = group[group.index != bas_row.name]
-                    maersk_prepaid_codes = {'EMS', 'CP1'}
-                    maersk_collect_codes = {'VP1', 'DHC', 'DDF', 'CP2', 'CP3', 'THD', 'DTHC', 'DDC', 'THC34', 'LPC51', 'CAR45'}
 
                     for _, surcharge_row in surcharge_rows.iterrows():
                         code = str(surcharge_row.get(charge_col, '')).strip()
@@ -3696,22 +3694,14 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                             continue
 
                         row_currency = str(row_currency or basis_waehrung or 'USD').strip().upper()
-                        curr_upper = str(row_currency or '').strip().upper()
 
                         beschreibung_raw = str(surcharge_row.get(charge_desc_col, '')).strip() if charge_desc_col else ''
 
                         label = f"{beschreibung_raw} ({code})" if beschreibung_raw and beschreibung_raw.lower() not in {'nan', 'none', ''} else code
                         entry = f"{label} = {amount:.2f} {row_currency}"
 
-                        # Fachregel Maersk-Tender:
-                        # - EMS + CP1 sind aktuell immer Prepaid
-                        # - bekannte Destination-Codes bleiben Collect
-                        # - neue/unbekannte USD/EUR-Zuschlaege vorerst Prepaid
-                        if code_upper in maersk_prepaid_codes:
-                            prepaid_surcharges.append(entry)
-                        elif code_upper in maersk_collect_codes:
-                            collect_surcharges.append(entry)
-                        elif curr_upper in {'USD', 'EUR'}:
+                        # Regel: USD/EUR → Prepaid (Origin-seitige Kosten), alle anderen Währungen → Collect
+                        if row_currency in {'USD', 'EUR'}:
                             prepaid_surcharges.append(entry)
                         else:
                             collect_surcharges.append(entry)
