@@ -3041,7 +3041,11 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         # Gemini nur als Fallback bei schlechten Ergebnissen.
 
         df_raw = pd.DataFrame()
-        global_contract = "Unbekannt"
+        global_contract = (
+            normalisiere_cma_quotation(datei.name)
+            or normalisiere_hapag_quotation(datei.name)
+            or "Unbekannt"
+        )
 
         if datei.name.lower().endswith('.xlsx'):
             datei.seek(0)
@@ -3165,11 +3169,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                                 sheet_carrier = carrier_name
                                 break
 
+                    row_contract_hint = (
+                        normalisiere_cma_quotation(" ".join(row_vals))
+                        or normalisiere_hapag_quotation(" ".join(row_vals))
+                    )
+                    if row_contract_hint and sheet_contract == "Unbekannt":
+                        sheet_contract = row_contract_hint
+                        global_contract = row_contract_hint
+
                     for j, val in enumerate(row_vals):
                         v_low = val.lower()
                         if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
                             if j + 1 < len(row_vals):
-                                sheet_contract = row_vals[j + 1]
+                                sheet_contract = (
+                                    normalisiere_cma_quotation(row_vals[j + 1])
+                                    or normalisiere_hapag_quotation(row_vals[j + 1])
+                                    or row_vals[j + 1]
+                                )
                                 global_contract = sheet_contract
                         if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
                             if j + 1 < len(row_vals):
@@ -3325,11 +3341,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                             csv_carrier = carrier_name
                             break
 
+                row_contract_hint = (
+                    normalisiere_cma_quotation(" ".join(row_vals))
+                    or normalisiere_hapag_quotation(" ".join(row_vals))
+                )
+                if row_contract_hint and csv_contract == "Unbekannt":
+                    csv_contract = row_contract_hint
+                    global_contract = row_contract_hint
+
                 for j, val in enumerate(row_vals):
                     v_low = val.lower()
                     if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
                         if j + 1 < len(row_vals):
-                            csv_contract = row_vals[j + 1]
+                            csv_contract = (
+                                normalisiere_cma_quotation(row_vals[j + 1])
+                                or normalisiere_hapag_quotation(row_vals[j + 1])
+                                or row_vals[j + 1]
+                            )
                     if 'loading' in v_low or v_low.strip() == 'pol' or 'pol name' in v_low:
                         if j + 1 < len(row_vals):
                             csv_pol = row_vals[j + 1]
@@ -3565,9 +3593,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 if commodity_val:
                     remark_parts.append(f"Commodity: {commodity_val}")
 
+                group_contract = global_contract
+                if 'Contract Number' in group.columns:
+                    raw_group_contract = erster_nichtleerer_wert(group['Contract Number'], default='')
+                    normalized_group_contract = (
+                        normalisiere_cma_quotation(raw_group_contract)
+                        or normalisiere_hapag_quotation(raw_group_contract)
+                        or raw_group_contract
+                    )
+                    if normalized_group_contract:
+                        group_contract = normalized_group_contract
+
+                if (_detected_carrier == 'CMA CGM') and (not group_contract or group_contract == 'Unbekannt'):
+                    group_contract = normalisiere_cma_quotation(datei.name) or group_contract
+
                 standard_rows.append({
                     'Carrier': _detected_carrier,
-                    'Contract Number': global_contract,
+                    'Contract Number': group_contract,
                     'Port of Loading': pol_val,
                     'Port of Destination': pod_val,
                     'Valid from': eff_val,
