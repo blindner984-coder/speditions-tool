@@ -2314,16 +2314,30 @@ def pickup_analysiere_msc(text):
         if not ist_gueltiger_pickup_depotname(depot):
             continue
 
-        # Fachregel: fuer Pick-up gilt c/h; wenn c/h nicht vorhanden, fallback auf m/h.
+        # Fachregel: fuer Pick-up gilt c/h.
+        # Wenn c/h explizit als "C/H ONLY" ausgewiesen ist, darf NICHT auf m/h
+        # (Drop-off-Spalte) gefallbackt werden.
+        ch_raw = str(match.group(5) or '').strip().upper()
         ch_40hc = parse_pickup_betrag(match.group(5))
         mh_40hc = parse_pickup_betrag(match.group(8))
-        final_40hc = ch_40hc if ch_40hc is not None else mh_40hc
+        if ch_raw == 'C/H ONLY':
+            final_40hc = 'C/H ONLY'
+            row_note = 'MSC-Regel: C/H ONLY bleibt als Pick-up-Hinweis erhalten; m/h ist Drop-off.'
+        elif ch_40hc is not None:
+            final_40hc = ch_40hc
+            row_note = 'Regel: 40HC Pick-up = c/h-Block.'
+        elif ch_raw in {'NO DEAL', 'NOT ALLOWED', 'M/H ONLY', 'N/A'}:
+            final_40hc = ch_raw
+            row_note = 'MSC-Regel: Pick-up laut c/h-Block nicht als Betrag freigegeben.'
+        else:
+            final_40hc = mh_40hc
+            row_note = 'Regel: 40HC Pick-up = c/h-Block, bei fehlendem c/h wird m/h verwendet.'
 
         rows.append({
             'Depot': depot,
             '40HC Pick Up': final_40hc,
             'Currency': 'EUR' if match.group(2) == '€' else match.group(2).upper(),
-            'Hinweis': 'Regel: 40HC Pick-up = c/h-Block, bei fehlendem c/h wird m/h verwendet.',
+            'Hinweis': row_note,
         })
 
     rows = dedupliziere_pickup_rows(rows)
