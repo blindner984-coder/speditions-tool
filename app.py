@@ -86,6 +86,7 @@ COLUMN_ALIASES: dict = {
         "40HQ", "40' HQ", "Rate 40HC", "Rate 40HQ", "40H",
         "40 DRY", "40DRY", "O/F", "OF", "Ocean Freight", "Base Rate",
         "40'rates", "40'rate", "current rate", "new rate", "Rate",
+        "40'", "40 '",
     ],
     "Currency": [
         "Currency", "Currency.1", "Currency.2", "Currency.3",
@@ -1525,8 +1526,10 @@ def extrahiere_hapag_quotation_excel(excel_dict, file_name):
 
             base_row = base_rows.iloc[0]
             basis = parse_decimal_wert(base_row.get(amount_col))
-            if basis is None or basis <= 0:
+            if basis is None or basis == 0:
                 continue
+            ist_negativ = basis < 0
+            basis = abs(basis)
 
             prepaid = []
             collect = []
@@ -1552,6 +1555,8 @@ def extrahiere_hapag_quotation_excel(excel_dict, file_name):
                     prepaid.append(entry)
 
             remark_parts = []
+            if ist_negativ:
+                remark_parts.append("Negativrate (Diskont)")
             if mfr_text:
                 remark_parts.append(f"MFR inkl. ({mfr_text})")
             if tt_col and pd.notna(base_row.get(tt_col)):
@@ -3048,6 +3053,26 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
         )
 
         if datei.name.lower().endswith('.xlsx'):
+            # Spezial-Parser immer zuerst testen (Hapag, CCPR, Evergreen),
+            # bevor der Schnell-Tab-Scan greift. So werden keine Fehl-Erkennungen
+            # durch Header-Scan erzeugt.
+            datei.seek(0)
+            try:
+                excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
+                for _early_parser, _early_name in [
+                    (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
+                    (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
+                    (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
+                ]:
+                    try:
+                        _early_result = _early_parser(excel_dict_early, datei.name)
+                    except Exception:
+                        _early_result = None
+                    if isinstance(_early_result, pd.DataFrame) and not _early_result.empty:
+                        return _early_result, _early_name
+            except Exception:
+                pass
+
             datei.seek(0)
             try:
                 df_fast = pd.read_excel(datei, sheet_name=0)
@@ -3158,6 +3183,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     # Sicherheitsnetz: Nur dann akzeptieren, wenn auch echte Preis-
                     # und Hafeninformationen vorhanden sind (kein Abkuerzungsblatt).
                     if hat_charge_spalte and hat_preis_daten and hat_hafen_spalte:
+                        import sys as _sys2; print(f"[DEBUG2] df_raw SET at sheet={sheet_name}, rows={len(df_quick_std)}", file=_sys2.stderr)
                         df_raw = df_quick_std
                         break
 
@@ -3190,6 +3216,43 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         if 'Contract Number' not in df_quick_std.columns:
                             if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                                 df_quick_std['Contract Number'] = fn_match.group(1)
+                            elif fn_match2 := re.search(r'^([A-Z]{2,6}\d{4,}[A-Z]?\d*)', datei.name, re.IGNORECASE):
+                                df_quick_std['Contract Number'] = fn_match2.group(1).upper()
+                            elif global_contract != "Unbekannt":
+                                df_quick_std['Contract Number'] = global_contract
+                        if 'Carrier' not in df_quick_std.columns:
+                            _fn_low_qt = datei.name.lower()
+                            _qt_hints = {
+                                'yang': 'Yang Ming', 'yangming': 'Yang Ming', 'ym': 'Yang Ming',
+                                'hapag': 'Hapag-Lloyd', 'hlcu': 'Hapag-Lloyd',
+                                'maersk': 'Maersk', 'msc': 'MSC',
+                                'cma': 'CMA CGM', 'mfr': 'CMA CGM',
+                                'evergreen': 'Evergreen', 'cosco': 'COSCO',
+                                'one': 'ONE', 'zim': 'ZIM',
+                            }
+                            _ct_found = False
+                            for _hint, _name in _qt_hints.items():
+                                if _hint in _fn_low_qt:
+                                    df_quick_std['Carrier'] = _name
+                                    _ct_found = True
+                                    break
+                            # Fallback: Carrier aus Metadaten-Zeilen vor dem Header
+                            if not _ct_found and quick_header_idx and quick_header_idx > 0:
+                                _meta_rows = df_preview.iloc[:quick_header_idx]
+                                _meta_text = " ".join(
+                                    v for rv in _meta_rows.values.tolist()
+                                    for v in rv if v and str(v).strip() and str(v).strip().lower() != 'nan'
+                                ).lower()
+                                _meta_carrier_map = {
+                                    'yang ming': 'Yang Ming', 'hapag': 'Hapag-Lloyd',
+                                    'maersk': 'Maersk', 'msc': 'MSC', 'cma cgm': 'CMA CGM',
+                                    'evergreen': 'Evergreen', 'cosco': 'COSCO', 'one': 'ONE',
+                                    'zim': 'ZIM', 'hmm': 'HMM', 'oocl': 'OOCL',
+                                }
+                                for _kw, _cn in _meta_carrier_map.items():
+                                    if _kw in _meta_text:
+                                        df_quick_std['Carrier'] = _cn
+                                        break
                         return df_quick_std, "Excel (Schnell-Tab)"
             except Exception:
                 pass
@@ -3202,17 +3265,8 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 except Exception as e:
                     return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
 
-                for parser_funktion, parser_name in [
-                    (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
-                    (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
-                    (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
-                ]:
-                    try:
-                        df_spezial = parser_funktion(excel_dict, datei.name)
-                    except Exception:
-                        df_spezial = None
-                    if isinstance(df_spezial, pd.DataFrame) and not df_spezial.empty:
-                        return df_spezial, parser_name
+                # Spezial-Parser wurden bereits oben ausgeführt (xlsx-Early-Block).
+                # Hier nur noch der generische Gruppen-Import.
 
                 alle_sheets_dfs = []
 
@@ -3288,7 +3342,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
                         for j, val in enumerate(row_vals):
                             v_low = val.lower()
-                            if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq']):
+                            if any(x in v_low for x in ['contract', 'quote', 'ref.', 'reference', 'sq', 'cust id', 'cust no', 'quotation no', 'quotation nr']):
                                 if j + 1 < len(row_vals):
                                     sheet_contract = (
                                         normalisiere_cma_quotation(row_vals[j + 1])
@@ -3862,6 +3916,13 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         df_raw['Contract Number'] = global_contract
                     df_return = df_raw
                 # Gemini hat nichts → Heuristik-Ergebnis behalten
+        else:
+            # Kein Charge-Format erkannt: df_raw mit Meta-Daten direkt zurückgeben
+            if 'Contract Number' not in df_raw.columns or df_raw['Contract Number'].isna().all():
+                df_raw['Contract Number'] = global_contract
+            elif global_contract != "Unbekannt":
+                df_raw['Contract Number'] = global_contract
+            df_return = df_raw
 
         return df_return, "Excel/CSV (Multi-Sheet)"
 
