@@ -1529,7 +1529,7 @@ def extrahiere_hapag_quotation_excel(excel_dict, file_name):
             if basis is None or basis == 0:
                 continue
             ist_negativ = basis < 0
-            basis = abs(basis)
+            # Negativrate bleibt negativ – wird als -701 USD etc. gespeichert
 
             prepaid = []
             collect = []
