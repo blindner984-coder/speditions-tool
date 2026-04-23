@@ -1957,6 +1957,139 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
     return pd.DataFrame(rows) if rows else None
 
 
+def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name):
+    """Stabiler Spezial-Parser fuer MSC-Workbook
+    'MSC Quote - FMS - ex NWC to Middle East ...'.
+    Dieser Pfad ist bewusst strikt, damit spaetere generische Regel-Aenderungen
+    dieses bekannte Layout nicht unbeabsichtigt veraendern.
+    """
+    file_name_low = str(file_name or '').lower()
+    if not ('msc quote - fms' in file_name_low and 'middle east' in file_name_low):
+        return None
+
+    if 'Seafreight' not in excel_dict:
+        return None
+
+    df_sheet = excel_dict.get('Seafreight')
+    if df_sheet is None or df_sheet.empty:
+        return None
+
+    # Meta: Contract / POL / Validity aus den oberen Key-Value-Zeilen.
+    contract_no = 'Unbekannt'
+    pol_list = []
+    valid_from = None
+    valid_to = None
+
+    for i in range(min(len(df_sheet), 30)):
+        key = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip().lower()
+        val = str(df_sheet.iat[i, 4] if df_sheet.shape[1] > 4 else '').strip()
+        if not key:
+            continue
+
+        if 'contract filing reference' in key and val:
+            contract_no = val
+        elif 'ports of loading' in key and val:
+            pol_list = [p.strip() for p in val.split(',') if p and p.strip()]
+        elif 'validity' in key and val:
+            dts = re.findall(r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', val)
+            if len(dts) >= 2:
+                valid_from = parse_datum_standard(dts[0])
+                valid_to = parse_datum_standard(dts[1])
+
+    if not pol_list:
+        pol_list = ['Unbekannt']
+
+    # Raten-Tabelle finden.
+    header_idx = None
+    for i in range(min(len(df_sheet), 70)):
+        c1 = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip().lower()
+        c2 = str(df_sheet.iat[i, 2] if df_sheet.shape[1] > 2 else '').strip().lower()
+        c4 = str(df_sheet.iat[i, 4] if df_sheet.shape[1] > 4 else '').strip().lower()
+        c6 = str(df_sheet.iat[i, 6] if df_sheet.shape[1] > 6 else '').strip().lower()
+        if c1 == 'port of discharge' and ("20'" in c4 or '20' in c4) and ('40' in c6):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        return None
+
+    rows = []
+    surcharge_entries = []
+    in_surcharge_block = False
+
+    for i in range(header_idx + 1, len(df_sheet)):
+        col1 = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip()
+        col2 = str(df_sheet.iat[i, 2] if df_sheet.shape[1] > 2 else '').strip()
+        col6_raw = df_sheet.iat[i, 6] if df_sheet.shape[1] > 6 else None
+        col7 = str(df_sheet.iat[i, 7] if df_sheet.shape[1] > 7 else '').strip()
+        remark = str(df_sheet.iat[i, 11] if df_sheet.shape[1] > 11 else '').strip()
+
+        text_row = ' '.join(
+            str(v).strip().lower()
+            for v in (df_sheet.iloc[i].tolist() if i < len(df_sheet) else [])
+            if str(v).strip() and str(v).strip().lower() not in {'nan', 'none'}
+        )
+
+        if 'surcharges related to sea freight' in text_row:
+            in_surcharge_block = True
+            continue
+
+        # Ende des relevanten Surcharge-Blocks sobald Administrative/Destination-Abschnitte starten.
+        if in_surcharge_block and (
+            'administrative local charges at origin' in text_row
+            or 'local charges at destination' in text_row
+        ):
+            in_surcharge_block = False
+
+        if in_surcharge_block:
+            code = col1.upper()
+            name = col2
+            amount = parse_decimal_wert(col6_raw)
+            if code and len(code) <= 5 and name and amount is not None and amount > 0:
+                base_text = str(col7 or '').strip().lower()
+                faktor = 2.0 if 'teu' in base_text else 1.0
+                amount_40hc = amount * faktor
+                label = f"{name} ({code})"
+                surcharge_entries.append(f"{label} = {amount_40hc:.2f} USD")
+            continue
+
+        # Normale Ratenzeilen: ISO2 in col1, POD-Name in col2, 40DV/HC in col6.
+        if not re.fullmatch(r'[A-Z]{2}', col1 or ''):
+            continue
+        pod = col2
+        if not pod or pod.lower() in {'nan', 'none', 'code'}:
+            continue
+
+        rate_40 = parse_decimal_wert(col6_raw)
+        if rate_40 is None or rate_40 <= 0:
+            continue
+
+        for pol in pol_list:
+            rows.append({
+                'Carrier': 'MSC',
+                'Contract Number': contract_no,
+                'Port of Loading': str(pol).strip() or 'Unbekannt',
+                'Port of Destination': pod,
+                'Valid from': valid_from,
+                'Valid to': valid_to,
+                '40HC': rate_40,
+                'Currency': 'USD',
+                'Included Prepaid Surcharges 40HC': '',
+                'Included Collect Surcharges 40HC': '',
+                'Remark': remark,
+            })
+
+    if not rows:
+        return None
+
+    surcharge_text = ', '.join(dedupliziere_eintraege(surcharge_entries))
+    if surcharge_text:
+        for row in rows:
+            row['Included Prepaid Surcharges 40HC'] = surcharge_text
+
+    return pd.DataFrame(rows)
+
+
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
@@ -3509,6 +3642,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             try:
                 excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
                 for _early_parser, _early_name in [
+                    (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)'),
                     (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
                     (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
                     (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
