@@ -2033,6 +2033,48 @@ def normalisiere_upload_dataframe(df_upload):
         'Discharge Port', 'Port of Discharge', 'Dest Port', 'POD Name', 'Arrival Port', 'To Port', 'Pod',
     ])
 
+    # MSC/FMS-Layout-Fix: In manchen Seafreight-Sheets steht in "Port of Destination"
+    # nur der 2-stellige Laendercode (z.B. AE), waehrend der echte POD-Name in einer
+    # Nachbarspalte (z.B. "Unnamed: 2") liegt. Dann POD auf die Namensspalte umstellen.
+    if 'Port of Destination' in out.columns:
+        pod_raw = out['Port of Destination'].astype(str).str.strip()
+        pod_nonempty = pod_raw[~ist_leerwert_series(out['Port of Destination'])]
+
+        if not pod_nonempty.empty:
+            iso2_ratio = pod_nonempty.str.fullmatch(r'[A-Z]{2}').mean()
+            if pd.notna(iso2_ratio) and iso2_ratio >= 0.60:
+                kandidat_spalten = [
+                    'Unnamed: 2',
+                    'Port of Destination.1',
+                    'Port of Discharge.1',
+                    'Destination Name',
+                    'POD Name',
+                    'City',
+                ]
+
+                for kcol in kandidat_spalten:
+                    if kcol not in out.columns:
+                        continue
+
+                    kseries = out[kcol].astype(str).str.strip()
+                    k_nonempty = kseries[~ist_leerwert_series(out[kcol])]
+                    if k_nonempty.empty:
+                        continue
+
+                    # Nur Spalten akzeptieren, die nach echten Ortsnamen aussehen.
+                    name_like_ratio = (
+                        (~k_nonempty.str.fullmatch(r'[A-Z]{2}'))
+                        & (k_nonempty.str.len() >= 3)
+                        & (~k_nonempty.str.contains(r'code|charge|surcharge|remark|freetime', case=False, regex=True))
+                    ).mean()
+                    if pd.isna(name_like_ratio) or name_like_ratio < 0.50:
+                        continue
+
+                    swap_mask = pod_raw.str.fullmatch(r'[A-Z]{2}') & (~ist_leerwert_series(out[kcol]))
+                    if swap_mask.any():
+                        out.loc[swap_mask, 'Port of Destination'] = out.loc[swap_mask, kcol]
+                        break
+
     # Fachregel: NCP0 ist ein POL-Synonym für Hamburg/Bremerhaven.
     out['Port of Loading'] = out['Port of Loading'].apply(normalisiere_hafen_alias)
 
@@ -2054,6 +2096,44 @@ def normalisiere_upload_dataframe(df_upload):
 
     # Preis-Konvertierung
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
+
+    # Zweiter, robuster POD-Fix nach Preis-Parsing:
+    # Wenn bei preisgueltigen Zeilen POD nur aus ISO2-Codes besteht (AE/BH/...),
+    # ersetze mit der benachbarten Namensspalte aus dem Originalsheet.
+    if 'Port of Destination' in out.columns:
+        pod_codes = out['Port of Destination'].astype(str).str.strip()
+        kandidat_spalten = ['Unnamed: 2', 'Port of Destination.1', 'Port of Discharge.1', 'Destination Name', 'POD Name', 'City']
+        for kcol in kandidat_spalten:
+            if kcol not in out.columns:
+                continue
+
+            kseries = out[kcol].astype(str).str.strip()
+            swap_mask = (
+                pod_codes.str.fullmatch(r'[A-Z]{2}')
+                & out['40HC'].notna()
+                & (~ist_leerwert_series(out[kcol]))
+                & (kseries.str.len() >= 3)
+                & (~kseries.str.contains(r'code|charge|surcharge|remark|freetime|port of discharge', case=False, regex=True))
+            )
+            # Erst ersetzen, wenn wir mehrere plausible Treffer haben.
+            if int(swap_mask.sum()) >= 3:
+                out.loc[swap_mask, 'Port of Destination'] = out.loc[swap_mask, kcol]
+                break
+
+    # Charge-Code-Zeilen entfernen: Einige MSC-Sheets enthalten nach der Ratentabelle
+    # Surcharge-Abschnitte, in denen Code-Spalten (z.B. ERC/EFS/FTS) irrtuemlich als
+    # POD interpretiert werden koennen.
+    if 'Port of Destination' in out.columns:
+        pod_text = out['Port of Destination'].astype(str).str.strip().str.upper()
+        for desc_col in ['Unnamed: 2', 'Surcharge Name', 'Description', 'Charge description']:
+            if desc_col not in out.columns:
+                continue
+            desc_text = out[desc_col].astype(str).str.strip().str.lower()
+            code_mask = pod_text.str.fullmatch(r'[A-Z0-9]{2,5}')
+            surcharge_mask = desc_text.str.contains(r'surcharge|handling charge|logistic fee|security|fuel|bunker', regex=True, na=False)
+            drop_mask = code_mask & surcharge_mask
+            if drop_mask.any():
+                out = out[~drop_mask].copy()
 
     # --- RADIKALE VALIDIERUNG (TRASH-FILTER) ---
     ungueltige = {'UNBEKANNT', 'NAN', 'NONE', '', 'NIL', 'NULL'}
@@ -2646,50 +2726,50 @@ def pickup_analysiere_imt(text):
 
 
 def pickup_analysiere_msc(text):
+    # MSC-Format: 6 Wert-Spalten pro Zeile = Drop-off (20DC, 40DC, 40HC) + Pick-up (20DC, 40DC, 40HC)
+    # Pick-up 40HC ist immer die 6. Wertspalte (group 8)
     token_pattern = r'(?:FREE|NIL|No deal|Not allowed|c/h only|m/h only|\d+(?:[.,]\d+)?)'
     pattern = re.compile(
-        rf'([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(EUR|USD|€)\s+'
+        rf'([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9/&().,\-\s]+?)\s+(EUR|CHF|USD|€)\s+'
         rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})\s+'
-        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})(?=\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß]|$)',
+        rf'({token_pattern})\s+({token_pattern})\s+({token_pattern})',
         re.IGNORECASE,
     )
     rows = []
     for match in pattern.finditer(text):
         depot = bereinige_pickup_depotname(match.group(1))
-        if not ist_gueltiger_pickup_depotname(depot):
+        # Kurze Reste wie "HC" oder "DC" sind Headerzeilen, keine Depots
+        if not ist_gueltiger_pickup_depotname(depot) or len(depot.strip()) <= 3:
             continue
 
-        # Fachregel: fuer Pick-up gilt c/h.
-        # Wenn c/h explizit als "C/H ONLY" ausgewiesen ist, darf NICHT auf m/h
-        # (Drop-off-Spalte) gefallbackt werden.
-        ch_raw = str(match.group(5) or '').strip().upper()
-        ch_40hc = parse_pickup_betrag(match.group(5))
-        mh_40hc = parse_pickup_betrag(match.group(8))
-        if ch_raw == 'C/H ONLY':
+        # Pick-up 40HC = 6. Wertspalte (group 8)
+        pu_raw = str(match.group(8) or '').strip().upper()
+        pu_40hc = parse_pickup_betrag(match.group(8))
+
+        if pu_raw in {'C/H ONLY'}:
             final_40hc = 'C/H ONLY'
-            row_note = 'MSC-Regel: C/H ONLY bleibt als Pick-up-Hinweis erhalten; m/h ist Drop-off.'
-        elif ch_40hc is not None:
-            final_40hc = ch_40hc
-            row_note = 'Regel: 40HC Pick-up = c/h-Block.'
-        elif ch_raw in {'NO DEAL', 'NOT ALLOWED', 'M/H ONLY', 'N/A'}:
-            final_40hc = ch_raw
-            row_note = 'MSC-Regel: Pick-up laut c/h-Block nicht als Betrag freigegeben.'
+            row_note = 'MSC: Pick-up nur auf Anfrage (C/H ONLY).'
+        elif pu_40hc is not None:
+            final_40hc = pu_40hc
+            row_note = ''
+        elif pu_raw in {'NO DEAL', 'NOT ALLOWED', 'M/H ONLY', 'N/A'}:
+            final_40hc = pu_raw
+            row_note = f'MSC: Pick-up nicht verfuegbar ({pu_raw}).'
         else:
-            final_40hc = mh_40hc
-            row_note = 'Regel: 40HC Pick-up = c/h-Block, bei fehlendem c/h wird m/h verwendet.'
+            continue  # kein verwertbarer Pick-up-Wert
 
         rows.append({
             'Depot': depot,
             '40HC Pick Up': final_40hc,
-            'Currency': 'EUR' if match.group(2) == '€' else match.group(2).upper(),
+            'Currency': 'CHF' if match.group(2).upper() == 'CHF' else 'EUR',
             'Hinweis': row_note,
         })
 
     rows = dedupliziere_pickup_rows(rows)
     return {
         'carrier': 'MSC',
-        'status': 'Teilweise' if rows else 'Nicht sauber auslesbar',
-        'note': 'MSC-Regel aktiv: c/h fuer 40HC Pick-up, fallback auf m/h falls c/h fehlt.' if rows else 'MSC-Tabelle konnte nicht stabil gelesen werden.',
+        'status': 'Vollautomatisch' if rows else 'Nicht sauber auslesbar',
+        'note': 'MSC Pick-up Charges aus Spalten 4-6 (Pick up Charges Block).' if rows else 'MSC-Tabelle konnte nicht stabil gelesen werden.',
         'rows': rows,
     }
 
