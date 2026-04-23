@@ -1957,6 +1957,95 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
     return pd.DataFrame(rows) if rows else None
 
 
+def extrahiere_yang_ming_ncpe_excel(excel_dict, file_name):
+    """Stabiler Spezial-Parser fuer bekannte Yang-Ming NCPE-Ratenblaetter.
+    Ziel: bestehendes Verhalten beibehalten und nur die Gültigkeit aus
+    'Document Validity' zuverlässig in die Ergebniszeilen injizieren.
+    """
+    file_name_low = str(file_name or '').lower()
+    if not file_name_low.endswith(('.xlsx', '.xlsm')):
+        return None
+    if not re.search(r'\bncpe\w*', file_name_low):
+        return None
+
+    def _parse_ncpe_validity_date(value):
+        text = str(value or '').strip()
+        if not text:
+            return None
+        parsed = pd.to_datetime(text, format='%Y/%m/%d', errors='coerce')
+        if pd.notna(parsed):
+            return parsed.strftime('%d.%m.%Y')
+        return parse_datum_standard(text)
+
+    for _sheet_name, df_sheet in (excel_dict or {}).items():
+        if df_sheet is None or df_sheet.empty or len(df_sheet) < 12:
+            continue
+
+        title_a = str(df_sheet.iat[0, 0] if df_sheet.shape[1] > 0 else '').strip().upper()
+        title_b = str(df_sheet.iat[0, 1] if df_sheet.shape[1] > 1 else '').strip().lower()
+        if title_a != 'YANG MING' or 'freight quotation' not in title_b:
+            continue
+
+        header_idx = None
+        for i in range(min(len(df_sheet), 20)):
+            row_vals = [str(v).strip().lower() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'country' in row_vals and 'pol' in row_vals and any('destination' == v for v in row_vals):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        valid_from = None
+        valid_to = None
+        contract_no = None
+        for i in range(min(header_idx, 12)):
+            key = str(df_sheet.iat[i, 0] if df_sheet.shape[1] > 0 else '').strip().lower()
+            val = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip()
+            if not key:
+                continue
+            if 'document validity' in key and val:
+                date_hits = re.findall(r'(\d{4}[/-]\d{2}[/-]\d{2}|\d{2}[./-]\d{2}[./-]\d{4})', val)
+                if len(date_hits) >= 2:
+                    valid_from = _parse_ncpe_validity_date(date_hits[0])
+                    valid_to = _parse_ncpe_validity_date(date_hits[1])
+            elif key in {'cust id', 'customer id'} and val:
+                contract_no = val
+
+        if not contract_no:
+            fn_match = re.search(r'(NCPE\w+)', str(file_name or ''), re.IGNORECASE)
+            contract_no = fn_match.group(1).upper() if fn_match else 'Unbekannt'
+
+        df_clean = dataframe_mit_header_aus_zeile(df_sheet, header_idx)
+        if df_clean.empty:
+            continue
+
+        df_std = standardisiere_spalten(df_clean)
+        if 'Valid from' not in df_std.columns:
+            df_std['Valid from'] = valid_from
+        else:
+            leer_mask = df_std['Valid from'].astype(str).str.strip().replace({'nan': '', 'None': ''}).eq('')
+            df_std.loc[leer_mask, 'Valid from'] = valid_from
+
+        if 'Valid to' not in df_std.columns:
+            df_std['Valid to'] = valid_to
+        else:
+            leer_mask = df_std['Valid to'].astype(str).str.strip().replace({'nan': '', 'None': ''}).eq('')
+            df_std.loc[leer_mask, 'Valid to'] = valid_to
+
+        if 'Carrier' not in df_std.columns:
+            df_std['Carrier'] = 'Yang Ming'
+        if 'Contract Number' not in df_std.columns:
+            df_std['Contract Number'] = contract_no
+        else:
+            leer_mask = df_std['Contract Number'].astype(str).str.strip().replace({'nan': '', 'None': ''}).eq('')
+            df_std.loc[leer_mask, 'Contract Number'] = contract_no
+
+        return df_std
+
+    return None
+
+
 def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name):
     """Stabiler Spezial-Parser fuer MSC-Workbook
     'MSC Quote - FMS - ex NWC to Middle East ...'.
@@ -3643,6 +3732,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
                 for _early_parser, _early_name in [
                     (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)'),
+                    (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)'),
                     (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
                     (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
                     (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
