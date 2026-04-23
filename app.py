@@ -2097,6 +2097,67 @@ def normalisiere_upload_dataframe(df_upload):
     # Preis-Konvertierung
     out['40HC'] = out['40HC'].apply(parse_decimal_wert)
 
+    # MSC-Seafreight-Fix: Surcharge-Zeilen (z.B. ERC/EFS/FTS) aus dem gleichen Sheet
+    # als Prepaid/Collect aggregieren, bevor die Zeilen spaeter als Nicht-Raten
+    # herausgefiltert werden.
+    if 'Port of Destination' in out.columns and '40HC' in out.columns:
+        desc_col = None
+        for _c in ['Unnamed: 2', 'Surcharge Name', 'Description', 'Charge description']:
+            if _c in out.columns:
+                desc_col = _c
+                break
+
+        if desc_col is not None:
+            pod_code = out['Port of Destination'].astype(str).str.strip().str.upper()
+            desc_text = out[desc_col].astype(str).str.strip()
+            desc_low = desc_text.str.lower()
+            code_mask = pod_code.str.fullmatch(r'[A-Z0-9]{2,5}')
+            surcharge_mask = desc_low.str.contains(
+                r'surcharge|handling charge|logistic fee|security|fuel|bunker|risk|emission|routing|tank',
+                regex=True,
+                na=False,
+            )
+            amount_mask = out['40HC'].notna() & (out['40HC'] > 0)
+            surcharge_rows = out[code_mask & surcharge_mask & amount_mask].copy()
+
+            if not surcharge_rows.empty:
+                prepaid_entries = []
+                collect_entries = []
+                for _, srow in surcharge_rows.iterrows():
+                    scode = str(srow.get('Port of Destination', '')).strip().upper()
+                    sdesc = str(srow.get(desc_col, '')).strip()
+                    samount = parse_decimal_wert(srow.get('40HC'))
+                    if not scode or samount is None or samount <= 0:
+                        continue
+
+                    scurr_raw = str(srow.get('Currency', '')).strip().upper()
+                    scurr = scurr_raw if (len(scurr_raw) == 3 and scurr_raw.isalpha()) else 'USD'
+                    label = f"{sdesc} ({scode})" if sdesc and sdesc.lower() not in {'nan', 'none', ''} else scode
+                    entry = f"{label} = {samount:.2f} {scurr}"
+
+                    sremark = str(srow.get('Remark', '')).strip().lower()
+                    if 'collect' in sremark or 'destination' in sremark:
+                        collect_entries.append(entry)
+                    else:
+                        prepaid_entries.append(entry)
+
+                prepaid_text = ', '.join(dedupliziere_eintraege(prepaid_entries))
+                collect_text = ', '.join(dedupliziere_eintraege(collect_entries))
+
+                if prepaid_text or collect_text:
+                    if 'Included Prepaid Surcharges 40HC' not in out.columns:
+                        out['Included Prepaid Surcharges 40HC'] = ''
+                    if 'Included Collect Surcharges 40HC' not in out.columns:
+                        out['Included Collect Surcharges 40HC'] = ''
+
+                    rate_rows_mask = ~(code_mask & surcharge_mask)
+                    if prepaid_text:
+                        out.loc[rate_rows_mask & out['Included Prepaid Surcharges 40HC'].astype(str).str.strip().eq(''),
+                                'Included Prepaid Surcharges 40HC'] = prepaid_text
+                    if collect_text:
+                        out.loc[rate_rows_mask & out['Included Collect Surcharges 40HC'].astype(str).str.strip().eq(''),
+                                'Included Collect Surcharges 40HC'] = collect_text
+
     # Zweiter, robuster POD-Fix nach Preis-Parsing:
     # Wenn bei preisgueltigen Zeilen POD nur aus ISO2-Codes besteht (AE/BH/...),
     # ersetze mit der benachbarten Namensspalte aus dem Originalsheet.
