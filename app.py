@@ -2128,6 +2128,301 @@ def ist_pickup_pdf_datei(file_name):
     return 'yang ming export fak rates' not in name_lower
 
 
+UNTERSTUETZTE_PICKUP_DATEIENDUNGEN = {'.pdf', '.xlsx', '.xlsm'}
+
+
+def lese_pickup_excel_roh(file_bytes):
+    try:
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+    except Exception:
+        return None
+
+
+def pickup_excel_textprobe(excel_dict, max_rows=20):
+    teile = []
+    for sheet_name, df_sheet in (excel_dict or {}).items():
+        teile.append(str(sheet_name))
+        preview = df_sheet.head(max_rows).fillna('').astype(str).values.flatten().tolist()
+        teile.extend(preview)
+    return ' '.join(teile)
+
+
+def erkenne_pickup_excel_layout(file_name, excel_dict):
+    file_name_lower = str(file_name or '').lower()
+    sheet_names_lower = [str(sheet).strip().lower() for sheet in (excel_dict or {}).keys()]
+    probe = pickup_excel_textprobe(excel_dict).lower()
+    suchtext = f"{file_name_lower} {probe}"
+
+    if 'pick up depots (nac)' in suchtext or 'fms / pup in eur' in suchtext:
+        return 'fms'
+    if 'empty pick up charge' in suchtext and re.search(r"40[' ]?hc", suchtext):
+        return 'hmm'
+    if 'drop off / pick up tariff' in suchtext or any('pudo' in name for name in sheet_names_lower):
+        return 'pudo'
+    if any('pick up tariff' in name for name in sheet_names_lower) or 'pick up charge - standard tariff' in suchtext:
+        return 'yang_ming'
+    return None
+
+
+def baue_pickup_depot_text(*teile):
+    cleaned = [re.sub(r'\s+', ' ', str(teil or '')).strip(' ,|') for teil in teile]
+    cleaned = [teil for teil in cleaned if teil and teil.lower() not in {'nan', 'none'}]
+    return ' | '.join(cleaned)
+
+
+def pickup_baue_ergebnis(carrier, rows, note_success='', note_failure='Datei konnte nicht als Pick-Up-Liste erkannt werden.', status_success='Vollautomatisch'):
+    rows = dedupliziere_pickup_rows(rows)
+    return {
+        'carrier': carrier,
+        'status': status_success if rows else 'Nicht sauber auslesbar',
+        'note': note_success if rows else note_failure,
+        'rows': rows,
+    }
+
+
+def pickup_analysiere_fms_excel(file_name, excel_dict):
+    workbook_text = pickup_excel_textprobe(excel_dict, max_rows=10)
+    carrier = erkenne_pickup_carrier(file_name, workbook_text)
+    rows = []
+
+    for _sheet_name, df_sheet in (excel_dict or {}).items():
+        header_idx = None
+        for i in range(min(len(df_sheet), 20)):
+            row_vals = [str(v).strip().lower() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'pick up depots (nac)' in row_vals:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        period_row = df_sheet.iloc[header_idx - 1] if header_idx > 0 else pd.Series(dtype=object)
+        for col_idx, title_raw in enumerate(period_row.tolist()):
+            title = re.sub(r'\s+', ' ', str(title_raw or '')).strip()
+            if not title or 'difference' in title.lower():
+                continue
+
+            hc_col = col_idx + 2
+            if hc_col >= df_sheet.shape[1]:
+                continue
+
+            header_value = str(df_sheet.iat[header_idx, hc_col] or '').strip().lower()
+            if '40' not in header_value or 'hc' not in header_value:
+                continue
+
+            for row_idx in range(header_idx + 1, len(df_sheet)):
+                depot = bereinige_pickup_depotname(df_sheet.iat[row_idx, 1] if df_sheet.shape[1] > 1 else '')
+                if not ist_gueltiger_pickup_depotname(depot):
+                    continue
+
+                value_40hc = parse_pickup_betrag(df_sheet.iat[row_idx, hc_col])
+                if value_40hc is None:
+                    continue
+
+                rows.append({
+                    'Depot': depot,
+                    '40HC Pick Up': value_40hc,
+                    'Currency': 'EUR',
+                    'Hinweis': f'Gueltigkeit: {title}',
+                })
+
+    return pickup_baue_ergebnis(
+        carrier,
+        rows,
+        note_success='FMS-Excel mit Periodenbloecken erkannt.',
+        note_failure='FMS-Pick-Up-Layout konnte nicht stabil gelesen werden.',
+    )
+
+
+def pickup_analysiere_yang_ming_excel(file_name, excel_dict):
+    carrier = 'Yang Ming'
+    rows = []
+
+    for sheet_name, df_sheet in (excel_dict or {}).items():
+        if 'pick up tariff' not in str(sheet_name).strip().lower():
+            continue
+
+        header_idx = None
+        for i in range(min(len(df_sheet), 30)):
+            row_vals = [str(v).strip().lower() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'country / location - ncp' in row_vals:
+                header_idx = i
+                break
+
+        if header_idx is None:
+            continue
+
+        validity_row = df_sheet.iloc[header_idx - 2] if header_idx >= 2 else pd.Series(dtype=object)
+        block_starts = []
+        for col_idx, value in df_sheet.iloc[header_idx].items():
+            if str(value).strip().lower() == 'country / location - ncp':
+                block_starts.append(col_idx)
+
+        for start_col in block_starts:
+            validity = re.sub(r'\s+', ' ', str(validity_row.get(start_col, '') or '')).strip()
+            current_country = ''
+            for row_idx in range(header_idx + 1, len(df_sheet)):
+                country_raw = str(df_sheet.iat[row_idx, start_col] or '').strip()
+                location = str(df_sheet.iat[row_idx, start_col + 1] or '').strip() if start_col + 1 < df_sheet.shape[1] else ''
+                code = str(df_sheet.iat[row_idx, start_col + 2] or '').strip() if start_col + 2 < df_sheet.shape[1] else ''
+                value_40hc = parse_pickup_betrag(df_sheet.iat[row_idx, start_col + 5] if start_col + 5 < df_sheet.shape[1] else None)
+
+                if country_raw and len(country_raw) <= 3 and country_raw.upper() == country_raw:
+                    current_country = country_raw
+
+                if not location or not code:
+                    continue
+                if value_40hc is None:
+                    continue
+
+                depot = baue_pickup_depot_text(location, f'[{code}]', f'({current_country})' if current_country else '')
+                depot = depot.replace(' | [', ' [').replace('] | (', '] (')
+                if not ist_gueltiger_pickup_depotname(depot):
+                    continue
+
+                row_note = 'Yang Ming Pick Up Tariff'
+                if validity:
+                    row_note += f' | {validity}'
+                rows.append({
+                    'Depot': depot,
+                    '40HC Pick Up': value_40hc,
+                    'Currency': 'EUR',
+                    'Hinweis': row_note,
+                })
+
+    return pickup_baue_ergebnis(
+        carrier,
+        rows,
+        note_success='Yang-Ming-Pickup-Sheet mit zwei Gueltigkeitsbloecken erkannt.',
+        note_failure='Yang-Ming-Pickup-Sheet konnte nicht stabil gelesen werden.',
+    )
+
+
+def pickup_analysiere_hmm_excel(file_name, excel_dict):
+    carrier = 'HMM'
+    rows = []
+
+    for _sheet_name, df_sheet in (excel_dict or {}).items():
+        if len(df_sheet) < 3 or df_sheet.shape[1] < 7:
+            continue
+
+        header_probe = ' '.join(df_sheet.head(2).fillna('').astype(str).values.flatten().tolist()).lower()
+        if 'empty pick up charge' not in header_probe:
+            continue
+
+        for row_idx in range(2, len(df_sheet)):
+            code = str(df_sheet.iat[row_idx, 0] or '').strip()
+            depot_name = str(df_sheet.iat[row_idx, 1] or '').strip()
+            currency = str(df_sheet.iat[row_idx, 3] or 'EUR').strip().upper() or 'EUR'
+            value_40hc = parse_pickup_betrag(df_sheet.iat[row_idx, 6])
+            if not depot_name or value_40hc is None:
+                continue
+
+            depot = baue_pickup_depot_text(depot_name, f'[{code}]' if code else '')
+            rows.append({
+                'Depot': depot.replace(' | [', ' ['),
+                '40HC Pick Up': value_40hc,
+                'Currency': currency,
+                'Hinweis': '',
+            })
+
+    return pickup_baue_ergebnis(
+        carrier,
+        rows,
+        note_success='HMM-Excel mit direkter 40HC-Spalte erkannt.',
+        note_failure='HMM-Pick-Up-Excel konnte nicht stabil gelesen werden.',
+    )
+
+
+def pickup_analysiere_pudo_excel(file_name, excel_dict):
+    workbook_text = pickup_excel_textprobe(excel_dict, max_rows=10)
+    carrier = erkenne_pickup_carrier(file_name, workbook_text)
+    rows = []
+
+    for _sheet_name, df_sheet in (excel_dict or {}).items():
+        header_idx = None
+        for i in range(min(len(df_sheet), 20)):
+            row_vals = [str(v).strip().lower() for v in df_sheet.iloc[i].tolist() if str(v).strip()]
+            if 'area/ country:' in row_vals and '40hc' in row_vals:
+                header_idx = i
+                break
+
+        if header_idx is None or df_sheet.shape[1] < 11:
+            continue
+
+        validity_text = re.sub(r'\s+', ' ', str(df_sheet.iat[header_idx - 1, 0] if header_idx >= 1 else '')).strip()
+        current_country = ''
+        for row_idx in range(header_idx + 1, len(df_sheet)):
+            country_raw = str(df_sheet.iat[row_idx, 0] or '').strip()
+            location = str(df_sheet.iat[row_idx, 1] or '').strip()
+            depot_name = str(df_sheet.iat[row_idx, 2] or '').strip()
+            code = str(df_sheet.iat[row_idx, 3] or '').strip()
+            currency = str(df_sheet.iat[row_idx, 4] or 'EUR').strip().upper() or 'EUR'
+            value_40hc = parse_pickup_betrag(df_sheet.iat[row_idx, 10])
+
+            if country_raw and len(country_raw) <= 3 and country_raw.upper() == country_raw:
+                current_country = country_raw
+
+            if not location or not depot_name or not code:
+                continue
+            if value_40hc is None:
+                continue
+
+            depot = baue_pickup_depot_text(location, depot_name, f'[{code}]', f'({current_country})' if current_country else '')
+            depot = depot.replace(' | [', ' [').replace('] | (', '] (')
+            rows.append({
+                'Depot': depot,
+                '40HC Pick Up': value_40hc,
+                'Currency': currency,
+                'Hinweis': validity_text or 'PUDO Pick-up Charge',
+            })
+
+    return pickup_baue_ergebnis(
+        carrier if carrier != 'Unbekannt' else 'Unbekannt',
+        rows,
+        note_success='PUDO-Excel mit getrenntem Pick-up-Block erkannt.',
+        note_failure='PUDO-Excel konnte nicht stabil gelesen werden.',
+    )
+
+
+def analysiere_pickup_excel(file_name, file_bytes):
+    excel_dict = lese_pickup_excel_roh(file_bytes)
+    if not excel_dict:
+        return {
+            'fileName': file_name,
+            'carrier': 'Unbekannt',
+            'status': 'Nicht sauber auslesbar',
+            'note': 'Excel-Datei konnte nicht gelesen werden.',
+            'rows': [],
+        }
+
+    layout = erkenne_pickup_excel_layout(file_name, excel_dict)
+    if layout == 'fms':
+        result = pickup_analysiere_fms_excel(file_name, excel_dict)
+    elif layout == 'yang_ming':
+        result = pickup_analysiere_yang_ming_excel(file_name, excel_dict)
+    elif layout == 'hmm':
+        result = pickup_analysiere_hmm_excel(file_name, excel_dict)
+    elif layout == 'pudo':
+        result = pickup_analysiere_pudo_excel(file_name, excel_dict)
+    else:
+        return None
+
+    result['fileName'] = file_name
+    return result
+
+
+def analysiere_pickup_datei(file_name, file_bytes):
+    ext = Path(str(file_name or '')).suffix.lower()
+    if ext == '.pdf':
+        if not ist_pickup_pdf_datei(file_name):
+            return None
+        return analysiere_pickup_pdf(file_name, file_bytes)
+    if ext in {'.xlsx', '.xlsm'}:
+        return analysiere_pickup_excel(file_name, file_bytes)
+    return None
+
+
 def lese_pdf_text_kompakt(file_bytes):
     reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     texte = []
@@ -2159,12 +2454,16 @@ def erkenne_pickup_carrier(file_name, text):
         return 'COSCO'
     if 'evergreen' in suchtext or 'de_exp_pickuptariff' in file_name_lower:
         return 'Evergreen'
+    if 'pudo' in file_name_lower or 'drop off / pick up tariff' in suchtext:
+        return 'ONE'
     if 'maersk' in suchtext:
         return 'Maersk'
     if 'mediterranean shipping company' in suchtext or re.search(r'\bmsc\b', suchtext):
         return 'MSC'
     if re.search(r'\bhmm\b', suchtext) or 'hyundai merchant marine' in suchtext:
         return 'HMM'
+    if 'yang ming' in suchtext:
+        return 'Yang Ming'
     if 'one pudo' in suchtext or 'ocean network express' in suchtext or 'pudo remarks' in suchtext:
         return 'ONE'
     if re.search(r'\bq\d{4}[a-z]{3}\d{5,}(?:/\d+)?\b', suchtext):
@@ -2175,7 +2474,14 @@ def erkenne_pickup_carrier(file_name, text):
 
 
 def parse_pickup_betrag(value):
-    text = str(value or '').strip()
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
     if not text:
         return None
 
@@ -2491,7 +2797,7 @@ def analysiere_pickup_pdf(file_name, file_bytes):
         result = pickup_analysiere_imt(text)
     elif 'one pudo' in name_lower:
         result = pickup_analysiere_one(text)
-    elif 'pick-up - drop off charges' in name_lower:
+    elif 'pick-up - drop off charges' in name_lower or carrier == 'MSC':
         result = pickup_analysiere_msc(text)
     elif 'hmm' in name_lower:
         result = pickup_analysiere_hmm(text)
@@ -2511,11 +2817,13 @@ def analysiere_pickup_upload_ordner():
         return []
 
     ergebnisse = []
-    for path in sorted(upload_dir.glob('*.pdf')):
-        if not ist_pickup_pdf_datei(path.name):
+    for path in sorted(upload_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in UNTERSTUETZTE_PICKUP_DATEIENDUNGEN:
             continue
         try:
-            ergebnisse.append(analysiere_pickup_pdf(path.name, path.read_bytes()))
+            ergebnis = analysiere_pickup_datei(path.name, path.read_bytes())
+            if ergebnis is not None:
+                ergebnisse.append(ergebnis)
         except Exception as exc:
             ergebnisse.append({
                 'fileName': path.name,
@@ -4448,16 +4756,16 @@ with tab_pickup:
 
     st.write("### 📤 Eigener PICK-UP Upload")
     pickup_upload_files = st.file_uploader(
-        "PICK-UP PDFs hochladen",
-        type=["pdf"],
+        "PICK-UP Dateien hochladen",
+        type=["pdf", "xlsx", "xlsm"],
         accept_multiple_files=True,
         key="pickup_upload_files",
     )
 
-    if st.button("🧪 Upload-PDFs analysieren", type="primary", key="pickup_upload_analyze_btn"):
+    if st.button("🧪 Upload-Dateien analysieren", type="primary", key="pickup_upload_analyze_btn"):
         st.session_state['pickup_upload_results'] = []
         if not pickup_upload_files:
-            st.warning("Bitte mindestens eine PICK-UP PDF auswaehlen.")
+            st.warning("Bitte mindestens eine PICK-UP Datei auswaehlen.")
         else:
             upload_results = []
             for datei in pickup_upload_files:
@@ -4472,7 +4780,17 @@ with tab_pickup:
                             'rows': [],
                         })
                         continue
-                    upload_results.append(analysiere_pickup_pdf(datei.name, datei_bytes))
+                    ergebnis = analysiere_pickup_datei(datei.name, datei_bytes)
+                    if ergebnis is None:
+                        upload_results.append({
+                            'fileName': datei.name,
+                            'carrier': 'Unbekannt',
+                            'status': 'Nicht sauber auslesbar',
+                            'note': 'Datei ist kein erkanntes Pick-Up-Layout.',
+                            'rows': [],
+                        })
+                    else:
+                        upload_results.append(ergebnis)
                 except Exception as exc:
                     upload_results.append({
                         'fileName': datei.name,
@@ -4526,16 +4844,16 @@ with tab_pickup:
 
     st.markdown("---")
     st.write("### 📂 Analyse aus Ordner data/upload")
-    st.caption("Optionaler Schnelltest aller PICK-UP PDFs im Upload-Ordner.")
+    st.caption("Optionaler Schnelltest aller PICK-UP PDFs und Excel-Dateien im Upload-Ordner.")
 
-    if st.button("🔎 PICK UP PDFs prüfen", type="primary", key="pickup_scan_btn"):
+    if st.button("🔎 PICK UP Dateien prüfen", type="primary", key="pickup_scan_btn"):
         st.session_state['pickup_scan_started'] = True
 
     if st.session_state.get('pickup_scan_started', False):
         pickup_ergebnisse = analysiere_pickup_upload_ordner()
 
         if not pickup_ergebnisse:
-            st.warning("Keine passenden PICK-UP-PDFs im Ordner data/upload gefunden.")
+            st.warning("Keine passenden PICK-UP Dateien im Ordner data/upload gefunden.")
         else:
             df_pickup_summary = pd.DataFrame([
                 {
