@@ -3073,6 +3073,47 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             except Exception:
                 pass
 
+            # global_contract frühzeitig per openpyxl-Scan setzen, damit er im
+            # Schnell-Tab- und Schnellpfad-Return bereits verfügbar ist.
+            if global_contract == "Unbekannt":
+                try:
+                    datei.seek(0)
+                    import openpyxl as _openpyxl_early
+                    _wb_e = _openpyxl_early.load_workbook(datei, read_only=True, data_only=True)
+                    _contract_kws = {'contract', 'filing reference', 'quote number', 'quotation no',
+                                     'quotation number', 'sq no', 'booking ref', 'approval reference'}
+                    for _sname_e in _wb_e.sheetnames:
+                        _ws_e = _wb_e[_sname_e]
+                        for _row_e in _ws_e.iter_rows(min_row=1, max_row=20, values_only=True):
+                            if not _row_e or len(_row_e) < 2:
+                                continue
+                            # Key kann in Spalte A (row[0]) oder B (row[1]) stehen
+                            _key_e = ''
+                            _val_start_e = 1
+                            if _row_e[0] is not None and str(_row_e[0]).strip():
+                                _key_e = str(_row_e[0]).strip().lower()
+                                _val_start_e = 1
+                            elif _row_e[1] is not None and str(_row_e[1]).strip():
+                                _key_e = str(_row_e[1]).strip().lower()
+                                _val_start_e = 2
+                            if not _key_e:
+                                continue
+                            # Wert: erste nicht-leere Zelle ab _val_start_e (bis Spalte 6)
+                            _val_e = ''
+                            for _ci_e in range(_val_start_e, min(len(_row_e), 6)):
+                                if _row_e[_ci_e] is not None and str(_row_e[_ci_e]).strip():
+                                    _val_e = str(_row_e[_ci_e]).strip()
+                                    break
+                            if any(kw in _key_e for kw in _contract_kws) and \
+                               re.match(r'^[A-Z]{0,3}\d{6,18}$', _val_e):
+                                global_contract = _val_e
+                                break
+                        if global_contract != "Unbekannt":
+                            break
+                    _wb_e.close()
+                except Exception:
+                    pass
+
             datei.seek(0)
             try:
                 df_fast = pd.read_excel(datei, sheet_name=0)
@@ -3220,6 +3261,37 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                                 df_quick_std['Contract Number'] = fn_match2.group(1).upper()
                             elif global_contract != "Unbekannt":
                                 df_quick_std['Contract Number'] = global_contract
+                        # POL aus Metadaten-Zeile vor dem Header (z.B. MSC: "Ports of Loading | Hamburg, ...")
+                        if ('Port of Loading' not in df_quick_std.columns or
+                                df_quick_std['Port of Loading'].astype(str).str.strip()
+                                .replace({'nan': '', 'None': ''}).eq('').all()) \
+                                and quick_header_idx and quick_header_idx > 0:
+                            for _mi in range(quick_header_idx):
+                                _mr = df_preview.iloc[_mi].tolist()
+                                # Key kann in Spalte A oder B stehen
+                                _mk = ''
+                                _mv_start_col = 1
+                                _a = str(_mr[0]).strip() if _mr and _mr[0] is not None else ''
+                                if _a and _a.lower() not in {'nan', 'none', ''}:
+                                    _mk = _a.lower()
+                                    _mv_start_col = 1
+                                elif len(_mr) > 1 and _mr[1] is not None:
+                                    _b = str(_mr[1]).strip()
+                                    if _b and _b.lower() not in {'nan', 'none', ''}:
+                                        _mk = _b.lower()
+                                        _mv_start_col = 2
+                                # Wert: erste nicht-leere Zelle ab _mv_start_col
+                                _mv = ''
+                                for _mci in range(_mv_start_col, min(len(_mr), 8)):
+                                    _mcv_raw = _mr[_mci]
+                                    if _mcv_raw is not None:
+                                        _mcv = str(_mcv_raw).strip()
+                                        if _mcv and _mcv.lower() not in {'nan', 'none', ''}:
+                                            _mv = _mcv
+                                            break
+                                if any(x in _mk for x in ['port of loading', 'ports of loading', 'pol']) and _mv:
+                                    df_quick_std['Port of Loading'] = _mv
+                                    break
                         if 'Carrier' not in df_quick_std.columns:
                             _fn_low_qt = datei.name.lower()
                             _qt_hints = {
@@ -3605,28 +3677,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if fn_match := re.search(r'(?:contract|ext\.\s+sul)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
                 global_contract = fn_match.group(1)
 
-        # Maersk-Metadaten-Scan: Contract Number steht in den ersten ~10 Zeilen der Excel-Datei
-        # (z.B. Maersk "Tender Quote"-Sheet Row 3: "Contract Number" | "299592520")
-        if global_contract == "Unbekannt" and datei.name.lower().endswith('.xlsx'):
-            try:
-                datei.seek(0)
-                import openpyxl as _openpyxl
-                _wb = _openpyxl.load_workbook(datei, read_only=True, data_only=True)
-                for _sname in _wb.sheetnames:
-                    _ws = _wb[_sname]
-                    for _row in _ws.iter_rows(min_row=1, max_row=10, values_only=True):
-                        if not _row or len(_row) < 2:
-                            continue
-                        key_val = str(_row[0]).strip().lower() if _row[0] is not None else ''
-                        cell_val = str(_row[1]).strip() if _row[1] is not None else ''
-                        if 'contract' in key_val and 'number' in key_val and re.match(r'^\d{6,12}$', cell_val):
-                            global_contract = cell_val
-                            break
-                    if global_contract != "Unbekannt":
-                        break
-                _wb.close()
-            except Exception:
-                pass
+        # (Der Metadaten-Scan für global_contract läuft bereits im xlsx-Early-Block oben.)
 
         # --- Maersk-Format Check ---
         charge_col = None
