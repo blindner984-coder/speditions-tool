@@ -4736,10 +4736,9 @@ def speichere_dataframe_batchweise(df_upload):
 
 
 # --- TABS FÜR UI ---
-tab_suche, tab_upload, tab_analytics, tab_zuschlaege, tab_pickup = st.tabs([
+tab_suche, tab_upload, tab_zuschlaege, tab_pickup = st.tabs([
     "🔍 Raten suchen",
     "⚙️ Daten hochladen (Admin)",
-    "📈 Analytics",
     "🧾 Zuschlägen",
     "📦 PICK UP",
 ])
@@ -5020,55 +5019,7 @@ with tab_upload:
         st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
 
 
-# === TAB 3: ANALYTICS ===
-with tab_analytics:
-    st.write("### 📈 Preisentwicklung einer Route")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        analytics_pol = st.text_input("Port of Loading (POL)", placeholder="z.B. Hamburg", key="analytics_pol")
-    with col_b:
-        analytics_pod = st.text_input("Port of Destination (POD)", placeholder="z.B. Jeddah", key="analytics_pod")
-
-    if st.button("📊 Trend analysieren", type="primary"):
-        if not analytics_pol.strip() or not analytics_pod.strip():
-            st.warning("Bitte POL und POD eingeben.")
-        else:
-            df_trend, _ = lade_raten_aus_db(such_pol=analytics_pol.strip(), such_pod=analytics_pod.strip())
-            if df_trend.empty:
-                st.warning(f"Keine Daten gefunden für {analytics_pol} → {analytics_pod}.")
-            else:
-                df_trend['Valid from dt'] = pd.to_datetime(df_trend.get('Valid from dt', df_trend.get('Valid from')), dayfirst=True, errors='coerce')
-                df_trend = df_trend.dropna(subset=['Valid from dt', '40HC'])
-                if df_trend.empty:
-                    st.warning("Keine verwertbaren Datensätze (fehlende Datum- oder Preisangaben).")
-                else:
-                    df_trend['All-In EUR'] = df_trend.apply(
-                        lambda r: berechne_total_eur_dynamic(r, '40HC', 'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC', r.name, include_all_collect=True),
-                        axis=1
-                    )
-                    df_trend = df_trend.sort_values('Valid from dt')
-
-                    st.markdown("---")
-                    kpi1, kpi2, kpi3 = st.columns(3)
-                    min_preis = df_trend['All-In EUR'].min()
-                    avg_preis = df_trend['All-In EUR'].mean()
-
-                    kpi1.metric("🟢 Historischer Bestpreis", f"{min_preis:.2f} €")
-                    kpi2.metric("🟡 Durchschnittspreis", f"{avg_preis:.2f} €")
-                    kpi3.metric("📋 Analysierte Raten", f"{len(df_trend)}")
-
-                    # --- TOP 3 RATEN TABELLE ---
-                    st.write("#### 🏆 Die 3 historisch günstigsten Raten")
-                    top_3 = df_trend.sort_values('All-In EUR').head(3)
-
-                    st.dataframe(
-                        top_3[['Carrier', 'Contract Number', 'Valid from', 'Valid to', 'All-In EUR']],
-                        width="stretch",
-                        hide_index=True
-                    )
-
-
-# === TAB 4: ZUSCHLÄGE ===
+# === TAB 3: ZUSCHLÄGE ===
 with tab_zuschlaege:
     is_admin_zuschlaege = admin_login_bereich("zuschlaege")
 
