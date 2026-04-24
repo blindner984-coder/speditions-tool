@@ -1416,6 +1416,39 @@ def dedupliziere_surcharge_string(text):
     return ", ".join(dedupliziere_eintraege(teile))
 
 
+def verschiebe_fremdwaehrungen_zu_collect(prepaid_text, collect_text):
+    def _split_entries(text):
+        if not isinstance(text, str) or not text.strip():
+            return []
+        return [
+            t.strip()
+            for t in re.split(
+                r";|\n|,(?=\s*[A-Z0-9]{2,10}(?:\s*\[[^\]]+\])?\s*\([A-Z]+\)\s*=)",
+                text,
+            )
+            if t.strip()
+        ]
+
+    prepaid_entries = _split_entries(prepaid_text)
+    collect_entries = _split_entries(collect_text)
+
+    neue_prepaid = []
+    neue_collect = list(collect_entries)
+
+    for entry in prepaid_entries:
+        waehrung_match = re.search(r"=\s*[-\d.,]+\s*([A-Z]{3})\b", entry)
+        waehrung = waehrung_match.group(1).upper() if waehrung_match else ''
+        if waehrung and waehrung not in {'EUR', 'USD'}:
+            neue_collect.append(entry)
+        else:
+            neue_prepaid.append(entry)
+
+    return (
+        ", ".join(dedupliziere_eintraege(neue_prepaid)),
+        ", ".join(dedupliziere_eintraege(neue_collect)),
+    )
+
+
 def extrahiere_mehrfach_pols(pol_text):
     text = str(pol_text or "").strip()
     if not text:
@@ -2456,6 +2489,18 @@ def normalisiere_upload_dataframe(df_upload):
         out['Included Prepaid Surcharges 40HC'] = ""
     if 'Included Collect Surcharges 40HC' not in out.columns:
         out['Included Collect Surcharges 40HC'] = ""
+
+    if {'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC'}.issubset(out.columns):
+        repartitioniert = out.apply(
+            lambda row: verschiebe_fremdwaehrungen_zu_collect(
+                row.get('Included Prepaid Surcharges 40HC', ''),
+                row.get('Included Collect Surcharges 40HC', ''),
+            ),
+            axis=1,
+            result_type='expand',
+        )
+        repartitioniert.columns = ['Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC']
+        out[['Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC']] = repartitioniert
 
     # Fachregel: Die Zeile "Included Prepaid Surcharges 40HC" gehoert zu PREPAID-Kosten
     # und bleibt daher immer in der Prepaid-Spalte.
