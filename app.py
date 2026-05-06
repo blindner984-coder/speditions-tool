@@ -1035,26 +1035,32 @@ def baue_zuschlag_gruppen_query(such_contract="", such_carrier=""):
     return query
 
 
-def baue_zuschlag_update_query(gruppe):
+def baue_zuschlag_update_query(gruppe, such_pol="", such_pod=""):
     import_batch_id = str(gruppe.get('importBatchId') or '').strip()
     source_file = str(gruppe.get('sourceFile') or '').strip()
     carrier = str(gruppe.get('carrier') or '').strip()
     contract_number = str(gruppe.get('contractNumber') or '').strip()
 
     if import_batch_id:
-        return {'importBatchId': import_batch_id}
-
-    if source_file:
-        return {
+        query = {'importBatchId': import_batch_id}
+    elif source_file:
+        query = {
             'sourceFile': source_file,
             'Carrier': carrier,
             'Contract Number': contract_number,
         }
+    else:
+        query = {
+            'Carrier': carrier,
+            'Contract Number': contract_number,
+        }
 
-    return {
-        'Carrier': carrier,
-        'Contract Number': contract_number,
-    }
+    if str(such_pol).strip():
+        query['Port of Loading'] = {'$regex': re.escape(str(such_pol).strip()), '$options': 'i'}
+    if str(such_pod).strip():
+        query['Port of Destination'] = {'$regex': re.escape(str(such_pod).strip()), '$options': 'i'}
+
+    return query
 
 
 @st.cache_data(ttl=60)
@@ -1111,7 +1117,7 @@ def lade_zuschlag_gruppen(such_contract="", such_carrier="", fetch_limit=5000):
 
 
 @st.cache_data(ttl=60)
-def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carrier="", contractNumber="", limit=50):
+def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carrier="", contractNumber="", such_pol="", such_pod="", limit=50):
     gruppe = {
         'groupKey': groupKey,
         'importBatchId': importBatchId,
@@ -1120,7 +1126,7 @@ def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carr
         'contractNumber': contractNumber,
     }
     rows = list(collection.find(
-        baue_zuschlag_update_query(gruppe),
+        baue_zuschlag_update_query(gruppe, such_pol=such_pol, such_pod=such_pod),
         {'_id': 0, 'Port of Loading': 1, 'Port of Destination': 1}
     ).limit(int(limit)))
     if not rows:
@@ -1128,9 +1134,9 @@ def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carr
     return pd.DataFrame(rows).fillna('').drop_duplicates().reset_index(drop=True)
 
 
-def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text):
+def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text, such_pol="", such_pod=""):
     return collection.update_many(
-        baue_zuschlag_update_query(gruppe),
+        baue_zuschlag_update_query(gruppe, such_pol=such_pol, such_pod=such_pod),
         {
             '$set': {
                 'Included Prepaid Surcharges 40HC': dedupliziere_surcharge_string(prepaid_text),
@@ -5246,7 +5252,26 @@ with tab_zuschlaege:
                 )
                 gruppe = df_gruppen.iloc[gruppen_optionen.index(ausgewaehlte_gruppe_label)].to_dict()
 
-                st.info(f"Änderungen werden für {int(gruppe.get('rowCount', 0))} Datensätze des ausgewählten Ratenblatts übernommen.")
+                group_key = str(gruppe.get('groupKey', 'default'))
+                group_key_safe = re.sub(r'[^A-Za-z0-9_-]+', '_', group_key)
+
+                col_zf1, col_zf2 = st.columns(2)
+                with col_zf1:
+                    such_z_pol = st.text_input(
+                        "⚓ Abgangshafen (POL) Filter",
+                        placeholder="Optional, z.B. Hamburg",
+                        key=f"surcharge_filter_pol_{group_key_safe}",
+                    )
+                with col_zf2:
+                    such_z_pod = st.text_input(
+                        "🎯 Empfangshafen (POD) Filter",
+                        placeholder="Optional, z.B. Jebel Ali",
+                        key=f"surcharge_filter_pod_{group_key_safe}",
+                    )
+
+                update_query = baue_zuschlag_update_query(gruppe, such_pol=such_z_pol, such_pod=such_z_pod)
+                anzahl_treffer = collection.count_documents(update_query)
+                st.info(f"Änderungen werden für {anzahl_treffer} gefilterte Datensätze übernommen (Contract/Reederei + optionale POL/POD-Filter).")
 
                 preview_df = lade_zuschlag_routen_preview(
                     str(gruppe.get('groupKey', '')),
@@ -5254,10 +5279,14 @@ with tab_zuschlaege:
                     sourceFile=str(gruppe.get('sourceFile', '')),
                     carrier=str(gruppe.get('carrier', '')),
                     contractNumber=str(gruppe.get('contractNumber', '')),
+                    such_pol=such_z_pol,
+                    such_pod=such_z_pod,
                 )
                 if not preview_df.empty:
                     st.write("#### Betroffene Fahrgebiete")
                     st.dataframe(preview_df, width="stretch", hide_index=True)
+                else:
+                    st.warning("Keine Fahrgebiete für die aktuellen POL/POD-Filter gefunden.")
 
                 with st.form(f"surcharge_update_form_{gruppe.get('groupKey', 'default')}"):
                     neuer_prepaid_text = st.text_area(
@@ -5277,14 +5306,25 @@ with tab_zuschlaege:
                     speichern_zuschlaege = st.form_submit_button("💾 Zuschläge für ganzes Ratenblatt speichern", type="primary")
 
                 if speichern_zuschlaege:
-                    ergebnis_update = aktualisiere_zuschlaege_fuer_gruppe(gruppe, neuer_prepaid_text, neuer_collect_text)
+                    if anzahl_treffer <= 0:
+                        st.warning("Keine Treffer für die aktuelle Filterkombination. Es wurden keine Zuschläge geändert.")
+                        ergebnis_update = None
+                    else:
+                        ergebnis_update = aktualisiere_zuschlaege_fuer_gruppe(
+                            gruppe,
+                            neuer_prepaid_text,
+                            neuer_collect_text,
+                            such_pol=such_z_pol,
+                            such_pod=such_z_pod,
+                        )
                     lade_raten_aus_db.clear()
                     lade_importierte_dateien.clear()
                     lade_loeschbare_importgruppen.clear()
                     zaehle_legacy_eintraege_ohne_datei_metadata.clear()
                     lade_zuschlag_gruppen.clear()
                     lade_zuschlag_routen_preview.clear()
-                    st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
+                    if ergebnis_update is not None:
+                        st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
     else:
         st.info("Zuschlagsverwaltung ist gesperrt. Bitte als Admin anmelden.")
 
