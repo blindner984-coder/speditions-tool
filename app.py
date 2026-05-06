@@ -2212,6 +2212,186 @@ def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name):
     return pd.DataFrame(rows)
 
 
+def extrahiere_cosco_iet_excel(excel_dict, file_name):
+    """Spezial-Parser fuer COSCO-IET-Rate-Sheets mit fixer Spaltenlogik.
+
+    Erwartetes Layout (aus Nutzerdaten):
+    - Spalte B: POL (forward fill)
+    - Spalte D: POD
+    - Spalte G: 40HC-Rate
+    - Spalten I-N: Surcharges / Hinweise
+    - Spalte O: Contract/Agreement Number
+    """
+    file_name_low = str(file_name or '').lower()
+    if 'cosco' not in file_name_low:
+        return None
+    if not any(x in file_name_low for x in ['iet', 'paper', 'pulp', 'forestry']):
+        return None
+
+    if not excel_dict:
+        return None
+
+    first_sheet_name = next(iter(excel_dict.keys()), None)
+    if not first_sheet_name:
+        return None
+
+    df_sheet = excel_dict.get(first_sheet_name)
+    if df_sheet is None or df_sheet.empty:
+        return None
+
+    valid_from = None
+    valid_to = None
+    base_currency = 'EUR'
+    agreement_default = 'Unbekannt'
+    header_idx = None
+    surcharge_header_row = None
+    surcharge_unit_row = None
+
+    for i in range(min(len(df_sheet), 80)):
+        b_val = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip()
+        c_val = str(df_sheet.iat[i, 2] if df_sheet.shape[1] > 2 else '').strip()
+        d_val = str(df_sheet.iat[i, 3] if df_sheet.shape[1] > 3 else '').strip()
+        b_low = b_val.lower()
+
+        if b_low == 'validity' and c_val:
+            dts = re.findall(r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', c_val)
+            if len(dts) >= 2:
+                valid_from = parse_datum_standard(dts[0])
+                valid_to = parse_datum_standard(dts[1])
+
+        if b_low == 'currency' and c_val:
+            cur = c_val.strip().upper()
+            if re.fullmatch(r'[A-Z]{3}', cur):
+                base_currency = cur
+
+        if b_low == 'agreement number' and c_val:
+            m_contract = re.search(r'([A-Z]{0,3}\d{5,}[A-Z0-9-]*)', c_val.upper())
+            if m_contract:
+                agreement_default = m_contract.group(1)
+
+        if b_low == 'pol' and d_val.lower() == 'pod':
+            header_idx = i
+            surcharge_header_row = i + 1
+            surcharge_unit_row = i + 2
+            break
+
+    if header_idx is None:
+        return None
+
+    surcharge_columns = []
+    # I..N = Spaltenindex 8..13 (0-basiert)
+    for col_idx in range(8, min(df_sheet.shape[1], 14)):
+        head = str(df_sheet.iat[surcharge_header_row, col_idx] if surcharge_header_row < len(df_sheet) else '').strip()
+        unit = str(df_sheet.iat[surcharge_unit_row, col_idx] if surcharge_unit_row < len(df_sheet) else '').strip()
+        if not head or head.lower() in {'nan', 'none'}:
+            continue
+        head_low = head.lower()
+        unit_low = unit.lower()
+
+        factor_40hc = 2.0 if 'per teu' in head_low or 'per teu' in unit_low else 1.0
+        col_currency = base_currency
+        m_cur = re.search(r'\b(USD|EUR|GBP|CNY|JPY|TRY|INR|AED|SAR|TWD|MYR)\b', f"{head} {unit}", re.IGNORECASE)
+        if m_cur:
+            col_currency = m_cur.group(1).upper()
+
+        surcharge_columns.append({
+            'idx': col_idx,
+            'label': head,
+            'factor': factor_40hc,
+            'currency': col_currency,
+            'is_textual': any(x in head_low for x in ['further surcharge', 'further surcharges']),
+            # Spalte N (Index 13) muss fachlich immer Prepaid bleiben.
+            'force_prepaid': col_idx == 13,
+        })
+
+    rows = []
+    current_pol = ''
+    current_country = ''
+    current_contract = agreement_default
+
+    for i in range(header_idx + 3, len(df_sheet)):
+        pol_raw = str(df_sheet.iat[i, 1] if df_sheet.shape[1] > 1 else '').strip()
+        country_raw = str(df_sheet.iat[i, 2] if df_sheet.shape[1] > 2 else '').strip()
+        pod_raw = str(df_sheet.iat[i, 3] if df_sheet.shape[1] > 3 else '').strip()
+        rate_40hc_raw = df_sheet.iat[i, 6] if df_sheet.shape[1] > 6 else None
+        contract_raw = str(df_sheet.iat[i, 14] if df_sheet.shape[1] > 14 else '').strip()
+        service_raw = str(df_sheet.iat[i, 15] if df_sheet.shape[1] > 15 else '').strip()
+        term_raw = str(df_sheet.iat[i, 16] if df_sheet.shape[1] > 16 else '').strip()
+        restriction_raw = str(df_sheet.iat[i, 17] if df_sheet.shape[1] > 17 else '').strip()
+
+        if pol_raw and pol_raw.lower() not in {'nan', 'none'}:
+            current_pol = pol_raw
+        if country_raw and country_raw.lower() not in {'nan', 'none'} and not country_raw.startswith('**'):
+            current_country = country_raw
+        if contract_raw and contract_raw.lower() not in {'nan', 'none'}:
+            current_contract = contract_raw
+
+        if not pod_raw or pod_raw.lower() in {'nan', 'none', 'pod'}:
+            continue
+
+        # Keine Datenzeile (Hinweiszeile) ohne echte 40HC-Rate ignorieren.
+        if isinstance(rate_40hc_raw, str) and 'no service' in rate_40hc_raw.lower():
+            continue
+
+        rate_40hc = parse_decimal_wert(rate_40hc_raw)
+        if rate_40hc is None or rate_40hc <= 0:
+            continue
+
+        prepaid_entries = []
+        collect_entries = []
+
+        for s_col in surcharge_columns:
+            cell_val = df_sheet.iat[i, s_col['idx']] if s_col['idx'] < df_sheet.shape[1] else None
+            if s_col['is_textual']:
+                txt = str(cell_val or '').strip()
+                if txt and txt.lower() not in {'nan', 'none'}:
+                    prepaid_entries.append(txt)
+                continue
+
+            amount = parse_decimal_wert(cell_val)
+            if amount is None or amount <= 0:
+                continue
+
+            amount_40hc = amount * float(s_col['factor'])
+            entry = f"{s_col['label']} = {amount_40hc:.2f} {s_col['currency']}"
+
+            if s_col.get('force_prepaid'):
+                prepaid_entries.append(entry)
+            elif s_col['currency'] in {'USD', 'EUR'}:
+                prepaid_entries.append(entry)
+            else:
+                collect_entries.append(entry)
+
+        remark_parts = []
+        if current_country:
+            remark_parts.append(f"Country: {current_country}")
+        if service_raw and service_raw.lower() not in {'nan', 'none'}:
+            remark_parts.append(f"Service: {service_raw}")
+        if term_raw and term_raw.lower() not in {'nan', 'none'}:
+            remark_parts.append(f"Term: {term_raw}")
+        if restriction_raw and restriction_raw.lower() not in {'nan', 'none'}:
+            remark_parts.append(str(restriction_raw))
+
+        rows.append({
+            'Carrier': 'COSCO',
+            'Contract Number': current_contract if current_contract else agreement_default,
+            'Port of Loading': current_pol if current_pol else 'Unbekannt',
+            'Port of Destination': pod_raw,
+            'Valid from': valid_from,
+            'Valid to': valid_to,
+            '40HC': rate_40hc,
+            'Currency': base_currency,
+            'Included Prepaid Surcharges 40HC': ', '.join(dedupliziere_eintraege(prepaid_entries)),
+            'Included Collect Surcharges 40HC': ', '.join(dedupliziere_eintraege(collect_entries)),
+            'Remark': ' | '.join(remark_parts),
+        })
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows)
+
+
 def normalisiere_upload_dataframe(df_upload):
     out = df_upload.copy()
 
@@ -3776,6 +3956,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             try:
                 excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
                 for _early_parser, _early_name in [
+                    (extrahiere_cosco_iet_excel, 'Excel (COSCO-IET-LOCKED)'),
                     (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)'),
                     (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)'),
                     (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
