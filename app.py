@@ -13,8 +13,9 @@ import requests
 import pymongo
 from pymongo.errors import BulkWriteError
 from pathlib import Path
+from collections import Counter
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Any
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -1145,29 +1146,34 @@ def baue_zuschlag_gruppen_query(such_contract="", such_carrier=""):
     return query
 
 
-def baue_zuschlag_update_query(gruppe, such_pol="", such_pod=""):
+def baue_zuschlag_update_query(gruppe, such_pol="", such_pod="", exact_pol="", exact_pod=""):
     import_batch_id = str(gruppe.get('importBatchId') or '').strip()
     source_file = str(gruppe.get('sourceFile') or '').strip()
     carrier = str(gruppe.get('carrier') or '').strip()
     contract_number = str(gruppe.get('contractNumber') or '').strip()
 
+    query: Any = {}
     if import_batch_id:
-        query = {'importBatchId': import_batch_id}
+        query['importBatchId'] = import_batch_id
     elif source_file:
-        query = {
-            'sourceFile': source_file,
-            'Carrier': carrier,
-            'Contract Number': contract_number,
-        }
+        query['sourceFile'] = source_file
+        query['Carrier'] = carrier
+        query['Contract Number'] = contract_number
     else:
-        query = {
-            'Carrier': carrier,
-            'Contract Number': contract_number,
-        }
+        query['Carrier'] = carrier
+        query['Contract Number'] = contract_number
 
-    if str(such_pol).strip():
+    exact_pol_text = str(exact_pol).strip()
+    exact_pod_text = str(exact_pod).strip()
+
+    if exact_pol_text:
+        query['Port of Loading'] = {'$regex': f"^{re.escape(exact_pol_text)}$", '$options': 'i'}
+    elif str(such_pol).strip():
         query['Port of Loading'] = {'$regex': re.escape(str(such_pol).strip()), '$options': 'i'}
-    if str(such_pod).strip():
+
+    if exact_pod_text:
+        query['Port of Destination'] = {'$regex': f"^{re.escape(exact_pod_text)}$", '$options': 'i'}
+    elif str(such_pod).strip():
         query['Port of Destination'] = {'$regex': re.escape(str(such_pod).strip()), '$options': 'i'}
 
     return query
@@ -1244,9 +1250,56 @@ def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carr
     return pd.DataFrame(rows).fillna('').drop_duplicates().reset_index(drop=True)
 
 
-def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text, such_pol="", such_pod=""):
+@st.cache_data(ttl=60)
+def lade_zuschlag_werte_fuer_filter(gruppe, such_pol="", such_pod="", exact_pol="", exact_pod="", limit=1000):
+    rows = list(collection.find(
+        baue_zuschlag_update_query(
+            gruppe,
+            such_pol=such_pol,
+            such_pod=such_pod,
+            exact_pol=exact_pol,
+            exact_pod=exact_pod,
+        ),
+        {
+            '_id': 0,
+            'Port of Loading': 1,
+            'Port of Destination': 1,
+            'Included Prepaid Surcharges 40HC': 1,
+            'Included Collect Surcharges 40HC': 1,
+        }
+    ).limit(int(limit)))
+    if not rows:
+        return pd.DataFrame(columns=[
+            'Port of Loading',
+            'Port of Destination',
+            'Included Prepaid Surcharges 40HC',
+            'Included Collect Surcharges 40HC',
+        ])
+    return pd.DataFrame(rows).fillna('')
+
+
+def ermittle_haeufigsten_zuschlagstext(df, column_name):
+    if df is None or df.empty or column_name not in df.columns:
+        return ""
+    werte = []
+    for value in df[column_name].tolist():
+        text = dedupliziere_surcharge_string(str(value or '').strip())
+        if text:
+            werte.append(text)
+    if not werte:
+        return ""
+    return Counter(werte).most_common(1)[0][0]
+
+
+def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text, such_pol="", such_pod="", exact_pol="", exact_pod=""):
     return collection.update_many(
-        baue_zuschlag_update_query(gruppe, such_pol=such_pol, such_pod=such_pod),
+        baue_zuschlag_update_query(
+            gruppe,
+            such_pol=such_pol,
+            such_pod=such_pod,
+            exact_pol=exact_pol,
+            exact_pod=exact_pod,
+        ),
         {
             '$set': {
                 'Included Prepaid Surcharges 40HC': dedupliziere_surcharge_string(prepaid_text),
@@ -5370,8 +5423,8 @@ with tab_zuschlaege:
     is_admin_zuschlaege = admin_login_bereich("zuschlaege")
 
     if is_admin_zuschlaege:
-        st.write("### 🧾 Zuschläge für ein ganzes Ratenblatt bearbeiten")
-        st.caption("Suche nach Contract-/Quotationnummer oder Reederei und übernimm Änderungen für alle Fahrgebiete des ausgewählten Ratenblatts.")
+        st.write("### 🧾 Zuschläge für ein Fahrgebiet bearbeiten")
+        st.caption("Suche nach Contract-/Quotationnummer oder Reederei, wähle danach ein exaktes Fahrgebiet (POL → POD) und übernimm Änderungen nur für diese Route.")
 
         col_z1, col_z2 = st.columns(2)
         with col_z1:
@@ -5428,10 +5481,6 @@ with tab_zuschlaege:
                         key=f"surcharge_filter_pod_{group_key_safe}",
                     )
 
-                update_query = baue_zuschlag_update_query(gruppe, such_pol=such_z_pol, such_pod=such_z_pod)
-                anzahl_treffer = collection.count_documents(update_query)
-                st.info(f"Änderungen werden für {anzahl_treffer} gefilterte Datensätze übernommen (Contract/Reederei + optionale POL/POD-Filter).")
-
                 preview_df = lade_zuschlag_routen_preview(
                     str(gruppe.get('groupKey', '')),
                     importBatchId=str(gruppe.get('importBatchId', '')),
@@ -5441,28 +5490,79 @@ with tab_zuschlaege:
                     such_pol=such_z_pol,
                     such_pod=such_z_pod,
                 )
+
+                exact_pol = ""
+                exact_pod = ""
                 if not preview_df.empty:
                     st.write("#### Betroffene Fahrgebiete")
                     st.dataframe(preview_df, width="stretch", hide_index=True)
+
+                    route_options = []
+                    for _, row in preview_df.iterrows():
+                        pol = str(row.get('Port of Loading', '') or '').strip()
+                        pod = str(row.get('Port of Destination', '') or '').strip()
+                        route_options.append((pol, pod, f"{pol} -> {pod}"))
+
+                    selected_route_label = st.selectbox(
+                        "Fahrgebiet für Bearbeitung auswählen (exakt)",
+                        options=[option[2] for option in route_options],
+                        key=f"surcharge_exact_route_{group_key_safe}",
+                    )
+
+                    selected_route = route_options[[option[2] for option in route_options].index(selected_route_label)]
+                    exact_pol = selected_route[0]
+                    exact_pod = selected_route[1]
                 else:
                     st.warning("Keine Fahrgebiete für die aktuellen POL/POD-Filter gefunden.")
+
+                update_query = baue_zuschlag_update_query(
+                    gruppe,
+                    such_pol=such_z_pol,
+                    such_pod=such_z_pod,
+                    exact_pol=exact_pol,
+                    exact_pod=exact_pod,
+                )
+                anzahl_treffer = collection.count_documents(update_query)
+                st.info(
+                    f"Änderungen werden für {anzahl_treffer} Datensatz/Datensätze übernommen "
+                    f"(exakte Route: {exact_pol or '-'} -> {exact_pod or '-'})."
+                )
+
+                edit_df = lade_zuschlag_werte_fuer_filter(
+                    gruppe,
+                    such_pol=such_z_pol,
+                    such_pod=such_z_pod,
+                    exact_pol=exact_pol,
+                    exact_pod=exact_pod,
+                )
+                vorbelegt_prepaid = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Prepaid Surcharges 40HC')
+                vorbelegt_collect = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Collect Surcharges 40HC')
+
+                if not edit_df.empty:
+                    unique_prepaid = edit_df['Included Prepaid Surcharges 40HC'].astype(str).str.strip().replace('', pd.NA).dropna().nunique()
+                    unique_collect = edit_df['Included Collect Surcharges 40HC'].astype(str).str.strip().replace('', pd.NA).dropna().nunique()
+                    if unique_prepaid > 1 or unique_collect > 1:
+                        st.warning(
+                            "Für die aktuelle Auswahl existieren mehrere unterschiedliche Zuschlagsstände. "
+                            "Die Eingabefelder wurden mit dem häufigsten Stand vorbelegt."
+                        )
 
                 with st.form(f"surcharge_update_form_{gruppe.get('groupKey', 'default')}"):
                     neuer_prepaid_text = st.text_area(
                         "Included Prepaid Surcharges 40HC",
-                        value=str(gruppe.get('prepaidSurcharges', '') or ''),
+                        value=vorbelegt_prepaid,
                         height=180,
                     )
                     neuer_collect_text = st.text_area(
                         "Included Collect Surcharges 40HC",
-                        value=str(gruppe.get('collectSurcharges', '') or ''),
+                        value=vorbelegt_collect,
                         height=140,
                     )
                     st.caption(
                         f"Erkannte Prepaid-Zuschläge: {len(berechne_gebuehren(neuer_prepaid_text))} | "
                         f"Collect-Zuschläge: {len(berechne_gebuehren(neuer_collect_text))}"
                     )
-                    speichern_zuschlaege = st.form_submit_button("💾 Zuschläge für ganzes Ratenblatt speichern", type="primary")
+                    speichern_zuschlaege = st.form_submit_button("💾 Zuschläge für ausgewähltes Fahrgebiet speichern", type="primary")
 
                 if speichern_zuschlaege:
                     if anzahl_treffer <= 0:
@@ -5475,6 +5575,8 @@ with tab_zuschlaege:
                             neuer_collect_text,
                             such_pol=such_z_pol,
                             such_pod=such_z_pod,
+                            exact_pol=exact_pol,
+                            exact_pod=exact_pod,
                         )
                     lade_raten_aus_db.clear()
                     lade_importierte_dateien.clear()
@@ -5482,6 +5584,7 @@ with tab_zuschlaege:
                     zaehle_legacy_eintraege_ohne_datei_metadata.clear()
                     lade_zuschlag_gruppen.clear()
                     lade_zuschlag_routen_preview.clear()
+                    lade_zuschlag_werte_fuer_filter.clear()
                     if ergebnis_update is not None:
                         st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
     else:
