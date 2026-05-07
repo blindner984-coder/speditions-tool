@@ -1309,6 +1309,50 @@ def aktualisiere_zuschlaege_fuer_gruppe(gruppe, prepaid_text, collect_text, such
     )
 
 
+def aktualisiere_zuschlaege_fuer_routen(gruppe, routen_liste, prepaid_text, collect_text):
+    """Aktualisiert Zuschläge für eine Liste von (pol, pod)-Tupeln in einem einzigen Update-Aufruf."""
+    import_batch_id = str(gruppe.get('importBatchId') or '').strip()
+    source_file = str(gruppe.get('sourceFile') or '').strip()
+    carrier = str(gruppe.get('carrier') or '').strip()
+    contract_number = str(gruppe.get('contractNumber') or '').strip()
+
+    basis_query: Any = {}
+    if import_batch_id:
+        basis_query['importBatchId'] = import_batch_id
+    elif source_file:
+        basis_query['sourceFile'] = source_file
+        basis_query['Carrier'] = carrier
+        basis_query['Contract Number'] = contract_number
+    else:
+        basis_query['Carrier'] = carrier
+        basis_query['Contract Number'] = contract_number
+
+    routen_filter = []
+    for (pol, pod) in routen_liste:
+        routen_filter.append({
+            'Port of Loading': {'$regex': f'^{re.escape(pol)}$', '$options': 'i'},
+            'Port of Destination': {'$regex': f'^{re.escape(pod)}$', '$options': 'i'},
+        })
+
+    if not routen_filter:
+        return None
+
+    if len(routen_filter) == 1:
+        query = {**basis_query, **routen_filter[0]}
+    else:
+        query = {**basis_query, '$or': routen_filter}
+
+    return collection.update_many(
+        query,
+        {
+            '$set': {
+                'Included Prepaid Surcharges 40HC': dedupliziere_surcharge_string(prepaid_text),
+                'Included Collect Surcharges 40HC': dedupliziere_surcharge_string(collect_text),
+            }
+        }
+    )
+
+
 def formatiere_datum_fuer_header(value):
     # 1. Fängt leere Werte ab (None, NaN, NaT)
     if pd.isna(value):
@@ -5491,11 +5535,9 @@ with tab_zuschlaege:
                     such_pod=such_z_pod,
                 )
 
-                exact_pol = ""
-                exact_pod = ""
+                ausgewaehlte_routen: list = []
                 if not preview_df.empty:
                     st.write("#### Betroffene Fahrgebiete")
-                    st.dataframe(preview_df, width="stretch", hide_index=True)
 
                     route_options = []
                     for _, row in preview_df.iterrows():
@@ -5503,49 +5545,43 @@ with tab_zuschlaege:
                         pod = str(row.get('Port of Destination', '') or '').strip()
                         route_options.append((pol, pod, f"{pol} -> {pod}"))
 
-                    selected_route_label = st.selectbox(
-                        "Fahrgebiet für Bearbeitung auswählen (exakt)",
-                        options=[option[2] for option in route_options],
-                        key=f"surcharge_exact_route_{group_key_safe}",
+                    alle_labels = [opt[2] for opt in route_options]
+
+                    ausgewaehlte_labels = st.multiselect(
+                        "Fahrgebiete für Bearbeitung auswählen (Mehrfachauswahl möglich)",
+                        options=alle_labels,
+                        default=alle_labels,
+                        key=f"surcharge_multi_route_{group_key_safe}",
                     )
 
-                    selected_route = route_options[[option[2] for option in route_options].index(selected_route_label)]
-                    exact_pol = selected_route[0]
-                    exact_pod = selected_route[1]
+                    ausgewaehlte_routen = [
+                        (opt[0], opt[1])
+                        for opt in route_options
+                        if opt[2] in ausgewaehlte_labels
+                    ]
                 else:
                     st.warning("Keine Fahrgebiete für die aktuellen POL/POD-Filter gefunden.")
 
-                update_query = baue_zuschlag_update_query(
-                    gruppe,
-                    such_pol=such_z_pol,
-                    such_pod=such_z_pod,
-                    exact_pol=exact_pol,
-                    exact_pod=exact_pod,
-                )
-                anzahl_treffer = collection.count_documents(update_query)
-                st.info(
-                    f"Änderungen werden für {anzahl_treffer} Datensatz/Datensätze übernommen "
-                    f"(exakte Route: {exact_pol or '-'} -> {exact_pod or '-'})."
-                )
+                # Treffer-Anzahl und Vorbelegung aus den ausgewählten Routen
+                if ausgewaehlte_routen:
+                    # Vorbelegung: Lade Zuschlagswerte der ersten ausgewählten Route als Referenz
+                    ref_pol, ref_pod = ausgewaehlte_routen[0]
+                    edit_df = lade_zuschlag_werte_fuer_filter(
+                        gruppe,
+                        exact_pol=ref_pol,
+                        exact_pod=ref_pod,
+                    )
+                    vorbelegt_prepaid = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Prepaid Surcharges 40HC')
+                    vorbelegt_collect = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Collect Surcharges 40HC')
 
-                edit_df = lade_zuschlag_werte_fuer_filter(
-                    gruppe,
-                    such_pol=such_z_pol,
-                    such_pod=such_z_pod,
-                    exact_pol=exact_pol,
-                    exact_pod=exact_pod,
-                )
-                vorbelegt_prepaid = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Prepaid Surcharges 40HC')
-                vorbelegt_collect = ermittle_haeufigsten_zuschlagstext(edit_df, 'Included Collect Surcharges 40HC')
-
-                if not edit_df.empty:
-                    unique_prepaid = edit_df['Included Prepaid Surcharges 40HC'].astype(str).str.strip().replace('', pd.NA).dropna().nunique()
-                    unique_collect = edit_df['Included Collect Surcharges 40HC'].astype(str).str.strip().replace('', pd.NA).dropna().nunique()
-                    if unique_prepaid > 1 or unique_collect > 1:
-                        st.warning(
-                            "Für die aktuelle Auswahl existieren mehrere unterschiedliche Zuschlagsstände. "
-                            "Die Eingabefelder wurden mit dem häufigsten Stand vorbelegt."
-                        )
+                    st.info(
+                        f"{len(ausgewaehlte_routen)} Fahrgebiet(e) ausgewählt. "
+                        "Die Zuschlagsfelder sind mit dem Stand der ersten ausgewählten Route vorbelegt."
+                    )
+                else:
+                    vorbelegt_prepaid = ""
+                    vorbelegt_collect = ""
+                    st.warning("Bitte mindestens ein Fahrgebiet auswählen.")
 
                 with st.form(f"surcharge_update_form_{gruppe.get('groupKey', 'default')}"):
                     neuer_prepaid_text = st.text_area(
@@ -5562,21 +5598,22 @@ with tab_zuschlaege:
                         f"Erkannte Prepaid-Zuschläge: {len(berechne_gebuehren(neuer_prepaid_text))} | "
                         f"Collect-Zuschläge: {len(berechne_gebuehren(neuer_collect_text))}"
                     )
-                    speichern_zuschlaege = st.form_submit_button("💾 Zuschläge für ausgewähltes Fahrgebiet speichern", type="primary")
+                    speichern_zuschlaege = st.form_submit_button(
+                        f"💾 Zuschläge für {len(ausgewaehlte_routen)} Fahrgebiet(e) speichern",
+                        type="primary",
+                        disabled=not ausgewaehlte_routen,
+                    )
 
                 if speichern_zuschlaege:
-                    if anzahl_treffer <= 0:
-                        st.warning("Keine Treffer für die aktuelle Filterkombination. Es wurden keine Zuschläge geändert.")
+                    if not ausgewaehlte_routen:
+                        st.warning("Keine Fahrgebiete ausgewählt. Es wurden keine Zuschläge geändert.")
                         ergebnis_update = None
                     else:
-                        ergebnis_update = aktualisiere_zuschlaege_fuer_gruppe(
+                        ergebnis_update = aktualisiere_zuschlaege_fuer_routen(
                             gruppe,
+                            ausgewaehlte_routen,
                             neuer_prepaid_text,
                             neuer_collect_text,
-                            such_pol=such_z_pol,
-                            such_pod=such_z_pod,
-                            exact_pol=exact_pol,
-                            exact_pod=exact_pod,
                         )
                     lade_raten_aus_db.clear()
                     lade_importierte_dateien.clear()
