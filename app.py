@@ -4706,6 +4706,24 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         mask = ziel_leer & quelle_ok
                         if mask.any():
                             df_raw.loc[mask, ziel] = df_raw.loc[mask, vorrang_col]
+
+                    # Extra-Regel für Port of Destination:
+                    # Wenn POD noch code-artige UN-LOCODE-Kürzel (2-6 Grossbuchstaben/Ziffern)
+                    # enthaelt UND Delivery echte Hafenbezeichnungen hat, immer Delivery nehmen.
+                    if ziel == 'Port of Destination':
+                        pod_vals = df_raw[ziel].astype(str).str.strip()
+                        delivery_vals = df_raw[vorrang_col].astype(str).str.strip()
+                        delivery_ok = ~delivery_vals.replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
+                        pod_is_code = pod_vals.str.fullmatch(r'[A-Z0-9]{2,6}', na=False)
+                        delivery_is_name = (
+                            ~delivery_vals.str.fullmatch(r'[A-Z0-9]{2,6}', na=False)
+                            & (delivery_vals.str.len() >= 3)
+                            & delivery_ok
+                        )
+                        override_mask = pod_is_code & delivery_is_name
+                        if override_mask.any():
+                            df_raw.loc[override_mask, ziel] = df_raw.loc[override_mask, vorrang_col]
+
             elif ziel not in df_raw.columns:
                 fallback_col = ermittle_erste_spalte(df_raw, ['Origin', 'Dest'] if 'Loading' in ziel else ['Dest', 'Origin'])
                 if fallback_col:
