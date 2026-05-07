@@ -921,6 +921,47 @@ def lade_raten_aus_db(such_pol="", such_pod="", such_contract="", fetch_limit=MA
     return pd.DataFrame(rows), ist_gekuerzt
 
 
+@st.cache_data(ttl=60)
+def ermittle_konflikte_aus_db_direkt(limit=1000):
+    """Findet Konflikte direkt per MongoDB-Aggregation – ohne Zeilen-Limit."""
+    pipeline = [
+        {'$addFields': {
+            '_ck':    {'$toUpper': {'$trim': {'input': {'$ifNull': ['$Contract Number', '']}}}},
+            '_polck': {'$toUpper': {'$trim': {'input': {'$ifNull': ['$Port of Loading', '']}}}},
+            '_podck': {'$toUpper': {'$trim': {'input': {'$ifNull': ['$Port of Destination', '']}}}},
+            '_vfk':   {'$trim': {'input': {'$ifNull': ['$Valid from', '']}}},
+            '_vtk':   {'$trim': {'input': {'$ifNull': ['$Valid to', '']}}},
+        }},
+        {'$group': {
+            '_id': {'ck': '$_ck', 'polck': '$_polck', 'podck': '$_podck', 'vfk': '$_vfk', 'vtk': '$_vtk'},
+            'sig_set': {'$addToSet': {
+                'basis': '$40HC',
+                'cur':   {'$ifNull': ['$Currency', '']},
+                'pre':   {'$ifNull': ['$Included Prepaid Surcharges 40HC', '']},
+                'col':   {'$ifNull': ['$Included Collect Surcharges 40HC', '']},
+            }},
+            'docs': {'$push': {
+                'Carrier':                           '$Carrier',
+                'Contract Number':                   '$Contract Number',
+                'Port of Loading':                   '$Port of Loading',
+                'Port of Destination':               '$Port of Destination',
+                'Valid from':                        '$Valid from',
+                'Valid to':                          '$Valid to',
+                '40HC':                              '$40HC',
+                'Currency':                          '$Currency',
+                'Included Prepaid Surcharges 40HC':  '$Included Prepaid Surcharges 40HC',
+                'Included Collect Surcharges 40HC':  '$Included Collect Surcharges 40HC',
+                'Remark':                            '$Remark',
+                'sourceFile':                        '$sourceFile',
+            }},
+        }},
+        {'$match': {'$expr': {'$gt': [{'$size': '$sig_set'}, 1]}}},
+        {'$sort': {'_id.ck': 1, '_id.polck': 1, '_id.podck': 1}},
+        {'$limit': int(limit)},
+    ]
+    return list(collection.aggregate(pipeline, allowDiskUse=True))
+
+
 def ermittle_abweichende_raten(df_input: pd.DataFrame) -> pd.DataFrame:
     if df_input is None or df_input.empty:
         return pd.DataFrame()
@@ -5423,6 +5464,7 @@ with tab_upload:
                             lade_importierte_dateien.clear()
                             lade_loeschbare_importgruppen.clear()
                             zaehle_legacy_eintraege_ohne_datei_metadata.clear()
+                            ermittle_konflikte_aus_db_direkt.clear()
                             st.success(f"✅ Super! {gespeichert} Raten-Zeilen wurden erfolgreich in die Datenbank geschrieben. Sie werden in 6 Monaten automatisch gelöscht.")
                             st.balloons()
                         else:
@@ -5462,6 +5504,7 @@ with tab_upload:
                 lade_importierte_dateien.clear()
                 lade_loeschbare_importgruppen.clear()
                 zaehle_legacy_eintraege_ohne_datei_metadata.clear()
+                ermittle_konflikte_aus_db_direkt.clear()
                 st.success(f"✅ Import-Datei gelöscht. Es wurden {ergebnis_file.deleted_count} Einträge entfernt.")
 
         st.markdown("---")
@@ -5473,6 +5516,7 @@ with tab_upload:
             lade_importierte_dateien.clear()
             lade_loeschbare_importgruppen.clear()
             zaehle_legacy_eintraege_ohne_datei_metadata.clear()
+            ermittle_konflikte_aus_db_direkt.clear()
             st.success(f"✅ Datenbank erfolgreich geleert! Es wurden {ergebnis_all.deleted_count} alte Einträge gelöscht.")
     else:
         st.info("Upload und Löschfunktionen sind gesperrt. Bitte als Admin anmelden.")
@@ -5638,6 +5682,7 @@ with tab_zuschlaege:
                     lade_zuschlag_gruppen.clear()
                     lade_zuschlag_routen_preview.clear()
                     lade_zuschlag_werte_fuer_filter.clear()
+                    ermittle_konflikte_aus_db_direkt.clear()
                     if ergebnis_update is not None:
                         st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
     else:
@@ -5658,50 +5703,66 @@ with tab_rate_checks:
     if not st.session_state.get('ratecheck_gestartet', False):
         st.info("Auf 'Jetzt prüfen' klicken um die gesamte Datenbank automatisch zu analysieren.")
     else:
-        with st.spinner("Lade alle Raten und suche nach Konflikten..."):
-            df_ratecheck, ist_gekuerzt_ratecheck = lade_raten_aus_db(fetch_limit=MAX_DB_FETCH)
+        with st.spinner("Analysiere Datenbank auf Konflikte..."):
+            alle_konflikte = ermittle_konflikte_aus_db_direkt()
 
-        if df_ratecheck is None or df_ratecheck.empty:
-            st.info("Die Datenbank ist leer.")
+        if not alle_konflikte:
+            st.success("Alles sauber: Keine doppelten Raten mit abweichenden Preisen gefunden.")
         else:
-            if ist_gekuerzt_ratecheck:
-                st.warning(
-                    f"Datenbank enthält mehr als {MAX_DB_FETCH} Raten – nur die ersten {MAX_DB_FETCH} wurden geprüft."
-                )
-
             whitelist = genehmigte_konflikte_laden()
-            df_konflikte = ermittle_abweichende_raten(df_ratecheck)
 
-            if not df_konflikte.empty and whitelist:
-                def ist_genehmigt(row):
-                    key = f"{row.get('Contract Number')}|{row.get('Valid from')}|{row.get('Valid to')}|{row.get('Port of Loading')}|{row.get('Port of Destination')}|{row.get('40HC')}|{row.get('Currency')}|{row.get('sourceFile')}"
-                    return key in whitelist
-                df_konflikte = df_konflikte[~df_konflikte.apply(ist_genehmigt, axis=1)].copy()
+            def ist_variante_genehmigt(doc, wl):
+                key = (
+                    f"{doc.get('Contract Number')}|{doc.get('Valid from')}|{doc.get('Valid to')}|"
+                    f"{doc.get('Port of Loading')}|{doc.get('Port of Destination')}|"
+                    f"{doc.get('40HC')}|{doc.get('Currency')}|{doc.get('sourceFile') or ''}"
+                )
+                return key in wl
 
-            if df_konflikte.empty:
+            # Deduplizieren + Whitelist anwenden
+            gefilterte_konflikte = []
+            for gruppe in alle_konflikte:
+                docs = gruppe.get('docs', [])
+                seen_sigs: set = set()
+                unique_docs = []
+                for doc in docs:
+                    sig = (
+                        f"{doc.get('40HC')}|{doc.get('Currency', '')}|"
+                        f"{doc.get('Included Prepaid Surcharges 40HC', '')}|"
+                        f"{doc.get('Included Collect Surcharges 40HC', '')}"
+                    )
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        unique_docs.append(doc)
+                if whitelist:
+                    unique_docs = [d for d in unique_docs if not ist_variante_genehmigt(d, whitelist)]
+                if len(unique_docs) > 1:
+                    gruppe['unique_docs'] = unique_docs
+                    gefilterte_konflikte.append(gruppe)
+
+            if not gefilterte_konflikte:
                 st.success("Alles sauber: Keine doppelten Raten mit abweichenden Preisen gefunden.")
             else:
-                gruppen_spalten = ['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key']
-                gruppen = list(df_konflikte.groupby(gruppen_spalten, dropna=False))
                 st.warning(
-                    f"⚠️ {len(gruppen)} Konflikt-Gruppe(n) gefunden – gleiche Contract + gleiche Gültigkeit + "
+                    f"⚠️ {len(gefilterte_konflikte)} Konflikt-Gruppe(n) gefunden – gleiche Contract + gleiche Gültigkeit + "
                     f"gleiche Route, aber unterschiedliche Preise."
                 )
 
-                for gruppe_index, (_, gruppe_df) in enumerate(gruppen, start=1):
-                    gruppe_df = gruppe_df.reset_index(drop=True)
-                    erste_zeile = gruppe_df.iloc[0]
+                for gruppe_index, gruppe in enumerate(gefilterte_konflikte, start=1):
+                    unique_docs = gruppe['unique_docs']
+                    erste_zeile = pd.Series(unique_docs[0])
                     valid_from_label = formatiere_datum_fuer_header(erste_zeile.get('Valid from'))
                     valid_to_label = formatiere_datum_fuer_header(erste_zeile.get('Valid to'))
                     label = (
                         f"📄 {erste_zeile.get('Contract Number', 'Unbekannt')} | "
                         f"{erste_zeile.get('Port of Loading', '?')} ➡️ {erste_zeile.get('Port of Destination', '?')} | "
                         f"📅 {valid_from_label} bis {valid_to_label} | "
-                        f"{int(erste_zeile.get('group_variants', 0) or 0)} Varianten"
+                        f"{len(unique_docs)} Varianten"
                     )
 
                     with st.expander(label, expanded=(gruppe_index <= 3)):
-                        for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
+                        for row_index, doc in enumerate(unique_docs, start=1):
+                            row = pd.Series(doc)
                             source_label = str(row.get('sourceFile') or '').strip()
                             header = f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**"
                             if source_label and source_label not in {'nan', 'None', ''}:
@@ -5734,13 +5795,14 @@ with tab_rate_checks:
                                     row.get('Port of Destination'),
                                     str(row.get('40HC')),
                                     row.get('Currency'),
-                                    str(row.get('sourceFile') or '')
+                                    str(row.get('sourceFile') or ''),
                                 ):
                                     st.success("Genehmigt! Variante wird beim nächsten Prüfen ausgeblendet.")
+                                    ermittle_konflikte_aus_db_direkt.clear()
                                     time.sleep(1)
                                     st.rerun()
 
-                            if row_index < len(gruppe_df):
+                            if row_index < len(unique_docs):
                                 st.divider()
 
 
