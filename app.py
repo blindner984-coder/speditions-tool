@@ -5438,104 +5438,67 @@ with tab_zuschlaege:
 # === TAB 4: RATEN-CHECKS ===
 with tab_rate_checks:
     st.write("### 📊 Raten-Checks")
-    st.caption("Zeigt Gruppen mit gleicher Contract/Quotationnummer und gleicher Gültigkeit + Route, bei denen verschiedene Raten hinterlegt sind.")
+    st.caption(
+        "Automatische Anzeige aller Fahrgebiete mit gleicher Contract/Quotation + gleicher Gültigkeit + "
+        "gleicher Route (POL → POD), bei denen **unterschiedliche Preise** hinterlegt sind."
+    )
 
-    rc_col1, rc_col2, rc_col3, rc_col4 = st.columns(4)
-    with rc_col1:
-        rc_such_pol = st.text_input("📍 Ladehafen (POL)", placeholder="z.B. Bremerhaven", key="ratecheck_pol")
-    with rc_col2:
-        rc_such_pod = st.text_input("🏁 Zielhafen (POD)", placeholder="z.B. Ennore", key="ratecheck_pod")
-    with rc_col3:
-        rc_such_contract = st.text_input("📄 Contract / Quotation", placeholder="z.B. 299592520", key="ratecheck_contract")
-    with rc_col4:
-        rc_historisch = st.checkbox(
-            "🕘 Historische anzeigen",
-            value=True,
-            key="ratecheck_historisch",
-            help="Wenn deaktiviert, werden nur am Stichtag gültige Raten berücksichtigt.",
-        )
-        rc_datum = st.date_input(
-            "Stichtag",
-            value=datetime.now(timezone.utc).date(),
-            disabled=rc_historisch,
-            key="ratecheck_datum",
-        )
+    if st.button("🔄 Jetzt prüfen", type="primary", key="ratecheck_start_btn"):
+        st.session_state['ratecheck_gestartet'] = True
 
-    if st.button("🔎 Unterschiedliche Raten finden", type="primary", key="ratecheck_start_btn"):
-        st.session_state['ratecheck_started'] = True
+    if not st.session_state.get('ratecheck_gestartet', False):
+        st.info("Auf 'Jetzt prüfen' klicken um die gesamte Datenbank automatisch zu analysieren.")
+    else:
+        with st.spinner("Lade alle Raten und suche nach Konflikten..."):
+            df_ratecheck, ist_gekuerzt_ratecheck = lade_raten_aus_db(fetch_limit=MAX_DB_FETCH)
 
-    if st.session_state.get('ratecheck_started', False):
-        with st.spinner("Analysiere Raten auf Abweichungen..."):
-            df_ratecheck, ist_gekuerzt_ratecheck = lade_raten_aus_db(
-                rc_such_pol,
-                rc_such_pod,
-                rc_such_contract,
-                fetch_limit=MAX_DB_FETCH,
-            )
-
-        if df_ratecheck.empty:
-            st.info("Keine Raten für die aktuelle Suche gefunden.")
+        if df_ratecheck is None or df_ratecheck.empty:
+            st.info("Die Datenbank ist leer.")
         else:
             if ist_gekuerzt_ratecheck:
                 st.warning(
-                    f"Es wurden mehr als {MAX_DB_FETCH} Raten gefunden. Für den Check wurden nur die ersten {MAX_DB_FETCH} berücksichtigt."
+                    f"Datenbank enthält mehr als {MAX_DB_FETCH} Raten – nur die ersten {MAX_DB_FETCH} wurden geprüft."
                 )
 
-            if 'Valid from dt' in df_ratecheck.columns:
-                df_ratecheck['Valid from dt'] = pd.to_datetime(df_ratecheck['Valid from dt'], errors='coerce')
+            df_konflikte = ermittle_abweichende_raten(df_ratecheck)
+
+            if df_konflikte.empty:
+                st.success("Alles sauber: Keine doppelten Raten mit abweichenden Preisen gefunden.")
             else:
-                valid_from_values = df_ratecheck['Valid from'].tolist() if 'Valid from' in df_ratecheck.columns else [None] * len(df_ratecheck)
-                df_ratecheck['Valid from dt'] = pd.to_datetime(valid_from_values, errors='coerce')
+                gruppen_spalten = ['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key']
+                gruppen = list(df_konflikte.groupby(gruppen_spalten, dropna=False))
+                st.warning(
+                    f"⚠️ {len(gruppen)} Konflikt-Gruppe(n) gefunden – gleiche Contract + gleiche Gültigkeit + "
+                    f"gleiche Route, aber unterschiedliche Preise."
+                )
 
-            if 'Valid to dt' in df_ratecheck.columns:
-                df_ratecheck['Valid to dt'] = pd.to_datetime(df_ratecheck['Valid to dt'], errors='coerce')
-            else:
-                valid_to_values = df_ratecheck['Valid to'].tolist() if 'Valid to' in df_ratecheck.columns else [None] * len(df_ratecheck)
-                df_ratecheck['Valid to dt'] = pd.to_datetime(valid_to_values, errors='coerce')
+                for gruppe_index, (_, gruppe_df) in enumerate(gruppen, start=1):
+                    gruppe_df = gruppe_df.reset_index(drop=True)
+                    erste_zeile = gruppe_df.iloc[0]
+                    valid_from_label = formatiere_datum_fuer_header(erste_zeile.get('Valid from'))
+                    valid_to_label = formatiere_datum_fuer_header(erste_zeile.get('Valid to'))
+                    label = (
+                        f"📄 {erste_zeile.get('Contract Number', 'Unbekannt')} | "
+                        f"{erste_zeile.get('Port of Loading', '?')} ➡️ {erste_zeile.get('Port of Destination', '?')} | "
+                        f"📅 {valid_from_label} bis {valid_to_label} | "
+                        f"{int(erste_zeile.get('group_variants', 0) or 0)} Varianten"
+                    )
 
-            maske_ratecheck = pd.Series([True] * len(df_ratecheck), index=df_ratecheck.index)
-            if not rc_historisch:
-                stichtag = pd.to_datetime(rc_datum)
-                maske_ratecheck &= (df_ratecheck['Valid from dt'] <= stichtag) & (df_ratecheck['Valid to dt'] >= stichtag)
-
-            df_ratecheck = df_ratecheck[maske_ratecheck].copy()
-            if df_ratecheck.empty:
-                st.info("Keine Raten im gewählten Gültigkeitsfenster gefunden.")
-            else:
-                df_konflikte = ermittle_abweichende_raten(df_ratecheck)
-                if df_konflikte.empty:
-                    st.success("Keine abweichenden Raten mit gleicher Contract/Quotation + gleicher Gültigkeit gefunden.")
-                else:
-                    gruppen_spalten = ['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key']
-                    gruppen = list(df_konflikte.groupby(gruppen_spalten, dropna=False))
-                    st.warning(
-                        f"Gefunden: {len(df_konflikte)} Zeilen in {len(gruppen)} Konflikt-Gruppe(n) mit unterschiedlichen Raten.")
-
-                    for gruppe_index, (_, gruppe_df) in enumerate(gruppen, start=1):
-                        gruppe_df = gruppe_df.reset_index(drop=True)
-                        erste_zeile = gruppe_df.iloc[0]
-                        valid_from_label = formatiere_datum_fuer_header(erste_zeile.get('Valid from'))
-                        valid_to_label = formatiere_datum_fuer_header(erste_zeile.get('Valid to'))
-                        label = (
-                            f"📄 {erste_zeile.get('Contract Number', 'Unbekannt')} | "
-                            f"{erste_zeile.get('Port of Loading', '?')} ➡️ {erste_zeile.get('Port of Destination', '?')} | "
-                            f"📅 {valid_from_label} bis {valid_to_label} | "
-                            f"Varianten: {int(erste_zeile.get('group_variants', 0) or 0)}"
-                        )
-
-                        with st.expander(label, expanded=(gruppe_index == 1)):
-                            for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
-                                st.markdown(f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**")
-                                anzeige_container_daten(
-                                    row,
-                                    "40' HC",
-                                    '40HC',
-                                    'Included Prepaid Surcharges 40HC',
-                                    'Included Collect Surcharges 40HC',
-                                    f"ratecheck_{gruppe_index}_{row_index}",
-                                )
-                                if pd.notna(row.get('Remark')) and row.get('Remark') != "":
-                                    st.info(f"💡 Bemerkung: {row['Remark']}")
+                    with st.expander(label, expanded=(gruppe_index <= 3)):
+                        for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
+                            st.markdown(f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**")
+                            anzeige_container_daten(
+                                row,
+                                "40' HC",
+                                '40HC',
+                                'Included Prepaid Surcharges 40HC',
+                                'Included Collect Surcharges 40HC',
+                                f"ratecheck_{gruppe_index}_{row_index}",
+                            )
+                            if pd.notna(row.get('Remark')) and row.get('Remark') != "":
+                                st.info(f"💡 Bemerkung: {row['Remark']}")
+                            if row_index < len(gruppe_df):
+                                st.divider()
 
 
 # === TAB 5: PICK UP ===
