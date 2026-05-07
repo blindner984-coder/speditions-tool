@@ -5495,11 +5495,9 @@ with tab_rate_checks:
         "Automatische Anzeige aller Fahrgebiete mit gleicher Contract/Quotation + gleicher Gültigkeit + "
         "gleicher Route (POL → POD), bei denen **unterschiedliche Preise** hinterlegt sind."
     )
-    st.caption("✅ Genehmigen: Varianten als 'OK' markieren, damit sie nicht mehr angezeigt werden.")
 
     if st.button("🔄 Jetzt prüfen", type="primary", key="ratecheck_start_btn"):
         st.session_state['ratecheck_gestartet'] = True
-        st.session_state['ratecheck_approvals'] = {}
 
     if not st.session_state.get('ratecheck_gestartet', False):
         st.info("Auf 'Jetzt prüfen' klicken um die gesamte Datenbank automatisch zu analysieren.")
@@ -5515,11 +5513,9 @@ with tab_rate_checks:
                     f"Datenbank enthält mehr als {MAX_DB_FETCH} Raten – nur die ersten {MAX_DB_FETCH} wurden geprüft."
                 )
 
-            # Whitelist laden und Konflikte filtern
             whitelist = genehmigte_konflikte_laden()
             df_konflikte = ermittle_abweichende_raten(df_ratecheck)
-            
-            # Filter: Entfernen Sie bereits genehmigten Konflikte
+
             if not df_konflikte.empty and whitelist:
                 def ist_genehmigt(row):
                     key = f"{row.get('Contract Number')}|{row.get('Valid from')}|{row.get('Valid to')}|{row.get('Port of Loading')}|{row.get('Port of Destination')}|{row.get('40HC')}|{row.get('Currency')}|{row.get('sourceFile')}"
@@ -5536,9 +5532,6 @@ with tab_rate_checks:
                     f"gleiche Route, aber unterschiedliche Preise."
                 )
 
-                if 'ratecheck_approvals' not in st.session_state:
-                    st.session_state['ratecheck_approvals'] = {}
-
                 for gruppe_index, (_, gruppe_df) in enumerate(gruppen, start=1):
                     gruppe_df = gruppe_df.reset_index(drop=True)
                     erste_zeile = gruppe_df.iloc[0]
@@ -5554,20 +5547,11 @@ with tab_rate_checks:
                     with st.expander(label, expanded=(gruppe_index <= 3)):
                         for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
                             source_label = str(row.get('sourceFile') or '').strip()
-                            approval_key = f"grp{gruppe_index}_var{row_index}"
-                            
                             header = f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**"
                             if source_label and source_label not in {'nan', 'None', ''}:
                                 header += f" &nbsp;|&nbsp; <small>📁 {source_label}</small>"
                             st.markdown(header, unsafe_allow_html=True)
-                            
-                            is_approved = st.toggle(
-                                label="✅ Diese Variante ist OK (genehmigen)",
-                                value=st.session_state['ratecheck_approvals'].get(approval_key, False),
-                                key=f"toggle_{approval_key}",
-                            )
-                            st.session_state['ratecheck_approvals'][approval_key] = is_approved
-                            
+
                             anzeige_container_daten(
                                 row,
                                 "40' HC",
@@ -5578,43 +5562,28 @@ with tab_rate_checks:
                             )
                             if pd.notna(row.get('Remark')) and row.get('Remark') != "":
                                 st.info(f"💡 Bemerkung: {row['Remark']}")
+
+                            if st.button(
+                                "✅ Diese Variante als OK genehmigen",
+                                key=f"btn_approve_{gruppe_index}_{row_index}",
+                                type="secondary",
+                            ):
+                                if genehmige_konflikt(
+                                    row.get('Contract Number'),
+                                    str(row.get('Valid from')),
+                                    str(row.get('Valid to')),
+                                    row.get('Port of Loading'),
+                                    row.get('Port of Destination'),
+                                    str(row.get('40HC')),
+                                    row.get('Currency'),
+                                    str(row.get('sourceFile') or '')
+                                ):
+                                    st.success("Genehmigt! Variante wird beim nächsten Prüfen ausgeblendet.")
+                                    time.sleep(1)
+                                    st.rerun()
+
                             if row_index < len(gruppe_df):
                                 st.divider()
-
-                st.divider()
-                if st.session_state.get('ratecheck_approvals'):
-                    approved_count = sum(1 for v in st.session_state['ratecheck_approvals'].values() if v)
-                    if approved_count > 0:
-                        if st.button(f"💾 {approved_count} Variante(n) als genehmigt speichern", type="primary", key="save_approvals"):
-                            saved_count = 0
-                            for approval_key in list(st.session_state['ratecheck_approvals'].keys()):
-                                if st.session_state['ratecheck_approvals'][approval_key]:
-                                    parts = approval_key.split('var')
-                                    if len(parts) == 2:
-                                        grp_num = int(parts[0].replace('grp', ''))
-                                        row_num = int(parts[1])
-                                        if 0 < grp_num <= len(gruppen):
-                                            _, g_df = gruppen[grp_num - 1]
-                                            g_df = g_df.reset_index(drop=True)
-                                            if 0 < row_num <= len(g_df):
-                                                row = g_df.iloc[row_num - 1]
-                                                if genehmige_konflikt(
-                                                    row.get('Contract Number'),
-                                                    str(row.get('Valid from')),
-                                                    str(row.get('Valid to')),
-                                                    row.get('Port of Loading'),
-                                                    row.get('Port of Destination'),
-                                                    str(row.get('40HC')),
-                                                    row.get('Currency'),
-                                                    str(row.get('sourceFile') or '')
-                                                ):
-                                                    saved_count += 1
-                            
-                            if saved_count > 0:
-                                st.success(f"✅ {saved_count} Variante(n) genehmigt. Seite wird aktualisiert...")
-                                st.session_state['ratecheck_gestartet'] = False
-                                time.sleep(1)
-                                st.rerun()
 
 
 # === TAB 5: PICK UP ===
