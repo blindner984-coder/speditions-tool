@@ -850,6 +850,7 @@ RATEN_PROJECTION = {
     '_id': 0, 'Carrier': 1, 'Contract Number': 1, 'Port of Loading': 1, 'Port of Destination': 1,
     'Valid from': 1, 'Valid to': 1, 'Valid from dt': 1, 'Valid to dt': 1, '40HC': 1,
     'Currency': 1, 'Included Prepaid Surcharges 40HC': 1, 'Included Collect Surcharges 40HC': 1, 'Remark': 1,
+    'sourceFile': 1,
 }
 
 MAX_DB_FETCH = 1200
@@ -5495,7 +5496,11 @@ with tab_rate_checks:
 
                     with st.expander(label, expanded=(gruppe_index <= 3)):
                         for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
-                            st.markdown(f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**")
+                            source_label = str(row.get('sourceFile') or '').strip()
+                            header = f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**"
+                            if source_label and source_label not in {'nan', 'None', ''}:
+                                header += f" &nbsp;|&nbsp; <small>📁 {source_label}</small>"
+                            st.markdown(header, unsafe_allow_html=True)
                             anzeige_container_daten(
                                 row,
                                 "40' HC",
