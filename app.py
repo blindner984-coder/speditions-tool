@@ -8,6 +8,7 @@ import os
 import hmac
 import uuid
 import tempfile
+import time
 import requests
 import pymongo
 from pymongo.errors import BulkWriteError
@@ -5555,16 +5556,16 @@ with tab_rate_checks:
                             source_label = str(row.get('sourceFile') or '').strip()
                             approval_key = f"grp{gruppe_index}_var{row_index}"
                             
-                            col_check, col_info = st.columns([0.08, 0.92])
+                            col_check, col_header = st.columns([0.06, 0.94])
                             with col_check:
                                 is_approved = st.checkbox(
-                                    "✓",
+                                    label="",
                                     value=st.session_state['ratecheck_approvals'].get(approval_key, False),
                                     key=f"cb_{approval_key}",
                                 )
                                 st.session_state['ratecheck_approvals'][approval_key] = is_approved
                             
-                            with col_info:
+                            with col_header:
                                 header = f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**"
                                 if source_label and source_label not in {'nan', 'None', ''}:
                                     header += f" &nbsp;|&nbsp; <small>📁 {source_label}</small>"
