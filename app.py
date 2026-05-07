@@ -10,6 +10,7 @@ import uuid
 import tempfile
 import requests
 import pymongo
+from pymongo.errors import BulkWriteError
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List
@@ -391,7 +392,7 @@ def extrahiere_msc_quote_pdf_daten(text, monatswert_modus="neu"):
         if response is None:
             st.warning("Alle Gemini-Modelle sind aktuell überlastet. Bitte versuche es in wenigen Minuten erneut.")
             return None
-        result = ExtractionResponse.model_validate_json(response.text)
+        result = ExtractionResponse.model_validate_json(response.text or "")
         if not result.rates:
             return None
 
@@ -510,7 +511,7 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
                         temperature=0.1,
                     ),
                 )
-                result = ExtractionResponse.model_validate_json(response.text)
+                result = ExtractionResponse.model_validate_json(response.text or "")
                 for rate in result.rates:
                     alle_raten.append({
                         "Carrier": rate.carrier,
@@ -873,6 +874,71 @@ def lade_raten_aus_db(such_pol="", such_pod="", such_contract="", fetch_limit=MA
     if ist_gekuerzt:
         rows = rows[:int(fetch_limit)]
     return pd.DataFrame(rows), ist_gekuerzt
+
+
+def ermittle_abweichende_raten(df_input: pd.DataFrame) -> pd.DataFrame:
+    if df_input is None or df_input.empty:
+        return pd.DataFrame()
+
+    benoetigte_spalten = [
+        'Contract Number', 'Port of Loading', 'Port of Destination',
+        'Valid from', 'Valid to', '40HC', 'Currency',
+        'Included Prepaid Surcharges 40HC', 'Included Collect Surcharges 40HC',
+    ]
+    for spalte in benoetigte_spalten:
+        if spalte not in df_input.columns:
+            return pd.DataFrame()
+
+    df = df_input.copy()
+
+    def norm_text(value):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+        return re.sub(r'\s+', ' ', str(value)).strip()
+
+    def norm_upper(value):
+        return norm_text(value).upper()
+
+    valid_from_dt = pd.to_datetime(df.get('Valid from dt', df['Valid from']), errors='coerce')
+    valid_to_dt = pd.to_datetime(df.get('Valid to dt', df['Valid to']), errors='coerce')
+
+    df['contract_key'] = df['Contract Number'].apply(norm_upper)
+    df['pol_key'] = df['Port of Loading'].apply(norm_upper)
+    df['pod_key'] = df['Port of Destination'].apply(norm_upper)
+    df['valid_from_key'] = valid_from_dt.dt.strftime('%Y-%m-%d').fillna(df['Valid from'].apply(norm_text))
+    df['valid_to_key'] = valid_to_dt.dt.strftime('%Y-%m-%d').fillna(df['Valid to'].apply(norm_text))
+
+    df['basis_40hc_num'] = df['40HC'].apply(parse_decimal_wert)
+    df['currency_key'] = df['Currency'].apply(norm_upper)
+    df['prepaid_key'] = df['Included Prepaid Surcharges 40HC'].apply(norm_text)
+    df['collect_key'] = df['Included Collect Surcharges 40HC'].apply(norm_text)
+    df['rate_signature'] = df.apply(
+        lambda r: "|".join([
+            '' if pd.isna(r.get('basis_40hc_num')) else f"{float(r.get('basis_40hc_num')):.4f}",
+            r.get('currency_key', ''),
+            r.get('prepaid_key', ''),
+            r.get('collect_key', ''),
+        ]),
+        axis=1,
+    )
+
+    group_cols = ['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key']
+    grouped = df.groupby(group_cols, dropna=False)
+    konflikt_maske = grouped['rate_signature'].transform('nunique') > 1
+    konflikt_maske &= grouped['rate_signature'].transform('size') > 1
+
+    df_konflikte = df[konflikt_maske].copy()
+    if df_konflikte.empty:
+        return df_konflikte
+
+    df_konflikte['group_size'] = df_konflikte.groupby(group_cols)['rate_signature'].transform('size')
+    df_konflikte['group_variants'] = df_konflikte.groupby(group_cols)['rate_signature'].transform('nunique')
+    df_konflikte = df_konflikte.sort_values(
+        by=['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key', 'basis_40hc_num'],
+        ascending=[True, True, True, True, True, True],
+        na_position='last',
+    ).reset_index(drop=True)
+    return df_konflikte
 
 
 @st.cache_data(ttl=60)
@@ -2284,11 +2350,50 @@ def extrahiere_cosco_iet_excel(excel_dict, file_name):
     if header_idx is None:
         return None
 
+    def parse_cosco_text_surcharges(text):
+        surcharge_text = str(text or '').strip()
+        if not surcharge_text or surcharge_text.lower() in {'nan', 'none'}:
+            return []
+
+        pattern = re.compile(
+            r'\*?\s*([A-Z0-9]{2,10})\s+'
+            r'(USD|EUR|GBP|CNY|JPY|TRY|INR|AED|SAR|TWD|MYR)\s+'
+            r'([\d.,]+)\s*/\s*(TEU|UNIT)\b',
+            re.IGNORECASE,
+        )
+
+        matches = list(pattern.finditer(surcharge_text))
+        if not matches:
+            return [surcharge_text]
+
+        parsed_entries = []
+        for idx, match in enumerate(matches):
+            code = match.group(1).upper()
+            currency = match.group(2).upper()
+            amount = parse_decimal_wert(match.group(3))
+            basis = match.group(4).upper()
+            if amount is None or amount <= 0:
+                continue
+
+            factor_40hc = 2.0 if basis == 'TEU' else 1.0
+            amount_40hc = amount * factor_40hc
+
+            next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(surcharge_text)
+            tail = surcharge_text[match.end():next_start].strip(' ,;/')
+            if tail and tail.lower() not in {'nan', 'none'}:
+                code_label = f"{code} [{tail}]"
+            else:
+                code_label = code
+
+            parsed_entries.append(f"{code_label} = {amount_40hc:.2f} {currency}")
+
+        return parsed_entries or [surcharge_text]
+
     surcharge_columns = []
     # I..N = Spaltenindex 8..13 (0-basiert)
     for col_idx in range(8, min(df_sheet.shape[1], 14)):
-        head = str(df_sheet.iat[surcharge_header_row, col_idx] if surcharge_header_row < len(df_sheet) else '').strip()
-        unit = str(df_sheet.iat[surcharge_unit_row, col_idx] if surcharge_unit_row < len(df_sheet) else '').strip()
+        head = str(df_sheet.iat[surcharge_header_row, col_idx] if surcharge_header_row is not None and surcharge_header_row < len(df_sheet) else '').strip()
+        unit = str(df_sheet.iat[surcharge_unit_row, col_idx] if surcharge_unit_row is not None and surcharge_unit_row < len(df_sheet) else '').strip()
         if not head or head.lower() in {'nan', 'none'}:
             continue
         head_low = head.lower()
@@ -2351,7 +2456,7 @@ def extrahiere_cosco_iet_excel(excel_dict, file_name):
             if s_col['is_textual']:
                 txt = str(cell_val or '').strip()
                 if txt and txt.lower() not in {'nan', 'none'}:
-                    prepaid_entries.append(txt)
+                    prepaid_entries.extend(parse_cosco_text_surcharges(txt))
                 continue
 
             amount = parse_decimal_wert(cell_val)
@@ -2427,7 +2532,7 @@ def normalisiere_upload_dataframe(df_upload):
         mask_40 = out[size_col].astype(str).str.contains('40|hc|hq|nan', na=True, case=False)
         out = out[mask_40].copy()
 
-    def stelle_spalte_sicher(ziel, kandidaten, default=""):
+    def stelle_spalte_sicher(ziel, kandidaten, default=None):
         if ziel not in out.columns:
             quelle = ermittle_erste_spalte(out, kandidaten)
             if quelle is not None:
@@ -3584,7 +3689,7 @@ def _msg_parse_route_text(route_text, fallback_pol='NCP0'):
         pol = ', '.join(pol_codes) if pol_codes else (left or fallback_pol)
         pod = ', '.join(pod_codes) if pod_codes else right
         return pol, pod, pol or fallback_pol
-    out = expandiere_mehrfach_pod_zeilen(out)
+    out = expandiere_mehrfach_pod_zeilen(text)
 
     codes = re.findall(r'\b[A-Z]{4,5}\b', text.upper())
     if codes:
@@ -4910,7 +5015,7 @@ def speichere_dataframe_batchweise(df_upload):
         try:
             collection.insert_many(batch_records, ordered=False)
             gespeichert += len(batch_records)
-        except pymongo.errors.BulkWriteError as bwe:
+        except BulkWriteError as bwe:
             inserted = bwe.details.get('nInserted', 0)
             gespeichert += inserted
             st.warning(f"Batch teilweise eingefügt: {inserted}/{len(batch_records)} Zeilen (restliche z.B. Duplikate übersprungen).")
@@ -4923,10 +5028,11 @@ def speichere_dataframe_batchweise(df_upload):
 
 
 # --- TABS FÜR UI ---
-tab_suche, tab_upload, tab_zuschlaege, tab_pickup = st.tabs([
+tab_suche, tab_upload, tab_zuschlaege, tab_rate_checks, tab_pickup = st.tabs([
     "🔍 Raten suchen",
     "⚙️ Daten hochladen (Admin)",
     "🧾 Zuschlägen",
+    "📊 Raten-Checks",
     "📦 PICK UP",
 ])
 
@@ -5327,6 +5433,109 @@ with tab_zuschlaege:
                         st.success(f"✅ Zuschläge aktualisiert. Betroffene Datensätze: {ergebnis_update.modified_count}")
     else:
         st.info("Zuschlagsverwaltung ist gesperrt. Bitte als Admin anmelden.")
+
+
+# === TAB 4: RATEN-CHECKS ===
+with tab_rate_checks:
+    st.write("### 📊 Raten-Checks")
+    st.caption("Zeigt Gruppen mit gleicher Contract/Quotationnummer und gleicher Gültigkeit + Route, bei denen verschiedene Raten hinterlegt sind.")
+
+    rc_col1, rc_col2, rc_col3, rc_col4 = st.columns(4)
+    with rc_col1:
+        rc_such_pol = st.text_input("📍 Ladehafen (POL)", placeholder="z.B. Bremerhaven", key="ratecheck_pol")
+    with rc_col2:
+        rc_such_pod = st.text_input("🏁 Zielhafen (POD)", placeholder="z.B. Ennore", key="ratecheck_pod")
+    with rc_col3:
+        rc_such_contract = st.text_input("📄 Contract / Quotation", placeholder="z.B. 299592520", key="ratecheck_contract")
+    with rc_col4:
+        rc_historisch = st.checkbox(
+            "🕘 Historische anzeigen",
+            value=True,
+            key="ratecheck_historisch",
+            help="Wenn deaktiviert, werden nur am Stichtag gültige Raten berücksichtigt.",
+        )
+        rc_datum = st.date_input(
+            "Stichtag",
+            value=datetime.now(timezone.utc).date(),
+            disabled=rc_historisch,
+            key="ratecheck_datum",
+        )
+
+    if st.button("🔎 Unterschiedliche Raten finden", type="primary", key="ratecheck_start_btn"):
+        st.session_state['ratecheck_started'] = True
+
+    if st.session_state.get('ratecheck_started', False):
+        with st.spinner("Analysiere Raten auf Abweichungen..."):
+            df_ratecheck, ist_gekuerzt_ratecheck = lade_raten_aus_db(
+                rc_such_pol,
+                rc_such_pod,
+                rc_such_contract,
+                fetch_limit=MAX_DB_FETCH,
+            )
+
+        if df_ratecheck.empty:
+            st.info("Keine Raten für die aktuelle Suche gefunden.")
+        else:
+            if ist_gekuerzt_ratecheck:
+                st.warning(
+                    f"Es wurden mehr als {MAX_DB_FETCH} Raten gefunden. Für den Check wurden nur die ersten {MAX_DB_FETCH} berücksichtigt."
+                )
+
+            if 'Valid from dt' in df_ratecheck.columns:
+                df_ratecheck['Valid from dt'] = pd.to_datetime(df_ratecheck['Valid from dt'], errors='coerce')
+            else:
+                valid_from_values = df_ratecheck['Valid from'].tolist() if 'Valid from' in df_ratecheck.columns else [None] * len(df_ratecheck)
+                df_ratecheck['Valid from dt'] = pd.to_datetime(valid_from_values, errors='coerce')
+
+            if 'Valid to dt' in df_ratecheck.columns:
+                df_ratecheck['Valid to dt'] = pd.to_datetime(df_ratecheck['Valid to dt'], errors='coerce')
+            else:
+                valid_to_values = df_ratecheck['Valid to'].tolist() if 'Valid to' in df_ratecheck.columns else [None] * len(df_ratecheck)
+                df_ratecheck['Valid to dt'] = pd.to_datetime(valid_to_values, errors='coerce')
+
+            maske_ratecheck = pd.Series([True] * len(df_ratecheck), index=df_ratecheck.index)
+            if not rc_historisch:
+                stichtag = pd.to_datetime(rc_datum)
+                maske_ratecheck &= (df_ratecheck['Valid from dt'] <= stichtag) & (df_ratecheck['Valid to dt'] >= stichtag)
+
+            df_ratecheck = df_ratecheck[maske_ratecheck].copy()
+            if df_ratecheck.empty:
+                st.info("Keine Raten im gewählten Gültigkeitsfenster gefunden.")
+            else:
+                df_konflikte = ermittle_abweichende_raten(df_ratecheck)
+                if df_konflikte.empty:
+                    st.success("Keine abweichenden Raten mit gleicher Contract/Quotation + gleicher Gültigkeit gefunden.")
+                else:
+                    gruppen_spalten = ['contract_key', 'valid_from_key', 'valid_to_key', 'pol_key', 'pod_key']
+                    gruppen = list(df_konflikte.groupby(gruppen_spalten, dropna=False))
+                    st.warning(
+                        f"Gefunden: {len(df_konflikte)} Zeilen in {len(gruppen)} Konflikt-Gruppe(n) mit unterschiedlichen Raten.")
+
+                    for gruppe_index, (_, gruppe_df) in enumerate(gruppen, start=1):
+                        gruppe_df = gruppe_df.reset_index(drop=True)
+                        erste_zeile = gruppe_df.iloc[0]
+                        valid_from_label = formatiere_datum_fuer_header(erste_zeile.get('Valid from'))
+                        valid_to_label = formatiere_datum_fuer_header(erste_zeile.get('Valid to'))
+                        label = (
+                            f"📄 {erste_zeile.get('Contract Number', 'Unbekannt')} | "
+                            f"{erste_zeile.get('Port of Loading', '?')} ➡️ {erste_zeile.get('Port of Destination', '?')} | "
+                            f"📅 {valid_from_label} bis {valid_to_label} | "
+                            f"Varianten: {int(erste_zeile.get('group_variants', 0) or 0)}"
+                        )
+
+                        with st.expander(label, expanded=(gruppe_index == 1)):
+                            for row_index, (_, row) in enumerate(gruppe_df.iterrows(), start=1):
+                                st.markdown(f"**Variante {row_index} | Carrier: {row.get('Carrier', 'Unbekannt')}**")
+                                anzeige_container_daten(
+                                    row,
+                                    "40' HC",
+                                    '40HC',
+                                    'Included Prepaid Surcharges 40HC',
+                                    'Included Collect Surcharges 40HC',
+                                    f"ratecheck_{gruppe_index}_{row_index}",
+                                )
+                                if pd.notna(row.get('Remark')) and row.get('Remark') != "":
+                                    st.info(f"💡 Bemerkung: {row['Remark']}")
 
 
 # === TAB 5: PICK UP ===
