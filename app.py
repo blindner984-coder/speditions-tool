@@ -5307,9 +5307,11 @@ with tab_suche:
                     valid_from_label = formatiere_datum_fuer_header(row.get('Valid from'))
                     valid_to_label = formatiere_datum_fuer_header(row.get('Valid to'))
                     gueltigkeit_label = f"{valid_from_label} bis {valid_to_label}" if (valid_from_label != "?" or valid_to_label != "?") else "Unbekannt"
+                    source_file_raw = str(row.get('sourceFile') or '').strip()
+                    source_file_label = f" | 📂 {source_file_raw}" if source_file_raw else ""
                     label = (
                         f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | "
-                        f"{row.get('Port of Loading')} ➡️ {row.get('Port of Destination')} | 📅 {gueltigkeit_label}"
+                        f"{row.get('Port of Loading')} ➡️ {row.get('Port of Destination')} | 📅 {gueltigkeit_label}{source_file_label}"
                     )
 
                     with st.expander(label):
