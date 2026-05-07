@@ -117,7 +117,7 @@ FUZZY_SCORE_THRESHOLD = 85
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # 2. Konfiguration & Design
-st.set_page_config(page_title="FreightIQ", page_icon="🚢", layout="wide")
+st.set_page_config(page_title="FreightIQ", layout="wide")
 
 st.markdown("""
     <style>
@@ -136,7 +136,7 @@ except FileNotFoundError:
     pass
 
 # --- HAUPT-ÜBERSCHRIFT ---
-st.title("🚢 FreightIQ")
+st.title("FreightIQ")
 
 MAX_UPLOAD_SIZE_MB = 15
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
