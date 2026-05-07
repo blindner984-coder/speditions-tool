@@ -2579,33 +2579,13 @@ def normalisiere_upload_dataframe(df_upload):
         'Discharge Port', 'Port of Discharge', 'Dest Port', 'POD Name', 'Arrival Port', 'To Port', 'Pod',
     ])
 
-    # Maersk-/E1E-Layout-Fix: In manchen Excel-Sheets steht im Feld "POD" nur ein
-    # Code, waehrend in "Delivery" der echte Zielhafenname steht (z.B. Spalte D).
-    # Dann soll Delivery als POD verwendet werden.
+    # Maersk-/E1E-Layout-Fix: Wenn eine separate Delivery-Spalte existiert und
+    # befuellt ist, immer als Port of Destination verwenden (Delivery hat die
+    # vollstaendigen Zielhafennamen, waehrend Port of Destination/POD oft nur Kuerzel hat).
     if 'Port of Destination' in out.columns and 'Delivery' in out.columns:
-        pod_series = out['Port of Destination'].astype(str).str.strip()
-        delivery_series = out['Delivery'].astype(str).str.strip()
-        delivery_valid_mask = ~ist_leerwert_series(out['Delivery'])
-
-        if delivery_valid_mask.any():
-            pod_sample = pod_series[delivery_valid_mask]
-            delivery_sample = delivery_series[delivery_valid_mask]
-
-            pod_code_ratio = pod_sample.str.fullmatch(r'[A-Z0-9]{2,5}').mean()
-            delivery_name_ratio = (
-                (~delivery_sample.str.fullmatch(r'[A-Z0-9]{2,5}'))
-                & (delivery_sample.str.len() >= 3)
-            ).mean()
-
-            # Nur umstellen, wenn aktuelle POD-Werte ueberwiegend codeartig sind
-            # und Delivery klar nach echten Hafenbezeichnungen aussieht.
-            if (
-                pd.notna(pod_code_ratio)
-                and pd.notna(delivery_name_ratio)
-                and pod_code_ratio >= 0.60
-                and delivery_name_ratio >= 0.60
-            ):
-                out.loc[delivery_valid_mask, 'Port of Destination'] = out.loc[delivery_valid_mask, 'Delivery']
+        delivery_ok = ~ist_leerwert_series(out['Delivery'])
+        if delivery_ok.any():
+            out.loc[delivery_ok, 'Port of Destination'] = out.loc[delivery_ok, 'Delivery']
 
     # MSC/FMS-Layout-Fix: In manchen Seafreight-Sheets steht in "Port of Destination"
     # nur der 2-stellige Laendercode (z.B. AE), waehrend der echte POD-Name in einer
@@ -4701,29 +4681,12 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     if ziel not in df_raw.columns:
                         df_raw[ziel] = df_raw[vorrang_col]
                     else:
-                        ziel_leer = df_raw[ziel].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
+                        # Vorrang-Spalte (z.B. Delivery) immer verwenden wo sie befuellt ist.
+                        # Beim Maersk/E1E-Format enthaelt Delivery die echten Zielhafennamen,
+                        # waehrend POD/Port of Destination nur Kuerzel/Kurznamen hat.
                         quelle_ok = ~df_raw[vorrang_col].astype(str).str.strip().replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
-                        mask = ziel_leer & quelle_ok
-                        if mask.any():
-                            df_raw.loc[mask, ziel] = df_raw.loc[mask, vorrang_col]
-
-                    # Extra-Regel für Port of Destination:
-                    # Wenn POD noch code-artige UN-LOCODE-Kürzel (2-6 Grossbuchstaben/Ziffern)
-                    # enthaelt UND Delivery echte Hafenbezeichnungen hat, immer Delivery nehmen.
-                    if ziel == 'Port of Destination':
-                        pod_vals = df_raw[ziel].astype(str).str.strip()
-                        delivery_vals = df_raw[vorrang_col].astype(str).str.strip()
-                        delivery_ok = ~delivery_vals.replace({'nan': '', 'None': '', 'NaN': ''}).eq('')
-                        pod_is_code = pod_vals.str.fullmatch(r'[A-Z0-9]{2,6}', na=False)
-                        delivery_is_name = (
-                            ~delivery_vals.str.fullmatch(r'[A-Z0-9]{2,6}', na=False)
-                            & (delivery_vals.str.len() >= 3)
-                            & delivery_ok
-                        )
-                        override_mask = pod_is_code & delivery_is_name
-                        if override_mask.any():
-                            df_raw.loc[override_mask, ziel] = df_raw.loc[override_mask, vorrang_col]
-
+                        if quelle_ok.any():
+                            df_raw.loc[quelle_ok, ziel] = df_raw.loc[quelle_ok, vorrang_col]
             elif ziel not in df_raw.columns:
                 fallback_col = ermittle_erste_spalte(df_raw, ['Origin', 'Dest'] if 'Loading' in ziel else ['Dest', 'Origin'])
                 if fallback_col:
