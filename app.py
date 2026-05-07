@@ -2579,6 +2579,34 @@ def normalisiere_upload_dataframe(df_upload):
         'Discharge Port', 'Port of Discharge', 'Dest Port', 'POD Name', 'Arrival Port', 'To Port', 'Pod',
     ])
 
+    # Maersk-/E1E-Layout-Fix: In manchen Excel-Sheets steht im Feld "POD" nur ein
+    # Code, waehrend in "Delivery" der echte Zielhafenname steht (z.B. Spalte D).
+    # Dann soll Delivery als POD verwendet werden.
+    if 'Port of Destination' in out.columns and 'Delivery' in out.columns:
+        pod_series = out['Port of Destination'].astype(str).str.strip()
+        delivery_series = out['Delivery'].astype(str).str.strip()
+        delivery_valid_mask = ~ist_leerwert_series(out['Delivery'])
+
+        if delivery_valid_mask.any():
+            pod_sample = pod_series[delivery_valid_mask]
+            delivery_sample = delivery_series[delivery_valid_mask]
+
+            pod_code_ratio = pod_sample.str.fullmatch(r'[A-Z0-9]{2,5}').mean()
+            delivery_name_ratio = (
+                (~delivery_sample.str.fullmatch(r'[A-Z0-9]{2,5}'))
+                & (delivery_sample.str.len() >= 3)
+            ).mean()
+
+            # Nur umstellen, wenn aktuelle POD-Werte ueberwiegend codeartig sind
+            # und Delivery klar nach echten Hafenbezeichnungen aussieht.
+            if (
+                pd.notna(pod_code_ratio)
+                and pd.notna(delivery_name_ratio)
+                and pod_code_ratio >= 0.60
+                and delivery_name_ratio >= 0.60
+            ):
+                out.loc[delivery_valid_mask, 'Port of Destination'] = out.loc[delivery_valid_mask, 'Delivery']
+
     # MSC/FMS-Layout-Fix: In manchen Seafreight-Sheets steht in "Port of Destination"
     # nur der 2-stellige Laendercode (z.B. AE), waehrend der echte POD-Name in einer
     # Nachbarspalte (z.B. "Unnamed: 2") liegt. Dann POD auf die Namensspalte umstellen.
