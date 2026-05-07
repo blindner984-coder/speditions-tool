@@ -5556,10 +5556,10 @@ with tab_rate_checks:
                             source_label = str(row.get('sourceFile') or '').strip()
                             approval_key = f"grp{gruppe_index}_var{row_index}"
                             
-                            col_check, col_header = st.columns([0.06, 0.94])
+                            col_check, col_header = st.columns([0.12, 0.88])
                             with col_check:
                                 is_approved = st.checkbox(
-                                    label="",
+                                    label="OK ✓",
                                     value=st.session_state['ratecheck_approvals'].get(approval_key, False),
                                     key=f"cb_{approval_key}",
                                 )
