@@ -5552,6 +5552,12 @@ with tab_rate_checks:
                                 header += f" &nbsp;|&nbsp; <small>📁 {source_label}</small>"
                             st.markdown(header, unsafe_allow_html=True)
 
+                            btn_key = f"btn_approve_{gruppe_index}_{row_index}"
+                            btn_clicked = st.button(
+                                "✅ Diese Variante als OK genehmigen",
+                                key=btn_key,
+                            )
+
                             anzeige_container_daten(
                                 row,
                                 "40' HC",
@@ -5563,11 +5569,7 @@ with tab_rate_checks:
                             if pd.notna(row.get('Remark')) and row.get('Remark') != "":
                                 st.info(f"💡 Bemerkung: {row['Remark']}")
 
-                            if st.button(
-                                "✅ Diese Variante als OK genehmigen",
-                                key=f"btn_approve_{gruppe_index}_{row_index}",
-                                type="secondary",
-                            ):
+                            if btn_clicked:
                                 if genehmige_konflikt(
                                     row.get('Contract Number'),
                                     str(row.get('Valid from')),
