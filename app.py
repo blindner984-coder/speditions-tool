@@ -1233,7 +1233,7 @@ def lade_zuschlag_gruppen(such_contract="", such_carrier="", fetch_limit=5000):
 
 
 @st.cache_data(ttl=60)
-def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carrier="", contractNumber="", such_pol="", such_pod="", limit=50):
+def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carrier="", contractNumber="", such_pol="", such_pod="", limit=500):
     gruppe = {
         'groupKey': groupKey,
         'importBatchId': importBatchId,
@@ -1241,13 +1241,27 @@ def lade_zuschlag_routen_preview(groupKey, importBatchId="", sourceFile="", carr
         'carrier': carrier,
         'contractNumber': contractNumber,
     }
-    rows = list(collection.find(
-        baue_zuschlag_update_query(gruppe, such_pol=such_pol, such_pod=such_pod),
-        {'_id': 0, 'Port of Loading': 1, 'Port of Destination': 1}
-    ).limit(int(limit)))
+    match_filter = baue_zuschlag_update_query(gruppe, such_pol=such_pol, such_pod=such_pod)
+    pipeline = [
+        {'$match': match_filter},
+        {'$group': {
+            '_id': {
+                'pol': '$Port of Loading',
+                'pod': '$Port of Destination',
+            }
+        }},
+        {'$project': {
+            '_id': 0,
+            'Port of Loading': '$_id.pol',
+            'Port of Destination': '$_id.pod',
+        }},
+        {'$sort': {'Port of Loading': 1, 'Port of Destination': 1}},
+        {'$limit': int(limit)},
+    ]
+    rows = list(collection.aggregate(pipeline))
     if not rows:
         return pd.DataFrame(columns=['Port of Loading', 'Port of Destination'])
-    return pd.DataFrame(rows).fillna('').drop_duplicates().reset_index(drop=True)
+    return pd.DataFrame(rows).fillna('').reset_index(drop=True)
 
 
 @st.cache_data(ttl=60)
