@@ -5561,14 +5561,12 @@ with tab_rate_checks:
                                 header += f" &nbsp;|&nbsp; <small>📁 {source_label}</small>"
                             st.markdown(header, unsafe_allow_html=True)
                             
-                            col_check, col_spacer = st.columns([0.2, 0.8])
-                            with col_check:
-                                is_approved = st.checkbox(
-                                    label="Genehmigt",
-                                    value=st.session_state['ratecheck_approvals'].get(approval_key, False),
-                                    key=f"cb_{approval_key}",
-                                )
-                                st.session_state['ratecheck_approvals'][approval_key] = is_approved
+                            is_approved = st.toggle(
+                                label="✅ Diese Variante ist OK (genehmigen)",
+                                value=st.session_state['ratecheck_approvals'].get(approval_key, False),
+                                key=f"toggle_{approval_key}",
+                            )
+                            st.session_state['ratecheck_approvals'][approval_key] = is_approved
                             
                             anzeige_container_daten(
                                 row,
