@@ -5720,6 +5720,23 @@ with tab_rate_checks:
                 )
                 return key in wl
 
+            def berechne_allin_ohne_collect(doc):
+                """Basis + nur Prepaid-EUR/USD-Zuschläge (kein Collect, kein BL) als Vergleichswert."""
+                basis = parse_decimal_wert(doc.get('40HC'))
+                if basis is None:
+                    return None
+                curr = str(doc.get('Currency', 'USD')).upper()
+                basis_eur = basis * usd_to_eur if curr == 'USD' else basis
+                summe = 0.0
+                for g in berechne_gebuehren(str(doc.get('Included Prepaid Surcharges 40HC', ''))):
+                    if ist_doc_gebuehr(g['name']) or ist_doc_gebuehr(g.get('label', '')):
+                        continue
+                    if g['waehrung'] == 'USD':
+                        summe += g['betrag'] * usd_to_eur
+                    elif g['waehrung'] == 'EUR':
+                        summe += g['betrag']
+                return round(basis_eur + summe, 2)
+
             # Deduplizieren + Whitelist anwenden
             gefilterte_konflikte = []
             for gruppe in alle_konflikte:
@@ -5742,6 +5759,10 @@ with tab_rate_checks:
                     d for d in unique_docs
                     if not str(d.get('Remark') or '').strip()
                 ]
+                # Kein echterKonflikt wenn alle Varianten denselben All-In-Preis haben
+                allin_preise = {berechne_allin_ohne_collect(d) for d in unique_docs}
+                if len(allin_preise) <= 1:
+                    continue
                 if len(unique_docs) > 1:
                     gruppe['unique_docs'] = unique_docs
                     gefilterte_konflikte.append(gruppe)
