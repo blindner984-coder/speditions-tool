@@ -5737,6 +5737,11 @@ with tab_rate_checks:
                         unique_docs.append(doc)
                 if whitelist:
                     unique_docs = [d for d in unique_docs if not ist_variante_genehmigt(d, whitelist)]
+                # Varianten mit Bemerkung herausfiltern – sind keine echten Konflikte
+                unique_docs = [
+                    d for d in unique_docs
+                    if not str(d.get('Remark') or '').strip()
+                ]
                 if len(unique_docs) > 1:
                     gruppe['unique_docs'] = unique_docs
                     gefilterte_konflikte.append(gruppe)
