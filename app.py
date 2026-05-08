@@ -1773,7 +1773,7 @@ def expandiere_mehrfach_pod_zeilen(df):
 
     return pd.DataFrame(neue_zeilen)
 
-def extrahiere_hapag_quotation_excel(excel_dict, file_name):
+def extrahiere_hapag_quotation_excel(excel_dict, file_name, wb=None):
     alle_rows = []
 
     for sheet_name, df_sheet in excel_dict.items():
@@ -2006,7 +2006,7 @@ def erkenne_ccpr_carrier(quotation_value, file_name, meta_text):
     return 'CMA CGM'
 
 
-def extrahiere_ccpr_excel(excel_dict, file_name):
+def extrahiere_ccpr_excel(excel_dict, file_name, wb=None):
     if 'Seafreights' not in excel_dict:
         return None
 
@@ -2154,7 +2154,7 @@ def extrahiere_ccpr_excel(excel_dict, file_name):
     return pd.DataFrame(rows) if rows else None
 
 
-def extrahiere_evergreen_excel(excel_dict, file_name):
+def extrahiere_evergreen_excel(excel_dict, file_name, wb=None):
     rows = []
     erlaubte_reiter_tokens = (
         'fak',
@@ -2258,7 +2258,7 @@ def extrahiere_evergreen_excel(excel_dict, file_name):
     return pd.DataFrame(rows) if rows else None
 
 
-def extrahiere_yang_ming_ncpe_excel(excel_dict, file_name):
+def extrahiere_yang_ming_ncpe_excel(excel_dict, file_name, wb=None):
     """Stabiler Spezial-Parser fuer bekannte Yang-Ming NCPE-Ratenblaetter.
     Ziel: bestehendes Verhalten beibehalten und nur die Gültigkeit aus
     'Document Validity' zuverlässig in die Ergebniszeilen injizieren.
@@ -2347,7 +2347,7 @@ def extrahiere_yang_ming_ncpe_excel(excel_dict, file_name):
     return None
 
 
-def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name):
+def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name, wb=None):
     """Stabiler Spezial-Parser fuer MSC-Workbook
     'MSC Quote - FMS - ex NWC to Middle East ...'.
     Dieser Pfad ist bewusst strikt, damit spaetere generische Regel-Aenderungen
@@ -2480,7 +2480,308 @@ def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name):
     return pd.DataFrame(rows)
 
 
-def extrahiere_cosco_iet_excel(excel_dict, file_name):
+def extrahiere_cosco_austria_fak_excel(excel_dict, file_name, wb=None):
+    """Parser fuer COSCO Austria Export FAK Multi-Sheet Excel.
+
+    Layout (alle Rate-Sheets identisch):
+    - Meta in Zeilen 8-17: VALIDITY, CURRENCY, FILING REF, CARRIER
+    - Zeile 18: Col B=POL, C=AREA, D=POD, E=20DC, F=40DC, G=40HC, H=DIRECT/T/S, I=TERM, J=REMARK
+    - Daten ab Zeile 20; forward fill POL (col B) und AREA (col C)
+    - Durchgestrichene Zeilen werden uebersprungen (per openpyxl font.strike)
+    - Zusätzliche Zuschläge werden aus dem Terms-Bereich jedes Sheets gelesen
+    - PICK UP FEE und Outport Arbitrary werden ignoriert
+    """
+    file_name_low = str(file_name or '').lower()
+    if 'cosco' not in file_name_low:
+        return None
+
+    has_fak_hint = 'fak' in file_name_low or 'austria' in file_name_low
+    has_multi_sheet = wb is not None and len(wb.sheetnames) > 3
+    if not has_fak_hint and not has_multi_sheet:
+        return None
+
+    if wb is None:
+        return None
+
+    SKIP_SHEETS = {'pick up fee', 'fe,me & ipbc outport arbitrary'}
+
+    def _parse_terms_surcharges(ws, terms_start_row, base_currency):
+        """Liest 'subject to' Zuschläge aus dem Terms-Bereich.
+        Gibt Liste von Dicts zurück: code, amount, currency, pol_filter, pod_filter, entry, is_collect.
+        """
+        results = []
+        seen_keys = set()
+        for row in ws.iter_rows(min_row=terms_start_row):
+            cells = list(row)
+            key = str(cells[1].value or '').strip() if len(cells) > 1 else ''
+            val = str(cells[2].value or '').strip() if len(cells) > 2 else ''
+            if not key or key.lower() in {'nan', 'none'}:
+                continue
+            combined = f"{key}: {val}"
+            # Skip incl./n.a./per-B/L/IMO
+            if re.search(r'\bincl\.?\b|\bn\.a\.\b|not applicable', combined, re.I):
+                continue
+            if re.search(r'/\s*B[/.]?L\b|per\s+B[/]?L\b|per B/L', combined, re.I):
+                continue
+            if 'imo' in key.lower():
+                continue
+            # Code aus Schlüsselanfang
+            code_m = re.match(r'^\*?\s*([A-Z]{2,10})', key.strip())
+            if not code_m:
+                continue
+            code = code_m.group(1)
+
+            # POL-Filter (Hamburg vs Koper)
+            has_ham = bool(re.search(r'\bhamburg\b', combined, re.I))
+            has_kop = bool(re.search(r'\bkoper\b', combined, re.I))
+            if has_ham and not has_kop:
+                pol_filter = 'HAMBURG'
+            elif has_kop and not has_ham:
+                pol_filter = 'KOPER'
+            else:
+                pol_filter = None
+
+            # POD-Filter (spezifische Häfen im Key)
+            pod_filter = None
+            key_up = key.upper()
+            if 'JEDDAH' in key_up:
+                pod_filter = 'JEDDAH'
+            elif 'UAE' in key_up or 'UNITED ARAB' in key_up or 'GULF' in key_up:
+                pod_filter = 'UAE'
+            elif 'YANGON' in key_up or 'MYANMAR' in key_up:
+                pod_filter = 'YANGON'
+            elif 'LEBANON' in key_up or 'BEIRUT' in key_up:
+                pod_filter = 'BEIRUT'
+            elif 'ISRAEL' in key_up:
+                pod_filter = 'ISRAEL'
+            elif 'AQABA' in key_up:
+                continue  # keine gültige Route
+            elif 'MERSIN' in key_up:
+                pod_filter = 'MERSIN'
+            elif 'CASABLANCA' in key_up:
+                pod_filter = 'CASABLANCA'
+            elif 'LYBIA' in key_up or 'LIBYA' in key_up:
+                pod_filter = 'TRIPOLI'
+
+            # Collect-Markierung
+            is_collect = bool(re.search(r'collect\s+basis|on\s+collect', combined, re.I))
+
+            # Betrag für 40HC ermitteln
+            amount_40hc = None
+            currency_final = base_currency
+
+            # Spezialfall /40 (z.B. EUR 3000/40´GP,HQ)
+            m40 = re.search(r'(USD|EUR)\s*([\d.,]+)\s*/\s*40', combined, re.I)
+            if m40:
+                amount_40hc = parse_decimal_wert(m40.group(2))
+                currency_final = m40.group(1).upper()
+
+            if amount_40hc is None:
+                # CURRENCY AMOUNT/TEU (×2 für 40HC)
+                m_teu = re.search(r'(USD|EUR)\s*([\d.,]+)\s*/\s*(?:TEU|unit)\b', combined, re.I)
+                if m_teu:
+                    amount_40hc = (parse_decimal_wert(m_teu.group(2)) or 0) * 2
+                    currency_final = m_teu.group(1).upper()
+
+            if amount_40hc is None:
+                # CURRENCY AMOUNT/container (1:1)
+                m_cnt = re.search(r'(USD|EUR)\s*([\d.,]+)\s*/\s*container\b', combined, re.I)
+                if m_cnt:
+                    amount_40hc = parse_decimal_wert(m_cnt.group(2))
+                    currency_final = m_cnt.group(1).upper()
+
+            if not amount_40hc or amount_40hc <= 0:
+                continue
+
+            dedup_key = (code, currency_final, round(amount_40hc, 2), pol_filter, pod_filter, is_collect)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+
+            results.append({
+                'code': code,
+                'amount': amount_40hc,
+                'currency': currency_final,
+                'pol_filter': pol_filter,
+                'pod_filter': pod_filter,
+                'is_collect': is_collect,
+                'entry': f"{code} = {amount_40hc:.2f} {currency_final}",
+            })
+        return results
+
+    rows_all = []
+
+    for shname in wb.sheetnames:
+        shname_low = shname.strip().lower()
+        if shname_low in SKIP_SHEETS:
+            continue
+
+        ws = wb[shname]
+
+        # Meta aus Zeilen 8-17 lesen
+        valid_from = None
+        valid_to = None
+        base_currency = 'USD'
+        filing_ref = 'Unbekannt'
+        carrier = 'COSCO'
+        skip_sheet = False
+
+        for row in ws.iter_rows(min_row=8, max_row=17, values_only=False):
+            cells = list(row)
+            if len(cells) < 3:
+                continue
+            key = str(cells[1].value or '').strip().upper() if cells[1].value is not None else ''
+            val = str(cells[2].value or '').strip() if cells[2].value is not None else ''
+            if not key and len(cells) > 1:
+                key = str(cells[0].value or '').strip().upper()
+
+            if 'VALIDITY' in key and val:
+                dts = re.findall(r'(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', val)
+                if len(dts) >= 2:
+                    valid_from = parse_datum_standard(dts[0])
+                    valid_to = parse_datum_standard(dts[1])
+                if valid_from is None and 'xx' in val.lower():
+                    skip_sheet = True
+                    break
+
+            if 'CURRENCY' in key:
+                m = re.search(r'\b(USD|EUR|GBP|CNY)\b', val or '', re.I)
+                if m:
+                    base_currency = m.group(1).upper()
+
+            if 'FILING REF' in key and val:
+                m = re.search(r'([A-Z]\d{6,})', val.upper())
+                if m:
+                    filing_ref = m.group(1)
+
+            if 'CARRIER' in key and val:
+                raw = val.strip()
+                if 'diamond' in raw.lower():
+                    carrier = 'Diamond Line'
+                elif 'cosco' in raw.lower():
+                    carrier = 'COSCO'
+
+        if skip_sheet or valid_from is None:
+            continue
+
+        # Header-Zeile
+        header_row_num = None
+        for row in ws.iter_rows(min_row=16, max_row=22):
+            cells = list(row)
+            b_val = str(cells[1].value or '').strip().upper() if len(cells) > 1 else ''
+            d_val = str(cells[3].value or '').strip().upper() if len(cells) > 3 else ''
+            if b_val == 'POL' and d_val == 'POD':
+                header_row_num = cells[0].row
+                break
+
+        if header_row_num is None:
+            continue
+
+        data_start = header_row_num + 2
+
+        current_pol = ''
+        current_area = ''
+        sheet_rows = []
+        terms_start_row = None
+
+        for row in ws.iter_rows(min_row=data_start):
+            cells = list(row)
+            if len(cells) < 4:
+                continue
+
+            # TERMS-Zeile erkennen
+            b_val_raw = str(cells[1].value or '').strip().upper() if len(cells) > 1 else ''
+            if 'TERMS' in b_val_raw and 'CONDIT' in b_val_raw and terms_start_row is None:
+                terms_start_row = cells[0].row + 1
+                break  # Ab hier nur noch Terms-Bereich → Daten-Loop abbrechen
+
+            # POL/AREA forward fill IMMER – auch bei durchgestrichenen Zeilen
+            pol_raw = str(cells[1].value or '').strip() if len(cells) > 1 else ''
+            area_raw = str(cells[2].value or '').strip() if len(cells) > 2 else ''
+            if pol_raw and pol_raw.lower() not in {'nan', 'none', 'pol'}:
+                current_pol = pol_raw
+            if area_raw and area_raw.lower() not in {'nan', 'none', 'area'}:
+                current_area = area_raw
+
+            # Strikethrough: POD oder Rate-Zelle durchgestrichen → Zeile überspringen
+            pod_cell = cells[3] if len(cells) > 3 else None
+            rate_cell = cells[6] if len(cells) > 6 else None
+            if pod_cell and pod_cell.font and pod_cell.font.strike:
+                continue
+            if rate_cell and rate_cell.font and rate_cell.font.strike:
+                continue
+
+            pod_raw = str(cells[3].value or '').strip() if len(cells) > 3 else ''
+            rate_40hc_val = cells[6].value if len(cells) > 6 else None
+            remark_raw = str(cells[9].value or '').strip() if len(cells) > 9 else ''
+
+            if not pod_raw or pod_raw.lower() in {'nan', 'none', 'pod'}:
+                continue
+            if isinstance(rate_40hc_val, str) and 'no service' in str(rate_40hc_val).lower():
+                continue
+
+            rate_40hc = parse_decimal_wert(rate_40hc_val)
+            if rate_40hc is None or rate_40hc <= 0:
+                continue
+
+            remark_parts = []
+            if remark_raw and remark_raw.lower() not in {'nan', 'none'}:
+                remark_parts.append(remark_raw)
+            if current_area and current_area.lower() not in {'nan', 'none'}:
+                remark_parts.append(f"Area: {current_area}")
+
+            sheet_rows.append({
+                'Carrier': carrier,
+                'Contract Number': filing_ref,
+                'Port of Loading': current_pol if current_pol else 'Unbekannt',
+                'Port of Destination': pod_raw,
+                'Valid from': valid_from,
+                'Valid to': valid_to,
+                '40HC': rate_40hc,
+                'Currency': base_currency,
+                'Included Prepaid Surcharges 40HC': '',
+                'Included Collect Surcharges 40HC': '',
+                'Remark': ' | '.join(remark_parts),
+            })
+
+        # Terms-Surcharges lesen und auf Sheet-Raten anwenden
+        if terms_start_row and sheet_rows:
+            terms_surch = _parse_terms_surcharges(ws, terms_start_row, base_currency)
+            for r in sheet_rows:
+                pol_up = r['Port of Loading'].upper()
+                pod_up = r['Port of Destination'].upper()
+                prepaid_extra = []
+                collect_extra = []
+                for s in terms_surch:
+                    # POL-Filter prüfen
+                    if s['pol_filter'] and s['pol_filter'] not in pol_up:
+                        continue
+                    # POD-Filter prüfen
+                    if s['pod_filter']:
+                        pf = s['pod_filter']
+                        if pf == 'ISRAEL':
+                            if 'HAIFA' not in pod_up and 'ASHDOD' not in pod_up:
+                                continue
+                        elif pf not in pod_up:
+                            continue
+                    if s['is_collect']:
+                        collect_extra.append(s['entry'])
+                    else:
+                        prepaid_extra.append(s['entry'])
+                if prepaid_extra:
+                    r['Included Prepaid Surcharges 40HC'] = ', '.join(prepaid_extra)
+                if collect_extra:
+                    r['Included Collect Surcharges 40HC'] = ', '.join(collect_extra)
+
+        rows_all.extend(sheet_rows)
+
+    if not rows_all:
+        return None
+
+    return pd.DataFrame(rows_all)
+
+
+def extrahiere_cosco_iet_excel(excel_dict, file_name, wb=None):
     """Spezial-Parser fuer COSCO-IET-Rate-Sheets mit fixer Spaltenlogik.
 
     Erwartetes Layout (aus Nutzerdaten):
@@ -2492,6 +2793,9 @@ def extrahiere_cosco_iet_excel(excel_dict, file_name):
     """
     file_name_low = str(file_name or '').lower()
     if 'cosco' not in file_name_low:
+        return None
+    # FAK-Dateien (Austria/multi-sheet) werden vom Austria-FAK-Parser behandelt
+    if 'fak' in file_name_low or 'austria' in file_name_low:
         return None
     if not any(x in file_name_low for x in ['iet', 'paper', 'pulp', 'forestry']):
         return None
@@ -4270,7 +4574,15 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             datei.seek(0)
             try:
                 excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
+                # openpyxl Workbook für Strikethrough-Erkennung (Austria FAK u.a.)
+                try:
+                    datei.seek(0)
+                    import openpyxl as _opx_ep
+                    _wb_early_opx = _opx_ep.load_workbook(datei, data_only=True)
+                except Exception:
+                    _wb_early_opx = None
                 for _early_parser, _early_name in [
+                    (extrahiere_cosco_austria_fak_excel, 'Excel (COSCO-Austria-FAK-LOCKED)'),
                     (extrahiere_cosco_iet_excel, 'Excel (COSCO-IET-LOCKED)'),
                     (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)'),
                     (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)'),
@@ -4279,7 +4591,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                     (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
                 ]:
                     try:
-                        _early_result = _early_parser(excel_dict_early, datei.name)
+                        _early_result = _early_parser(excel_dict_early, datei.name, _wb_early_opx)
                     except Exception:
                         _early_result = None
                     if isinstance(_early_result, pd.DataFrame) and not _early_result.empty:
