@@ -5699,6 +5699,7 @@ with tab_rate_checks:
 
     if st.button("🔄 Jetzt prüfen", type="primary", key="ratecheck_start_btn"):
         st.session_state['ratecheck_gestartet'] = True
+        st.session_state['ratecheck_seite'] = 0
 
     if not st.session_state.get('ratecheck_gestartet', False):
         st.info("Auf 'Jetzt prüfen' klicken um die gesamte Datenbank automatisch zu analysieren.")
@@ -5743,12 +5744,43 @@ with tab_rate_checks:
             if not gefilterte_konflikte:
                 st.success("Alles sauber: Keine doppelten Raten mit abweichenden Preisen gefunden.")
             else:
+                SEITE_GROESSE = 20
+                gesamt_konflikte = len(gefilterte_konflikte)
+                gesamt_seiten = max(1, (gesamt_konflikte + SEITE_GROESSE - 1) // SEITE_GROESSE)
+
+                if 'ratecheck_seite' not in st.session_state:
+                    st.session_state['ratecheck_seite'] = 0
+                # Seite auf gültigen Bereich begrenzen
+                if st.session_state['ratecheck_seite'] >= gesamt_seiten:
+                    st.session_state['ratecheck_seite'] = gesamt_seiten - 1
+
+                aktuelle_seite = st.session_state['ratecheck_seite']
+                start_idx = aktuelle_seite * SEITE_GROESSE
+                end_idx = min(start_idx + SEITE_GROESSE, gesamt_konflikte)
+
                 st.warning(
-                    f"⚠️ {len(gefilterte_konflikte)} Konflikt-Gruppe(n) gefunden – gleiche Contract + gleiche Gültigkeit + "
-                    f"gleiche Route, aber unterschiedliche Preise."
+                    f"⚠️ {gesamt_konflikte} Konflikt-Gruppe(n) gefunden – gleiche Contract + gleiche Gültigkeit + "
+                    f"gleiche Route, aber unterschiedliche Preise. "
+                    f"Seite {aktuelle_seite + 1} von {gesamt_seiten} (Einträge {start_idx + 1}–{end_idx})"
                 )
 
-                for gruppe_index, gruppe in enumerate(gefilterte_konflikte, start=1):
+                # Navigations-Buttons
+                nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
+                with nav_col1:
+                    if st.button("⬅️ Zurück", key="ratecheck_prev", disabled=(aktuelle_seite == 0)):
+                        st.session_state['ratecheck_seite'] -= 1
+                        st.rerun()
+                with nav_col3:
+                    if st.button("Weiter ➡️", key="ratecheck_next", disabled=(aktuelle_seite >= gesamt_seiten - 1)):
+                        st.session_state['ratecheck_seite'] += 1
+                        st.rerun()
+                with nav_col2:
+                    st.caption(f"Seite {aktuelle_seite + 1} / {gesamt_seiten}")
+
+                seiten_konflikte = gefilterte_konflikte[start_idx:end_idx]
+
+                for seiten_pos, gruppe in enumerate(seiten_konflikte):
+                    gruppe_index = start_idx + seiten_pos + 1
                     unique_docs = gruppe['unique_docs']
                     erste_zeile = pd.Series(unique_docs[0])
                     valid_from_label = formatiere_datum_fuer_header(erste_zeile.get('Valid from'))
@@ -5760,7 +5792,7 @@ with tab_rate_checks:
                         f"{len(unique_docs)} Varianten"
                     )
 
-                    with st.expander(label, expanded=(gruppe_index <= 3)):
+                    with st.expander(label, expanded=(seiten_pos == 0 and aktuelle_seite == 0)):
                         for row_index, doc in enumerate(unique_docs, start=1):
                             row = pd.Series(doc)
                             source_label = str(row.get('sourceFile') or '').strip()
@@ -5804,6 +5836,19 @@ with tab_rate_checks:
 
                             if row_index < len(unique_docs):
                                 st.divider()
+
+                # Navigations-Buttons unten wiederholen
+                nav2_col1, nav2_col2, nav2_col3 = st.columns([1, 3, 1])
+                with nav2_col1:
+                    if st.button("⬅️ Zurück", key="ratecheck_prev2", disabled=(aktuelle_seite == 0)):
+                        st.session_state['ratecheck_seite'] -= 1
+                        st.rerun()
+                with nav2_col3:
+                    if st.button("Weiter ➡️", key="ratecheck_next2", disabled=(aktuelle_seite >= gesamt_seiten - 1)):
+                        st.session_state['ratecheck_seite'] += 1
+                        st.rerun()
+                with nav2_col2:
+                    st.caption(f"Seite {aktuelle_seite + 1} / {gesamt_seiten}")
 
 
 # === TAB 5: PICK UP ===
