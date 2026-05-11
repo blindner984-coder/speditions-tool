@@ -4672,225 +4672,65 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 except Exception:
                     pass
 
-            datei.seek(0)
-            try:
-                df_fast = pd.read_excel(datei, sheet_name=0, nrows=MAX_EXCEL_SHEET_ROWS)
-                df_fast_std = standardisiere_spalten(df_fast)
-                # Maersk-Tender haben eine 'Charge'-Spalte → NICHT den Schnellpfad nehmen,
-                # sonst werden Surcharges nicht gruppiert und BAS/Surcharges als separate Raten importiert.
-                hat_charge_spalte = any(
-                    str(c).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']
-                    for c in df_fast_std.columns
-                )
-                if not hat_charge_spalte and 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
-                    # FIX: Receipt/Delivery haben Vorrang vor leeren POL/POD-Spalten
-                    for _ziel, _vorrang in [('Port of Loading', ['Receipt', 'Place of Receipt']),
-                                            ('Port of Destination', ['Delivery', 'Place of Delivery'])]:
-                        _vorrang_col = ermittle_erste_spalte(df_fast_std, _vorrang)
-                        if _vorrang_col:
-                            _hat_daten = not df_fast_std[_vorrang_col].astype(str).str.strip().replace(
-                                {'nan': '', 'None': '', 'NaN': ''}
-                            ).eq('').all()
-                            if _hat_daten:
-                                if _ziel not in df_fast_std.columns:
-                                    df_fast_std[_ziel] = df_fast_std[_vorrang_col]
-                                else:
-                                    _ziel_leer = df_fast_std[_ziel].astype(str).str.strip().replace(
-                                        {'nan': '', 'None': '', 'NaN': ''}
-                                    ).eq('')
-                                    _quelle_ok = ~df_fast_std[_vorrang_col].astype(str).str.strip().replace(
-                                        {'nan': '', 'None': '', 'NaN': ''}
-                                    ).eq('')
-                                    _mask = _ziel_leer & _quelle_ok
-                                    if _mask.any():
-                                        df_fast_std.loc[_mask, _ziel] = df_fast_std.loc[_mask, _vorrang_col]
-                    if 'Contract Number' not in df_fast_std.columns:
-                        if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
-                            df_fast_std['Contract Number'] = fn_match.group(1)
-                    return df_fast_std, "Excel (Schnell)"
-            except Exception:
-                pass
-
-            # Schneller Sheet-Header-Scan:
-            # Viele Carrier-Dateien starten mit Disclaimer-Sheets. Statt sofort den
-            # teuren Komplett-Import (alle Sheets + Deep-Scan) zu machen, suchen wir
-            # in den Top-Zeilen je Sheet nach einer plausiblen Header-Zeile.
+            # Schutz vor OOM bei Dateien mit formal riesigen (aber meist leeren) Sheet-Dimensionen:
+            # In diesem Fall keine Schnellpfade nutzen, sondern direkt den nrows-begrenzten Multi-Sheet-Pfad.
+            excel_hat_riesige_dimensionen = False
             try:
                 datei.seek(0)
-                xls = pd.ExcelFile(datei)
-                header_scan_limit = 120
+                import openpyxl as _openpyxl_dim
+                _wb_dim = _openpyxl_dim.load_workbook(datei, read_only=True, data_only=True)
+                for _ws_dim in _wb_dim.worksheets:
+                    _max_r = int(getattr(_ws_dim, 'max_row', 0) or 0)
+                    _max_c = int(getattr(_ws_dim, 'max_column', 0) or 0)
+                    if _max_r > (MAX_EXCEL_SHEET_ROWS * 2) or _max_c > 300:
+                        excel_hat_riesige_dimensionen = True
+                        break
+                _wb_dim.close()
+            except Exception:
+                excel_hat_riesige_dimensionen = False
 
-                for sheet_name in xls.sheet_names:
-                    try:
-                        df_preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=header_scan_limit)
-                    except Exception:
-                        continue
-
-                    if df_preview.empty:
-                        continue
-
-                    quick_header_idx = None
-                    for i in range(min(len(df_preview), header_scan_limit)):
-                        row_vals = df_preview.iloc[i].dropna().astype(str).tolist()
-                        if len(row_vals) < 3:
-                            continue
-                        if zaehle_bekannte_spalten(row_vals) >= 3:
-                            quick_header_idx = i
-                            break
-
-                    if quick_header_idx is None:
-                        for i in range(min(len(df_preview), header_scan_limit)):
-                            row_vals = df_preview.iloc[i].dropna().astype(str).tolist()
-                            if len(row_vals) < 2:
-                                continue
-                            if zaehle_bekannte_spalten(row_vals) >= 2:
-                                quick_header_idx = i
-                                break
-
-                    if quick_header_idx is None:
-                        continue
-
-                    try:
-                        df_quick = pd.read_excel(
-                            xls,
-                            sheet_name=sheet_name,
-                            header=quick_header_idx,
-                            nrows=MAX_EXCEL_SHEET_ROWS,
-                        )
-                    except Exception:
-                        continue
-
-                    if df_quick.empty:
-                        continue
-
-                    df_quick_std = standardisiere_spalten(df_quick)
+            if not excel_hat_riesige_dimensionen:
+                datei.seek(0)
+                try:
+                    df_fast = pd.read_excel(datei, sheet_name=0, nrows=MAX_EXCEL_SHEET_ROWS)
+                    df_fast_std = standardisiere_spalten(df_fast)
+                    # Maersk-Tender haben eine 'Charge'-Spalte → NICHT den Schnellpfad nehmen,
+                    # sonst werden Surcharges nicht gruppiert und BAS/Surcharges als separate Raten importiert.
                     hat_charge_spalte = any(
                         str(c).strip().lower() in ['charge', 'charge code', 'charge type', 'chrg']
-                        for c in df_quick_std.columns
+                        for c in df_fast_std.columns
                     )
-                    hat_hafen_spalte = any(
-                        col in df_quick_std.columns
-                        for col in ['Port of Loading', 'Port of Destination', 'POL', 'POD', 'Receipt', 'Delivery']
-                    )
-
-                    hat_preis_daten = False
-                    for _col in df_quick_std.columns:
-                        _c_low = str(_col).strip().lower()
-                        if any(kw in _c_low for kw in ['40', 'rate', 'price', 'amount', 'freight', 'o/f']):
-                            _parsed = df_quick_std[_col].head(800).apply(parse_decimal_wert)
-                            if (_parsed.notna() & (_parsed > 0)).any():
-                                hat_preis_daten = True
-                                break
-
-                    # Charge-Sheets laufen durch den bestehenden Grouping-Pfad weiter,
-                    # damit BAS/Surcharges weiterhin korrekt aggregiert werden.
-                    # Sicherheitsnetz: Nur dann akzeptieren, wenn auch echte Preis-
-                    # und Hafeninformationen vorhanden sind (kein Abkuerzungsblatt).
-                    if hat_charge_spalte and hat_preis_daten and hat_hafen_spalte:
-                        import sys as _sys2; print(f"[DEBUG2] df_raw SET at sheet={sheet_name}, rows={len(df_quick_std)}", file=_sys2.stderr)
-                        df_raw = df_quick_std
-                        break
-
-                    if 'Port of Destination' in df_quick_std.columns and '40HC' in df_quick_std.columns:
-                        _rate_40 = df_quick_std['40HC'].head(800).apply(parse_decimal_wert)
-                        if not (_rate_40.notna() & (_rate_40 > 0)).any():
-                            continue
-
+                    if not hat_charge_spalte and 'Port of Destination' in df_fast_std.columns and '40HC' in df_fast_std.columns:
+                        # FIX: Receipt/Delivery haben Vorrang vor leeren POL/POD-Spalten
                         for _ziel, _vorrang in [('Port of Loading', ['Receipt', 'Place of Receipt']),
                                                 ('Port of Destination', ['Delivery', 'Place of Delivery'])]:
-                            _vorrang_col = ermittle_erste_spalte(df_quick_std, _vorrang)
+                            _vorrang_col = ermittle_erste_spalte(df_fast_std, _vorrang)
                             if _vorrang_col:
-                                _hat_daten = not df_quick_std[_vorrang_col].astype(str).str.strip().replace(
+                                _hat_daten = not df_fast_std[_vorrang_col].astype(str).str.strip().replace(
                                     {'nan': '', 'None': '', 'NaN': ''}
                                 ).eq('').all()
                                 if _hat_daten:
-                                    if _ziel not in df_quick_std.columns:
-                                        df_quick_std[_ziel] = df_quick_std[_vorrang_col]
+                                    if _ziel not in df_fast_std.columns:
+                                        df_fast_std[_ziel] = df_fast_std[_vorrang_col]
                                     else:
-                                        _ziel_leer = df_quick_std[_ziel].astype(str).str.strip().replace(
+                                        _ziel_leer = df_fast_std[_ziel].astype(str).str.strip().replace(
                                             {'nan': '', 'None': '', 'NaN': ''}
                                         ).eq('')
-                                        _quelle_ok = ~df_quick_std[_vorrang_col].astype(str).str.strip().replace(
+                                        _quelle_ok = ~df_fast_std[_vorrang_col].astype(str).str.strip().replace(
                                             {'nan': '', 'None': '', 'NaN': ''}
                                         ).eq('')
                                         _mask = _ziel_leer & _quelle_ok
                                         if _mask.any():
-                                            df_quick_std.loc[_mask, _ziel] = df_quick_std.loc[_mask, _vorrang_col]
-
-                        if 'Contract Number' not in df_quick_std.columns:
+                                            df_fast_std.loc[_mask, _ziel] = df_fast_std.loc[_mask, _vorrang_col]
+                        if 'Contract Number' not in df_fast_std.columns:
                             if fn_match := re.search(r'(?:contract)[\s_0-9-]*?(\d{6,10})', datei.name, re.IGNORECASE):
-                                df_quick_std['Contract Number'] = fn_match.group(1)
-                            elif fn_match2 := re.search(r'^([A-Z]{2,6}\d{4,}[A-Z]?\d*)', datei.name, re.IGNORECASE):
-                                df_quick_std['Contract Number'] = fn_match2.group(1).upper()
-                            elif global_contract != "Unbekannt":
-                                df_quick_std['Contract Number'] = global_contract
-                        # POL aus Metadaten-Zeile vor dem Header (z.B. MSC: "Ports of Loading | Hamburg, ...")
-                        if ('Port of Loading' not in df_quick_std.columns or
-                                df_quick_std['Port of Loading'].astype(str).str.strip()
-                                .replace({'nan': '', 'None': ''}).eq('').all()) \
-                                and quick_header_idx and quick_header_idx > 0:
-                            for _mi in range(quick_header_idx):
-                                _mr = df_preview.iloc[_mi].tolist()
-                                # Key kann in Spalte A oder B stehen
-                                _mk = ''
-                                _mv_start_col = 1
-                                _a = str(_mr[0]).strip() if _mr and _mr[0] is not None else ''
-                                if _a and _a.lower() not in {'nan', 'none', ''}:
-                                    _mk = _a.lower()
-                                    _mv_start_col = 1
-                                elif len(_mr) > 1 and _mr[1] is not None:
-                                    _b = str(_mr[1]).strip()
-                                    if _b and _b.lower() not in {'nan', 'none', ''}:
-                                        _mk = _b.lower()
-                                        _mv_start_col = 2
-                                # Wert: erste nicht-leere Zelle ab _mv_start_col
-                                _mv = ''
-                                for _mci in range(_mv_start_col, min(len(_mr), 8)):
-                                    _mcv_raw = _mr[_mci]
-                                    if _mcv_raw is not None:
-                                        _mcv = str(_mcv_raw).strip()
-                                        if _mcv and _mcv.lower() not in {'nan', 'none', ''}:
-                                            _mv = _mcv
-                                            break
-                                if any(x in _mk for x in ['port of loading', 'ports of loading', 'pol']) and _mv:
-                                    df_quick_std['Port of Loading'] = _mv
-                                    break
-                        if 'Carrier' not in df_quick_std.columns:
-                            _fn_low_qt = datei.name.lower()
-                            _qt_hints = {
-                                'yang': 'Yang Ming', 'yangming': 'Yang Ming', 'ym': 'Yang Ming',
-                                'hapag': 'Hapag-Lloyd', 'hlcu': 'Hapag-Lloyd',
-                                'maersk': 'Maersk', 'msc': 'MSC',
-                                'cma': 'CMA CGM', 'mfr': 'CMA CGM',
-                                'evergreen': 'Evergreen', 'cosco': 'COSCO',
-                                'one': 'ONE', 'zim': 'ZIM',
-                            }
-                            _ct_found = False
-                            for _hint, _name in _qt_hints.items():
-                                if _hint in _fn_low_qt:
-                                    df_quick_std['Carrier'] = _name
-                                    _ct_found = True
-                                    break
-                            # Fallback: Carrier aus Metadaten-Zeilen vor dem Header
-                            if not _ct_found and quick_header_idx and quick_header_idx > 0:
-                                _meta_rows = df_preview.iloc[:quick_header_idx]
-                                _meta_text = " ".join(
-                                    v for rv in _meta_rows.values.tolist()
-                                    for v in rv if v and str(v).strip() and str(v).strip().lower() != 'nan'
-                                ).lower()
-                                _meta_carrier_map = {
-                                    'yang ming': 'Yang Ming', 'hapag': 'Hapag-Lloyd',
-                                    'maersk': 'Maersk', 'msc': 'MSC', 'cma cgm': 'CMA CGM',
-                                    'evergreen': 'Evergreen', 'cosco': 'COSCO', 'one': 'ONE',
-                                    'zim': 'ZIM', 'hmm': 'HMM', 'oocl': 'OOCL',
-                                }
-                                for _kw, _cn in _meta_carrier_map.items():
-                                    if _kw in _meta_text:
-                                        df_quick_std['Carrier'] = _cn
-                                        break
-                        return df_quick_std, "Excel (Schnell-Tab)"
-            except Exception:
-                pass
+                                df_fast_std['Contract Number'] = fn_match.group(1)
+                        return df_fast_std, "Excel (Schnell)"
+                except Exception:
+                    pass
+
+            # Schneller Sheet-Header-Scan ist deaktiviert.
+            # Der folgende Multi-Sheet-Pfad ist robuster und durch nrows-Limits abgesichert.
 
             # --- Multi-Sheet Verarbeitung ---
             if df_raw.empty:
