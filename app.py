@@ -4666,7 +4666,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
 
             datei.seek(0)
             try:
-                df_fast = pd.read_excel(datei, sheet_name=0)
+                df_fast = pd.read_excel(datei, sheet_name=0, nrows=MAX_EXCEL_SHEET_ROWS)
                 df_fast_std = standardisiere_spalten(df_fast)
                 # Maersk-Tender haben eine 'Charge'-Spalte → NICHT den Schnellpfad nehmen,
                 # sonst werden Surcharges nicht gruppiert und BAS/Surcharges als separate Raten importiert.
@@ -4743,7 +4743,12 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         continue
 
                     try:
-                        df_quick = pd.read_excel(xls, sheet_name=sheet_name, header=quick_header_idx)
+                        df_quick = pd.read_excel(
+                            xls,
+                            sheet_name=sheet_name,
+                            header=quick_header_idx,
+                            nrows=MAX_EXCEL_SHEET_ROWS,
+                        )
                     except Exception:
                         continue
 
