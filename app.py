@@ -5539,8 +5539,15 @@ with tab_suche:
                     gueltigkeit_label = f"{valid_from_label} bis {valid_to_label}" if (valid_from_label != "?" or valid_to_label != "?") else "Unbekannt"
                     source_file_raw = str(row.get('sourceFile') or '').strip()
                     source_file_label = f" | 📂 {source_file_raw}" if source_file_raw else ""
+                    # Carrier normalisieren: 'nan'/None + R-Nummer-Vertrag → MSC
+                    _carr_raw = str(row.get('Carrier') or '').strip()
+                    if _carr_raw.lower() in {'nan', 'none', '', 'unbekannt'}:
+                        _cn_raw = str(row.get('Contract Number') or '').strip()
+                        if re.match(r'^R\d{12,15}$', _cn_raw):
+                            _carr_raw = 'MSC'
+                    carrier_label = _carr_raw or 'Unbekannt'
                     label = (
-                        f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {row.get('Carrier')} | 📄 {row.get('Contract Number')} | "
+                        f"{'🏆 BESTER PREIS | ' if is_best else ''}🚢 {carrier_label} | 📄 {row.get('Contract Number')} | "
                         f"{row.get('Port of Loading')} ➡️ {row.get('Port of Destination')} | 📅 {gueltigkeit_label}{source_file_label}"
                     )
 
