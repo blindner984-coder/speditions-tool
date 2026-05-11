@@ -4598,24 +4598,32 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             datei.seek(0)
             try:
                 excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
-                # openpyxl Workbook für Strikethrough-Erkennung (Austria FAK u.a.)
-                try:
-                    datei.seek(0)
-                    import openpyxl as _opx_ep
-                    _wb_early_opx = _opx_ep.load_workbook(datei, data_only=True)
-                except Exception:
-                    _wb_early_opx = None
-                for _early_parser, _early_name in [
-                    (extrahiere_cosco_austria_fak_excel, 'Excel (COSCO-Austria-FAK-LOCKED)'),
-                    (extrahiere_cosco_iet_excel, 'Excel (COSCO-IET-LOCKED)'),
-                    (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)'),
-                    (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)'),
-                    (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)'),
-                    (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)'),
-                    (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)'),
+                # openpyxl-Workbook nur bei Bedarf laden (verhindert Speicher-Spitzen bei großen/leeren Sheets)
+                _wb_early_opx = None
+
+                def _hole_wb_early_opx():
+                    nonlocal _wb_early_opx
+                    if _wb_early_opx is None:
+                        try:
+                            datei.seek(0)
+                            import openpyxl as _opx_ep
+                            _wb_early_opx = _opx_ep.load_workbook(datei, read_only=True, data_only=True)
+                        except Exception:
+                            _wb_early_opx = None
+                    return _wb_early_opx
+
+                for _early_parser, _early_name, _needs_wb in [
+                    (extrahiere_cosco_austria_fak_excel, 'Excel (COSCO-Austria-FAK-LOCKED)', True),
+                    (extrahiere_cosco_iet_excel, 'Excel (COSCO-IET-LOCKED)', False),
+                    (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)', False),
+                    (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)', False),
+                    (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)', False),
+                    (extrahiere_ccpr_excel, 'Excel (CCPR-Vertrag)', False),
+                    (extrahiere_evergreen_excel, 'Excel (Evergreen-Quotation)', False),
                 ]:
                     try:
-                        _early_result = _early_parser(excel_dict_early, datei.name, _wb_early_opx)
+                        _early_wb = _hole_wb_early_opx() if _needs_wb else None
+                        _early_result = _early_parser(excel_dict_early, datei.name, _early_wb)
                     except Exception:
                         _early_result = None
                     if isinstance(_early_result, pd.DataFrame) and not _early_result.empty:
