@@ -142,6 +142,7 @@ st.title("FreightIQ")
 
 MAX_UPLOAD_SIZE_MB = 15
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_EXCEL_SHEET_ROWS = 20_000  # Sheets mit mehr Zeilen werden auf diesen Wert abgeschnitten (verhindert Speicher-Absturz bei leeren Riesensheets)
 MAX_ADMIN_LOGIN_ATTEMPTS = 5
 ADMIN_LOCK_SECONDS = 300
 
@@ -477,7 +478,7 @@ def extrahiere_excel_mit_gemini(file_bytes, file_name):
         if file_name.lower().endswith(".csv"):
             df_raw = pd.read_csv(buf, header=None, low_memory=False)
         else:
-            all_sheets = pd.read_excel(buf, sheet_name=None, header=None)
+            all_sheets = pd.read_excel(buf, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
             sheet_parts = []
             for sheet_name, df_sheet in all_sheets.items():
                 if df_sheet.empty:
@@ -2223,6 +2224,11 @@ def extrahiere_evergreen_excel(excel_dict, file_name, wb=None):
             if price is None:
                 continue
 
+            # DM/DT-Sektion (Demurrage/Detention) überspringen: dort steht 'CALENDAR' in der Währungsspalte
+            _raw_currency = str(row.get(currency_col, '') or '').strip().upper()
+            if _raw_currency == 'CALENDAR':
+                continue
+
             remark_parts = []
             for spalte in [remark_col, manifest_col, local_surcharge_col]:
                 if spalte and pd.notna(row.get(spalte)):
@@ -2249,7 +2255,7 @@ def extrahiere_evergreen_excel(excel_dict, file_name, wb=None):
                 'Valid from': parse_datum_standard(validity_match.group(1)) if validity_match else None,
                 'Valid to': parse_datum_standard(validity_match.group(2)) if validity_match else None,
                 '40HC': price,
-                'Currency': str(row.get(currency_col, 'USD')).strip().upper() or 'USD',
+                'Currency': _raw_currency or 'USD',
                 'Included Prepaid Surcharges 40HC': '',
                 'Included Collect Surcharges 40HC': '',
                 'Remark': ' | '.join(dedupliziere_eintraege(remark_parts)),
@@ -3340,7 +3346,7 @@ UNTERSTUETZTE_PICKUP_DATEIENDUNGEN = {'.pdf', '.xlsx', '.xlsm'}
 
 def lese_pickup_excel_roh(file_bytes):
     try:
-        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+        return pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
     except Exception:
         return None
 
@@ -4573,7 +4579,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             # durch Header-Scan erzeugt.
             datei.seek(0)
             try:
-                excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None)
+                excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
                 # openpyxl Workbook für Strikethrough-Erkennung (Austria FAK u.a.)
                 try:
                     datei.seek(0)
@@ -4859,7 +4865,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if df_raw.empty:
                 datei.seek(0)
                 try:
-                    excel_dict = pd.read_excel(datei, sheet_name=None, header=None)
+                    excel_dict = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
                 except Exception as e:
                     return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
 
