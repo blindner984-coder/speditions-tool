@@ -3075,6 +3075,24 @@ def normalisiere_upload_dataframe(df_upload):
     stelle_spalte_sicher('Valid from', COLUMN_ALIASES['Valid from'], default=None)
     stelle_spalte_sicher('Valid to', COLUMN_ALIASES['Valid to'], default=None)
 
+    # TMS Code → Contract Number Fallback (MSC/FMS IPBC-Format: R-Nummer steckt in TMS Code)
+    if 'TMS Code' in out.columns:
+        _cn_unbekannt = ist_leerwert_series(out['Contract Number']) | out['Contract Number'].astype(str).str.strip().isin({'Unbekannt', 'unbekannt'})
+        _tms_valid = ~ist_leerwert_series(out['TMS Code'])
+        out.loc[_cn_unbekannt & _tms_valid, 'Contract Number'] = out.loc[_cn_unbekannt & _tms_valid, 'TMS Code'].astype(str).str.strip()
+
+    # Carrier-Fallback: Wenn Carrier-Spalte nur Leer-/NaN-Werte hat, auf Default setzen
+    if 'Carrier' in out.columns:
+        _carr_leer = ist_leerwert_series(out['Carrier'])
+        if _carr_leer.all():
+            out['Carrier'] = 'FMS'
+
+    # MSC-Carrier-Erkennung: Vertragsnummern im Format R + 12..15 Ziffern = MSC
+    if 'Carrier' in out.columns and 'Contract Number' in out.columns:
+        _msc_cn_mask = out['Contract Number'].astype(str).str.match(r'^R\d{12,15}$', na=False)
+        _carr_unbekannt_oder_fms = out['Carrier'].astype(str).str.strip().isin({'FMS', 'Unbekannt', 'unbekannt', '', 'nan', 'none'})
+        out.loc[_msc_cn_mask & _carr_unbekannt_oder_fms, 'Carrier'] = 'MSC'
+
     # Bereits vorhandene, aber leere Hafen-Spalten mit besseren Quellen auffuellen.
     fuelle_leerwerte_aus_quellen('Port of Loading', [
         'Receipt', 'Place of Receipt', 'POL', 'Port of Load', 'Origin Port',
