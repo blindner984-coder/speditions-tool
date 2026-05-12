@@ -2353,6 +2353,221 @@ def extrahiere_yang_ming_ncpe_excel(excel_dict, file_name, wb=None):
     return None
 
 
+def extrahiere_msc_fms_ipbc_excel(excel_dict, file_name, wb=None):
+    """Spezial-Parser fuer MSC FMS IPBC-Ratenblatt.
+
+    Erkennungsmerkmale:
+    - Sheet 'IPBC' vorhanden
+    - Spalte 'TMS Code' in Zeile 9 (R-Nummer + 14 Ziffern)
+    - Sheet 'IPBC Specials' optionally vorhanden
+
+    IPBC-Sheet Layout (header Zeile 9):
+      Col 0: TMS Code | Col 1: Port of Loading | Col 2: Port of Discharge
+      Col 3: CTR (20'/40') | Col 6: Rate | Col 24: Valid from | Col 25: Valid until
+      Col 26: Remarks
+
+    IPBC Specials Layout (header Zeile 2):
+      Col 0: TMS Code | Col 1: Account | Col 2: POL | Col 3: POD
+      Col 5: Rate 40' | Col 7: Valid from | Col 8: Valid until | Col 13: Remarks
+    """
+    # Erkennung: Sheet 'IPBC' mit TMS-Code-Spalte
+    ipbc_sheet = None
+    for sh_name in excel_dict:
+        if str(sh_name).strip().upper() == 'IPBC':
+            ipbc_sheet = sh_name
+            break
+    if ipbc_sheet is None:
+        return None
+
+    df_ipbc = excel_dict[ipbc_sheet]
+    if df_ipbc is None or df_ipbc.empty:
+        return None
+
+    # Header-Zeile finden (TMS Code in Spalte 0 oder 'Rate' in einer der ersten 15 Zeilen)
+    header_idx = None
+    for i in range(min(len(df_ipbc), 20)):
+        row_vals = df_ipbc.iloc[i].astype(str).str.strip().tolist()
+        if row_vals[0].lower() == 'tms code' and 'port of loading' in [v.lower() for v in row_vals[:4]]:
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    # Spalten-Mapping aus Header-Zeile
+    header_row = df_ipbc.iloc[header_idx].astype(str).str.strip().tolist()
+    col_idx = {v.lower(): i for i, v in enumerate(header_row)}
+
+    tms_col  = col_idx.get('tms code', 0)
+    pol_col  = col_idx.get('port of loading', 1)
+    pod_col  = col_idx.get('port of discharge', 2)
+    ctr_col  = col_idx.get('ctr', 3)
+    rate_col = col_idx.get('rate', 6)
+
+    # Datum-/Gültigkeitsspalten: suche 'valid from' und 'valid until'
+    vf_col  = col_idx.get('valid from', None)
+    vt_col  = col_idx.get('valid until', None)
+    # Remark – letzte Spalte mit 'remark' im Header
+    rem_col = None
+    for h_label, h_idx in col_idx.items():
+        if 'remark' in h_label:
+            rem_col = h_idx
+
+    rows = []
+    for i in range(header_idx + 2, len(df_ipbc)):  # +2: Zeile 10 ist Sub-Header (at POL / at POD)
+        row = df_ipbc.iloc[i]
+
+        def cell(idx):
+            return row.iloc[idx] if idx is not None and idx < len(row) else None
+
+        tms   = str(cell(tms_col) or '').strip()
+        pol   = str(cell(pol_col) or '').strip()
+        pod   = str(cell(pod_col) or '').strip()
+        ctr   = str(cell(ctr_col) or '').strip()
+        remark = str(cell(rem_col) or '').strip() if rem_col is not None else ''
+
+        # Nur 40'-Zeilen; Skip leere / Header-Wiederholungen
+        if not tms or tms.lower() in {'nan', 'none', 'tms code'}:
+            continue
+        if not pol or pol.lower() in {'nan', 'none', 'port of loading'}:
+            continue
+        if not pod or pod.lower() in {'nan', 'none', 'port of discharge'}:
+            continue
+        if "20'" in ctr:
+            continue  # nur 40' übernehmen
+
+        # TMS Code muss wie eine R-Nummer aussehen oder einen Buchstaben enthalten
+        tms = tms.rstrip()
+
+        rate_val = parse_decimal_wert(cell(rate_col))
+        if rate_val is None or rate_val <= 0:
+            continue
+
+        valid_from = parse_datum_standard(cell(vf_col)) if vf_col is not None else None
+        valid_to   = parse_datum_standard(cell(vt_col)) if vt_col is not None else None
+
+        # Remark bereinigen
+        if remark.lower() in {'nan', 'none', ''}:
+            remark = ''
+
+        rows.append({
+            'Carrier': 'MSC',
+            'Contract Number': tms,
+            'Port of Loading': pol,
+            'Port of Destination': pod,
+            'Valid from': valid_from,
+            'Valid to':   valid_to,
+            '40HC': rate_val,
+            'Currency': 'USD',
+            'Included Prepaid Surcharges 40HC': '',
+            'Included Collect Surcharges 40HC': '',
+            'Remark': remark,
+        })
+
+    # --- IPBC Specials (optionales zweites Sheet) ---
+    spec_sheet = None
+    for sh_name in excel_dict:
+        if 'ipbc specials' in str(sh_name).strip().lower():
+            spec_sheet = sh_name
+            break
+
+    if spec_sheet is not None:
+        df_spec = excel_dict[spec_sheet]
+        if df_spec is not None and not df_spec.empty:
+            # Header bei Zeile 2 (0-basiert)
+            for i in range(min(len(df_spec), 10)):
+                rv = df_spec.iloc[i].astype(str).str.strip().tolist()
+                rv_low = [v.lower() for v in rv]
+                if 'pol' in rv_low and 'pod' in rv_low:
+                    spec_hdr_idx = i
+                    break
+            else:
+                spec_hdr_idx = None
+
+            if spec_hdr_idx is not None:
+                spec_hdr = df_spec.iloc[spec_hdr_idx].astype(str).str.strip().tolist()
+                sc = {v.lower(): j for j, v in enumerate(spec_hdr)}
+
+                s_tms = sc.get('nan', 0)  # TMS Code in Spalte 0 (NaN-Header)
+                # Suche explizit TMS-Spalte: erste Spalte mit R-Nummern
+                s_pol = sc.get('pol', 2)
+                s_pod = sc.get('pod', 3)
+                # "Rate 40'" oder "Rate 40'" (smart quote)
+                s_rate = None
+                for k, j in sc.items():
+                    if '40' in k and 'rate' in k:
+                        s_rate = j
+                        break
+                if s_rate is None:
+                    s_rate = 5
+                s_vf = sc.get('valid from', 7)
+                s_vt = sc.get('valid until', 8)
+                s_rem = None
+                for k, j in sc.items():
+                    if 'remark' in k:
+                        s_rem = j
+
+                for i in range(spec_hdr_idx + 1, len(df_spec)):
+                    srow = df_spec.iloc[i]
+
+                    def scell(idx):
+                        return srow.iloc[idx] if idx is not None and idx < len(srow) else None
+
+                    tms   = str(scell(s_tms) or '').strip()
+                    pol   = str(scell(s_pol) or '').strip()
+                    pod   = str(scell(s_pod) or '').strip()
+                    remark = str(scell(s_rem) or '').strip() if s_rem is not None else ''
+
+                    if not tms or tms.lower() in {'nan', 'none', ''}:
+                        continue
+                    if not pol or pol.lower() in {'nan', 'none', 'pol'}:
+                        continue
+                    if not pod or pod.lower() in {'nan', 'none', 'pod', 'destination'}:
+                        continue
+
+                    rate_val = parse_decimal_wert(scell(s_rate))
+                    if rate_val is None or rate_val <= 0:
+                        continue
+
+                    valid_from = parse_datum_standard(scell(s_vf))
+                    valid_to   = parse_datum_standard(scell(s_vt))
+
+                    if remark.lower() in {'nan', 'none', ''}:
+                        remark = ''
+
+                    # POL kann mehrere Häfen enthalten (z.B. HAM/BRV/ANR/RTM)
+                    pols = [p.strip() for p in pol.split('/') if p.strip()]
+                    if not pols:
+                        pols = [pol]
+                    # POD kann mehrere Häfen enthalten
+                    pods = [p.strip() for p in pod.split('/') if p.strip()]
+                    if not pods:
+                        pods = [pod]
+
+                    for p in pols:
+                        for d in pods:
+                            rows.append({
+                                'Carrier': 'MSC',
+                                'Contract Number': tms,
+                                'Port of Loading': p,
+                                'Port of Destination': d,
+                                'Valid from': valid_from,
+                                'Valid to':   valid_to,
+                                '40HC': rate_val,
+                                'Currency': 'USD',
+                                'Included Prepaid Surcharges 40HC': '',
+                                'Included Collect Surcharges 40HC': '',
+                                'Remark': remark,
+                            })
+
+    if not rows:
+        return None
+
+    df_result = pd.DataFrame(rows)
+    df_result['Valid from dt'] = pd.to_datetime(df_result['Valid from'], dayfirst=True, errors='coerce')
+    df_result['Valid to dt']   = pd.to_datetime(df_result['Valid to'],   dayfirst=True, errors='coerce')
+    return df_result
+
+
 def extrahiere_msc_fms_middleeast_excel(excel_dict, file_name, wb=None):
     """Stabiler Spezial-Parser fuer MSC-Workbook
     'MSC Quote - FMS - ex NWC to Middle East ...'.
@@ -4615,6 +4830,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 for _early_parser, _early_name, _needs_wb in [
                     (extrahiere_cosco_austria_fak_excel, 'Excel (COSCO-Austria-FAK-LOCKED)', True),
                     (extrahiere_cosco_iet_excel, 'Excel (COSCO-IET-LOCKED)', False),
+                    (extrahiere_msc_fms_ipbc_excel, 'Excel (MSC-FMS-IPBC-LOCKED)', False),
                     (extrahiere_msc_fms_middleeast_excel, 'Excel (MSC-FMS-MiddleEast-LOCKED)', False),
                     (extrahiere_yang_ming_ncpe_excel, 'Excel (Yang-Ming-NCPE-LOCKED)', False),
                     (extrahiere_hapag_quotation_excel, 'Excel (Hapag-Quotation)', False),
