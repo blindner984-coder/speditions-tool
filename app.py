@@ -2535,7 +2535,8 @@ def extrahiere_msc_fms_ipbc_excel(excel_dict, file_name, wb=None):
                         remark = ''
 
                     # POL kann mehrere Häfen enthalten (z.B. HAM/BRV/ANR/RTM)
-                    pols = [p.strip() for p in pol.split('/') if p.strip()]
+                    _pol_map = {'HAM': 'Hamburg', 'BRV': 'Bremerhaven', 'ANR': 'Antwerp', 'RTM': 'Rotterdam'}
+                    pols = [_pol_map.get(p.strip().upper(), p.strip()) for p in pol.split('/') if p.strip()]
                     if not pols:
                         pols = [pol]
                     # POD kann mehrere Häfen enthalten
