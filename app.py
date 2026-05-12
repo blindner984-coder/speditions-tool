@@ -5893,6 +5893,7 @@ with tab_upload:
                                 df_teil['sourceFile'] = datei.name
                                 df_teil['importBatchId'] = f"{int(import_time.timestamp())}_{uuid.uuid4().hex[:8]}"
                                 alle_daten.append(df_teil)
+                                st.caption(f"✅ {datei.name} → {format_name} ({len(df_teil)} Zeilen erkannt)")
                             else:
                                 st.warning(f"⚠️ {datei.name} übersprungen: {format_name}")
 
