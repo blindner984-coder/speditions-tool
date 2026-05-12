@@ -2211,6 +2211,9 @@ def extrahiere_evergreen_excel(excel_dict, file_name, wb=None):
         rate_col = ermittle_erste_spalte(df_rates, ["40' HC", '40HC'])
         pol_col = ermittle_erste_spalte(df_rates, ['POL'])
         pod_col = ermittle_erste_spalte(df_rates, ['POD'])
+        # DLY = Endlieferhafen (Ziel der Sendung); bevorzugt über POD, da mehrere Routen denselben POD teilen
+        dly_col = ermittle_erste_spalte(df_rates, ['DLY'])
+        dest_col = dly_col if dly_col else pod_col
         currency_col = ermittle_erste_spalte(df_rates, ['Currency'])
         remark_col = ermittle_erste_spalte(df_rates, ['Remark'])
         manifest_col = ermittle_erste_spalte(df_rates, ['Manifest Items'])
@@ -2247,11 +2250,17 @@ def extrahiere_evergreen_excel(excel_dict, file_name, wb=None):
             _quote_sheet = normalisiere_evergreen_quotation(sheet_name_str)
             _contract_nr = _quote_ref or _quote_sq or _quote_sheet or 'Unbekannt'
 
+            _dly_val = str(row.get(dest_col, '')).strip()
+            _pod_val = str(row.get(pod_col, '')).strip()
+            # Wenn DLY vorhanden und vom POD verschieden → POD in Remark vermerken
+            if dly_col and _pod_val and _pod_val != _dly_val:
+                remark_parts.insert(0, f"via POD: {_pod_val}")
+
             rows.append({
                 'Carrier': 'Evergreen',
                 'Contract Number': _contract_nr,
                 'Port of Loading': str(row.get(pol_col, '')).strip(),
-                'Port of Destination': str(row.get(pod_col, '')).strip(),
+                'Port of Destination': _dly_val,
                 'Valid from': parse_datum_standard(validity_match.group(1)) if validity_match else None,
                 'Valid to': parse_datum_standard(validity_match.group(2)) if validity_match else None,
                 '40HC': price,
