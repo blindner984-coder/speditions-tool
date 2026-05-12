@@ -4862,24 +4862,19 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 # Dimension-Check per openpyxl read_only VOR dem all-sheets-Read.
                 # Wenn min. ein Sheet formal >10x Limit Zeilen hat, lesen wir ALLE Sheets einzeln,
                 # um den gleichzeitigen Speicher-Peak zu vermeiden.
-                _do_sheet_by_sheet = False
                 _sheet_names_pre = []
                 try:
                     import openpyxl as _opx_predim
                     _wb_predim = _opx_predim.load_workbook(datei, read_only=True, data_only=True)
                     _sheet_names_pre = list(_wb_predim.sheetnames)
-                    for _ws_predim in _wb_predim.worksheets:
-                        _mr_predim = int(getattr(_ws_predim, 'max_row', 0) or 0)
-                        if _mr_predim > MAX_EXCEL_SHEET_ROWS * 10:
-                            _do_sheet_by_sheet = True
-                            break
                     _wb_predim.close()
                 except Exception:
-                    _do_sheet_by_sheet = False
+                    _sheet_names_pre = []
                 datei.seek(0)
 
-                if _do_sheet_by_sheet and _sheet_names_pre:
-                    # Sheet-by-sheet lesen (ein Sheet auf einmal, peak Speicher begrenzt)
+                if _sheet_names_pre:
+                    # Immer sheet-by-sheet lesen: verhindert OOM bei Sheets mit
+                    # großen deklarierten Dimensionen (z.B. IPBC Specials mit 1M Zeilen)
                     excel_dict_early = {}
                     for _sn in _sheet_names_pre:
                         try:
@@ -4890,6 +4885,7 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                         except Exception:
                             excel_dict_early[_sn] = pd.DataFrame()
                 else:
+                    datei.seek(0)
                     excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
                 # openpyxl-Workbook nur bei Bedarf laden (verhindert Speicher-Spitzen bei großen/leeren Sheets)
                 _wb_early_opx = None
@@ -5030,7 +5026,20 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             if df_raw.empty:
                 datei.seek(0)
                 try:
-                    excel_dict = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
+                    # Sheet-by-sheet lesen: verhindert OOM bei Sheets mit großen
+                    # deklarierten Dimensionen (z.B. IPBC Specials mit 1M Zeilen)
+                    if _sheet_names_pre:
+                        excel_dict = {}
+                        for _sn_gen in _sheet_names_pre:
+                            try:
+                                datei.seek(0)
+                                excel_dict[_sn_gen] = pd.read_excel(
+                                    datei, sheet_name=_sn_gen, header=None, nrows=MAX_EXCEL_SHEET_ROWS
+                                )
+                            except Exception:
+                                excel_dict[_sn_gen] = pd.DataFrame()
+                    else:
+                        excel_dict = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
                 except Exception as e:
                     return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
 
