@@ -5043,8 +5043,23 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
                 except Exception as e:
                     return pd.DataFrame(), f"Fehler beim Lesen der Excel: {e}"
 
-                # Spezial-Parser wurden bereits oben ausgeführt (xlsx-Early-Block).
-                # Hier nur noch der generische Gruppen-Import.
+                # Spezial-Parser als Fallback nochmals versuchen (falls der frühe Block
+                # wegen eines Fehlers übersprungen wurde).
+                for _fb_parser, _fb_name in [
+                    (extrahiere_msc_fms_ipbc_excel,           'Excel (MSC-FMS-IPBC-LOCKED)'),
+                    (extrahiere_msc_fms_middleeast_excel,     'Excel (MSC-FMS-MiddleEast-LOCKED)'),
+                    (extrahiere_cosco_iet_excel,              'Excel (COSCO-IET-LOCKED)'),
+                    (extrahiere_yang_ming_ncpe_excel,         'Excel (Yang-Ming-NCPE-LOCKED)'),
+                    (extrahiere_hapag_quotation_excel,        'Excel (Hapag-Quotation)'),
+                    (extrahiere_ccpr_excel,                   'Excel (CCPR-Vertrag)'),
+                    (extrahiere_evergreen_excel,              'Excel (Evergreen-Quotation)'),
+                ]:
+                    try:
+                        _fb_result = _fb_parser(excel_dict, datei.name, None)
+                    except Exception:
+                        _fb_result = None
+                    if isinstance(_fb_result, pd.DataFrame) and not _fb_result.empty:
+                        return _fb_result, _fb_name
 
                 alle_sheets_dfs = []
 
