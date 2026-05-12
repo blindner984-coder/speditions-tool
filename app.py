@@ -2412,6 +2412,33 @@ def extrahiere_msc_fms_ipbc_excel(excel_dict, file_name, wb=None):
         if 'remark' in h_label:
             rem_col = h_idx
 
+    # Surcharge-Spalten: Sub-Header-Zeile lesen (Zeile nach header_idx)
+    sub_header_row = []
+    if header_idx + 1 < len(df_ipbc):
+        sub_header_row = df_ipbc.iloc[header_idx + 1].astype(str).str.strip().tolist()
+
+    # Kombinierte Spaltennamen aufbauen (z.B. 'THC' + 'HAM' → 'THC HAM')
+    _last_main = None
+    _col_names_combined = {}
+    for _ci, _raw in enumerate(header_row):
+        _m = _raw.strip() if _raw.strip().lower() not in {'nan', 'none', ''} else None
+        _sub = sub_header_row[_ci].strip() if _ci < len(sub_header_row) else ''
+        _sub_clean = _sub if _sub.lower() not in {'nan', 'none', ''} else ''
+        if _m:
+            _last_main = _m
+            _col_names_combined[_ci] = f"{_m} {_sub_clean}".strip()
+        elif _last_main and _sub_clean:
+            _col_names_combined[_ci] = f"{_last_main} {_sub_clean}"
+
+    # Surcharge-Spalten zwischen Rate und Valid from filtern
+    _rate_end  = rate_col if rate_col is not None else 6
+    _vf_start  = vf_col   if vf_col   is not None else len(header_row)
+    surcharge_cols = [
+        (_ci, _name) for _ci, _name in _col_names_combined.items()
+        if _ci > _rate_end and _ci < _vf_start
+        and _name.lower() not in {'tms code', 'port of loading', 'port of discharge', 'ctr', 'rate', 'valid from', 'valid until', 'remarks'}
+    ]
+
     rows = []
     for i in range(header_idx + 2, len(df_ipbc)):  # +2: Zeile 10 ist Sub-Header (at POL / at POD)
         row = df_ipbc.iloc[i]
@@ -2449,6 +2476,14 @@ def extrahiere_msc_fms_ipbc_excel(excel_dict, file_name, wb=None):
         if remark.lower() in {'nan', 'none', ''}:
             remark = ''
 
+        # Surcharges mit numerischem Wert sammeln (Format: "CODE = WERT USD")
+        surcharge_parts = []
+        for s_idx, s_name in surcharge_cols:
+            s_num = parse_decimal_wert(cell(s_idx))
+            if s_num is not None and s_num > 0:
+                surcharge_parts.append(f"{s_name} = {s_num:.0f} USD")
+        surcharge_prepaid = ', '.join(surcharge_parts)
+
         rows.append({
             'Carrier': 'MSC',
             'Contract Number': tms,
@@ -2458,7 +2493,7 @@ def extrahiere_msc_fms_ipbc_excel(excel_dict, file_name, wb=None):
             'Valid to':   valid_to,
             '40HC': rate_val,
             'Currency': 'USD',
-            'Included Prepaid Surcharges 40HC': '',
+            'Included Prepaid Surcharges 40HC': surcharge_prepaid,
             'Included Collect Surcharges 40HC': '',
             'Remark': remark,
         })
