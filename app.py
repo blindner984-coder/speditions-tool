@@ -3551,6 +3551,7 @@ def normalisiere_upload_dataframe(df_upload):
     out['Included Prepaid Surcharges 40HC'] = out['Included Prepaid Surcharges 40HC'].apply(dedupliziere_surcharge_string)
     out['Included Collect Surcharges 40HC'] = out['Included Collect Surcharges 40HC'].apply(dedupliziere_surcharge_string)
     out = expandiere_mehrfach_pol_zeilen(out)
+    out = expandiere_mehrfach_pod_zeilen(out)
 
     ziel_spalten = [
         'Carrier', 'Contract Number', 'Port of Loading', 'Port of Destination',
@@ -4812,7 +4813,39 @@ def lade_und_uebersetze_cached(file_name, file_bytes, monatswert_modus="neu"):
             # durch Header-Scan erzeugt.
             datei.seek(0)
             try:
-                excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
+                # Schutz vor OOM bei Dateien mit formal riesigen Sheets (z.B. IPBC Specials mit 1M Dummy-Zeilen):
+                # Dimension-Check per openpyxl read_only VOR dem all-sheets-Read.
+                # Wenn min. ein Sheet formal >10x Limit Zeilen hat, lesen wir ALLE Sheets einzeln,
+                # um den gleichzeitigen Speicher-Peak zu vermeiden.
+                _do_sheet_by_sheet = False
+                _sheet_names_pre = []
+                try:
+                    import openpyxl as _opx_predim
+                    _wb_predim = _opx_predim.load_workbook(datei, read_only=True, data_only=True)
+                    _sheet_names_pre = list(_wb_predim.sheetnames)
+                    for _ws_predim in _wb_predim.worksheets:
+                        _mr_predim = int(getattr(_ws_predim, 'max_row', 0) or 0)
+                        if _mr_predim > MAX_EXCEL_SHEET_ROWS * 10:
+                            _do_sheet_by_sheet = True
+                            break
+                    _wb_predim.close()
+                except Exception:
+                    _do_sheet_by_sheet = False
+                datei.seek(0)
+
+                if _do_sheet_by_sheet and _sheet_names_pre:
+                    # Sheet-by-sheet lesen (ein Sheet auf einmal, peak Speicher begrenzt)
+                    excel_dict_early = {}
+                    for _sn in _sheet_names_pre:
+                        try:
+                            datei.seek(0)
+                            excel_dict_early[_sn] = pd.read_excel(
+                                datei, sheet_name=_sn, header=None, nrows=MAX_EXCEL_SHEET_ROWS
+                            )
+                        except Exception:
+                            excel_dict_early[_sn] = pd.DataFrame()
+                else:
+                    excel_dict_early = pd.read_excel(datei, sheet_name=None, header=None, nrows=MAX_EXCEL_SHEET_ROWS)
                 # openpyxl-Workbook nur bei Bedarf laden (verhindert Speicher-Spitzen bei großen/leeren Sheets)
                 _wb_early_opx = None
 
@@ -5839,33 +5872,7 @@ with tab_upload:
                     try:
                         df_upload = pd.concat(alle_daten, ignore_index=True)
 
-                        with st.expander("🔍 Debug: Rohdaten vor Normalisierung", expanded=True):
-                            st.write(f"**Zeilen gesamt:** {len(df_upload)}")
-                            ziel_cols = ['Port of Loading', 'Port of Destination', '40HC', 'Valid from', 'Valid to', 'Carrier', 'Contract Number', 'Currency']
-                            gefunden = [c for c in ziel_cols if c in df_upload.columns]
-                            fehlend = [c for c in ziel_cols if c not in df_upload.columns]
-                            st.write(f"**Standard-Spalten gefunden:** {gefunden}")
-                            st.write(f"**Standard-Spalten FEHLEN (werden per Fuzzy gesucht):** {fehlend}")
-                            st.write(f"**Alle Spalten in der Datei:** {list(df_upload.columns)}")
-                            st.dataframe(df_upload.head(5).astype(str))
-
-                        df_norm = df_upload.copy()
-                        with st.expander("🔍 Debug: Fuzzy-Matching Ergebnis", expanded=True):
-                            for key in ['Port of Loading', 'Port of Destination', '40HC']:
-                                if key not in df_norm.columns:
-                                    treffer = ermittle_erste_spalte(df_norm, COLUMN_ALIASES[key])
-                                    st.write(f"**{key}** → Fuzzy-Treffer: `{treffer}` | Werte: {list(df_norm[treffer].dropna().head(5)) if treffer else 'NICHT GEFUNDEN'}")
-                                else:
-                                    st.write(f"**{key}** → bereits als Spalte vorhanden | Werte: {list(df_norm[key].dropna().head(5))}")
-
                         df_upload = normalisiere_upload_dataframe(df_upload)
-
-                        with st.expander("🔍 Debug: Nach Normalisierung", expanded=True):
-                            st.write(f"**Zeilen nach Normalisierung:** {len(df_upload)}")
-                            if not df_upload.empty:
-                                st.dataframe(df_upload[['Port of Loading', 'Port of Destination', '40HC', 'Currency', 'Carrier']].head(10))
-                            else:
-                                st.write("Alle Zeilen wurden weggefiltert.")
 
                         if 'createdAt' not in df_upload.columns:
                             df_upload['createdAt'] = datetime.now(timezone.utc)
